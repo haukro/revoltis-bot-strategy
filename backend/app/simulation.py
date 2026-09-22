@@ -101,7 +101,7 @@ def simulate(
                 profit = position["stake"] * (gross_return - 2 * fee)
                 cash += position["stake"] + profit
                 positions.remove(position)
-                trades.append({"id": f"simulation-{pair}-{close_time}-{len(trades)}", "pair": pair, "status": "closed", "opened_at": position["opened_at"], "closed_at": _iso(close_time), "entry_rate": position["entry_rate"], "exit_rate": close, "stake_amount": position["stake"], "profit_usdt": round(profit, 6), "exit_reason": exit_reason, "raw": {"source": "binance_public_candles", "entry_fee_usdt": round(position["stake"] * fee, 6), "exit_fee_usdt": round(position["stake"] * fee, 6), "gross_return_percent": round(gross_return * 100, 6), "net_return_percent": round((gross_return - 2 * fee) * 100, 6), "holding_candles": index - position["entry_index"]}})
+                trades.append({"id": f"simulation-{pair}-{close_time}-{len(trades)}", "pair": pair, "status": "closed", "opened_at": position["opened_at"], "closed_at": _iso(close_time), "entry_rate": position["entry_rate"], "exit_rate": close, "stake_amount": position["stake"], "profit_usdt": round(profit, 6), "exit_reason": exit_reason, "raw": {"source": "okx_public_candles", "entry_fee_usdt": round(position["stake"] * fee, 6), "exit_fee_usdt": round(position["stake"] * fee, 6), "gross_return_percent": round(gross_return * 100, 6), "net_return_percent": round((gross_return - 2 * fee) * 100, 6), "holding_candles": index - position["entry_index"]}})
 
         equity = marked_equity()
         peak = max(peak, equity)
@@ -161,7 +161,7 @@ def simulate(
             profit = position["stake"] * (gross_return - 2 * fee)
             cash += position["stake"] + profit
             positions.remove(position)
-            trades.append({"id": f"simulation-{pair}-{close_time}-{len(trades)}", "pair": pair, "status": "closed", "opened_at": position["opened_at"], "closed_at": _iso(close_time), "entry_rate": position["entry_rate"], "exit_rate": last_close, "stake_amount": position["stake"], "profit_usdt": round(profit, 6), "exit_reason": "end_of_test", "raw": {"source": "binance_public_candles", "entry_fee_usdt": round(position["stake"] * fee, 6), "exit_fee_usdt": round(position["stake"] * fee, 6), "gross_return_percent": round(gross_return * 100, 6), "net_return_percent": round((gross_return - 2 * fee) * 100, 6), "holding_candles": len(candles_by_pair[pair]) - 1 - position["entry_index"]}})
+            trades.append({"id": f"simulation-{pair}-{close_time}-{len(trades)}", "pair": pair, "status": "closed", "opened_at": position["opened_at"], "closed_at": _iso(close_time), "entry_rate": position["entry_rate"], "exit_rate": last_close, "stake_amount": position["stake"], "profit_usdt": round(profit, 6), "exit_reason": "end_of_test", "raw": {"source": "okx_public_candles", "entry_fee_usdt": round(position["stake"] * fee, 6), "exit_fee_usdt": round(position["stake"] * fee, 6), "gross_return_percent": round(gross_return * 100, 6), "net_return_percent": round((gross_return - 2 * fee) * 100, 6), "holding_candles": len(candles_by_pair[pair]) - 1 - position["entry_index"]}})
         final_time = max((int(candles[-1]["close_time"]) for candles in candles_by_pair.values() if candles), default=0)
         if final_time:
             equity_curve.append({"time": _iso(final_time), "value": round(cash, 4)})

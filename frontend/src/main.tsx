@@ -58,6 +58,8 @@ function App() {
   const [scanner, setScanner] = useState<any>(null);
   const [scannerError, setScannerError] = useState('');
   const [scannerLoading, setScannerLoading] = useState(false);
+  const [universeProposal, setUniverseProposal] = useState<any>(null);
+  const [universeLoading, setUniverseLoading] = useState(false);
   const [paperBotRunning, setPaperBotRunning] = useState(false);
   const [simulation, setSimulation] = useState<any>(null);
   const [lastRun, setLastRun] = useState<any>(null);
@@ -112,6 +114,30 @@ function App() {
   const applyPreset = (key: string) => { setConfig(current => ({ ...(current as Config), ...(presets[key].settings as Config) })); setActivePreset(key); setMessage(`Profil „${presets[key].title}“ bol nastavený. Hodnoty môžeš ďalej upraviť.`); };
   const save = async () => { const response = await fetch('/api/strategy', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config) }); setMessage(response.ok ? 'Nastavenie je uložené.' : 'Nastavenie sa nepodarilo uložiť.'); };
   const saveVersion = async () => { const name = window.prompt('Názov verzie stratégie:', `Verzia ${new Date().toLocaleDateString('sk-SK')}`); if (!name) return; const note = window.prompt('Čo sa v tejto verzii zmenilo?') || ''; const response = await fetch('/api/strategy-versions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, note, settings: config }) }); if (response.ok) { setMessage('Verzia stratégie je uložená.'); load(); } else setMessage('Verziu sa nepodarilo uložiť.'); };
+  const proposeUniverse = async () => {
+    if (!config || universeLoading) return;
+    setUniverseLoading(true); setUniverseProposal(null); setMessage('OKX kontroluje likviditu, knihu objednávok, režim trhu a korelácie…');
+    try {
+      const timeframe = String(config.timeframe) === '15m' ? '15m' : '5m';
+      const response = await fetch('/api/market/universe/pick', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ timeframe, max_picks: 5, trade_notional_usdt: Number(config.stake_amount || 50), lock_hours: 12 }) });
+      if (!response.ok) throw new Error(await response.text());
+      const proposal = await response.json(); setUniverseProposal(proposal);
+      setMessage(proposal.status === 'ok' ? 'Návrh je pripravený. Coiny ešte neboli zmenené.' : proposal.message);
+    } catch { setMessage('Návrh z OKX sa nepodarilo vytvoriť. Pôvodný zoznam zostal bez zmeny.'); }
+    finally { setUniverseLoading(false); }
+  };
+  const acceptUniverse = async () => {
+    if (!config || universeProposal?.status !== 'ok') return;
+    const pairs = universeProposal.picks.map((item: any) => item.pair);
+    const nextConfig = { ...config, selected_pairs: pairs };
+    const universe = { proposal_id: universeProposal.proposal_id, source: universeProposal.source, accepted_at: new Date().toISOString(), lock: universeProposal.lock, pairs, method: universeProposal.method };
+    const [strategyResponse, versionResponse] = await Promise.all([
+      fetch('/api/strategy', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(nextConfig) }),
+      fetch('/api/strategy-versions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: `OKX universe ${new Date().toLocaleDateString('sk-SK')}`, note: `Automatický návrh ${universeProposal.proposal_id}; uzamknutý na ${universeProposal.lock.hours} h.`, settings: nextConfig, universe }) }),
+    ]);
+    if (!strategyResponse.ok || !versionResponse.ok) { setMessage('Návrh sa nepodarilo uložiť ako novú verziu stratégie.'); return; }
+    setConfig(nextConfig); setMarketPair(pairs[0]); setMessage(`Použitý a zamknutý návrh: ${pairs.join(', ')}.`); await load();
+  };
   const compare = async () => { if (!left || !right || left === right) { setMessage('Vyber dve rozdielne verzie backtestu.'); return; } const response = await fetch(`/api/backtests/compare?left=${encodeURIComponent(left)}&right=${encodeURIComponent(right)}`); if (response.ok) setComparison(await response.json()); else setMessage('Backtesty sa nepodarilo porovnať.'); };
   const exportConfig = async () => { const response = await fetch('/api/export/freqtrade', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config) }); const blob = new Blob([JSON.stringify(await response.json(), null, 2)], { type: 'application/json' }); const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = 'revoltis-dry-run-config.json'; link.click(); URL.revokeObjectURL(link.href); };
   const startOptimizer = async () => {
@@ -122,13 +148,14 @@ function App() {
       // markets in one request exceeds the function limit, so process one coin
       // at a time and keep the best independently validated result.
       const completed: any[] = [];
-      for (let index = 0; index < coins.length; index += 1) {
-        const pair = coins[index];
-        setOptimizer({ status: 'running', progress: Math.round(index / coins.length * 100), message: `Testujem ${pair} (${index + 1}/${coins.length})` });
+      const optimizationPairs = ((config.selected_pairs || []) as string[]).length ? config.selected_pairs as string[] : coins;
+      for (let index = 0; index < optimizationPairs.length; index += 1) {
+        const pair = optimizationPairs[index];
+        setOptimizer({ status: 'running', progress: Math.round(index / optimizationPairs.length * 100), message: `Testujem ${pair} (${index + 1}/${optimizationPairs.length})` });
         const response = await fetch('/api/optimizer/run', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ settings: config, pairs: [pair], timeframes: ['1m', '3m', '5m', '15m'], history_days: optimizerDays, trials_per_market: optimizerTrials }),
+          body: JSON.stringify({ settings: config, pairs: [pair], timeframes: ['5m', '15m'], history_days: optimizerDays, trials_per_market: optimizerTrials }),
         });
         if (!response.ok) {
           const detail = await response.text();
@@ -183,7 +210,7 @@ function App() {
       } catch (error: any) {
         if (error?.name === 'AbortError') return;
         setRunStatus('failed');
-        setMessage('Historické dáta sa nepodarilo spracovať. Skontroluj pripojenie na Binance.');
+        setMessage('Historické dáta sa nepodarilo spracovať. Skontroluj pripojenie na OKX.');
       } finally {
         setIsRunning(false);
         runAbortRef.current = null;
@@ -221,7 +248,7 @@ function App() {
       const wantedCandles = Math.ceil((endTime - startTime) / 60000 / minutes);
       const controller = new AbortController();
       runAbortRef.current = controller;
-      setMessage(timeLimited ? `Simulácia prebieha do ${new Date(scheduledEnd).toLocaleString('sk-SK')}.` : 'Živá simulácia beží. Vyhodnocujem nové sviečky z Binance.');
+      setMessage(timeLimited ? `Simulácia prebieha do ${new Date(scheduledEnd).toLocaleString('sk-SK')}.` : 'Živá simulácia beží. Vyhodnocujem nové sviečky z OKX.');
       try {
         const response = await fetch('/api/simulations/run', { method: 'POST', signal: controller.signal, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ settings: currentConfig, candle_limit: Math.min(5000, Math.max(100, wantedCandles)), start_time: startTime, end_time: endTime }) });
         if (!response.ok) throw new Error('simulation_failed');
@@ -295,6 +322,7 @@ function App() {
     setMessage(paperBotRunning ? 'Paper bot bol zastavený.' : 'Paper bot sleduje najlepšie hodnotené OKX trhy. Reálne príkazy sú vypnuté.');
   };
   const selected = useMemo(() => (config?.selected_pairs || []) as string[], [config]);
+  const availableCoins = useMemo(() => Array.from(new Set([...coins, ...(universeProposal?.picks || []).map((item: any) => item.pair)])), [universeProposal]);
   if (!config || !dashboard) return <main className="loading"><div className="brand-mark">R</div><h1>Revoltis Bot Strategy</h1><p>{message || 'Pripravujem simuláciu…'}</p></main>;
   const currentPair = marketPair || selected[0];
   const allVisibleTrades = simulation?.trades || dashboard.trades || [];
@@ -318,7 +346,7 @@ function App() {
     <section className="metric-grid"><Metric label={`Simulačný kapitál · ${currentPair}`} value={`${metrics.initial_capital} USDT`} hint="počiatočný stav" /><Metric label={`Realizovaný výsledok · ${currentPair}`} value={`${metrics.realized_profit >= 0 ? '+' : ''}${metrics.realized_profit} USDT`} hint="po uzatvorených obchodoch" positive={metrics.realized_profit >= 0} /><Metric label={`Úspešnosť · ${currentPair}`} value={`${metrics.win_rate} %`} hint={`${metrics.closed_trades} uzatvorených obchodov`} /><Metric label={`Max. drawdown · ${currentPair}`} value={`${metrics.max_drawdown_percent ?? 0} %`} hint="pokles od maxima" /></section>
     <section className="preset-section"><div className="preset-heading"><div><span className="eyebrow">RÝCHLE NASTAVENIE</span><h3>Vyber profil stratégie</h3></div><p>Profil automaticky prenastaví obchodné hranice. Coiny a počiatočný kapitál ostanú zachované.</p></div><div className="preset-grid">{Object.entries(presets).map(([key, preset]) => <button key={key} className={`preset ${key} ${activePreset === key ? 'selected' : ''}`} onClick={() => applyPreset(key)}><span>{key === 'conservative' ? '◒' : key === 'growing' ? '↗' : '⚡'}</span><div><b>{preset.title}</b><small>{preset.description}</small></div><i>{activePreset === key ? 'Aktívna' : 'Použiť'}</i></button>)}</div></section>
     <section className="optimizer-panel">
-      <div className="optimizer-head"><div><span className="eyebrow">AI OPTIMALIZAČNÝ AGENT</span><h3>Hľadanie najlepšej stratégie</h3><p>Agent otestuje všetkých 14 coinov. Hlavné intervaly sú 5m a 15m, kratšie slúžia ako stresový test. Tri walk-forward okná a záverečný holdout chránia pred prispôsobením minulosti.</p></div><button onClick={startOptimizer} disabled={optimizerRunning}>{optimizerRunning ? 'Agent pracuje…' : '✦ Spustiť AI optimalizáciu'}</button></div>
+      <div className="optimizer-head"><div><span className="eyebrow">AI OPTIMALIZAČNÝ AGENT</span><h3>Hľadanie najlepšej stratégie</h3><p>Agent otestuje uzamknutý zoznam coinov na hlavných intervaloch 5m a 15m. Tri walk-forward okná a záverečný holdout chránia pred prispôsobením minulosti.</p></div><button onClick={startOptimizer} disabled={optimizerRunning}>{optimizerRunning ? 'Agent pracuje…' : '✦ Spustiť AI optimalizáciu'}</button></div>
       <div className="optimizer-options"><label>História<select value={optimizerDays} onChange={event => setOptimizerDays(Number(event.target.value) as 1 | 7 | 14 | 30)} disabled={optimizerRunning}><option value={1}>1 deň</option><option value={7}>7 dní</option><option value={14}>14 dní</option><option value={30}>30 dní</option></select></label><label>Varianty na trh<select value={optimizerTrials} onChange={event => setOptimizerTrials(Number(event.target.value))} disabled={optimizerRunning}><option value={2}>2 · rýchle</option><option value={3}>3 · odporúčané</option><option value={5}>5 · dôkladné</option></select></label><span>Výpočet hodnotí zisk, drawdown, počet obchodov, stabilitu a odhadované náklady.</span></div>
       {optimizer?.status === 'running' && <div className="optimizer-progress"><div><span style={{ width: `${optimizer.progress || 0}%` }} /></div><p>{optimizer.message} · {optimizer.progress || 0} %</p></div>}
       {optimizer?.status === 'failed' && <div className="optimizer-error">Optimalizácia zlyhala: {optimizer.message}</div>}
@@ -326,8 +354,8 @@ function App() {
       <p className="optimizer-note">Optimalizácia negarantuje budúci zisk. Pred použitím reálnych peňazí musí výsledok prejsť novým backtestom, kontrolou skreslenia a dlhším dry-run testom.</p>
     </section>
     <FreqtradeVisual />
-    <section className="panel market-panel"><div className="section-title"><span>LIVE</span><div><h3>Aktuálne sviečky z burzy</h3><p>Verejné spot dáta Binance · bez API kľúča · {config.timeframe}</p></div><select className="market-pair" value={marketPair} onChange={event => setMarketPair(event.target.value)}>{selected.map(pair => <option key={pair}>{pair}</option>)}</select></div><MarketChart market={market} error={marketError} />{simulation && <div className="simulation-result"><b>Výsledok poslednej simulácie · {currentPair}</b><span>Hodnota portfólia: {metrics.portfolio_value} USDT</span><span>Zisk/strata: {metrics.realized_profit >= 0 ? '+' : ''}{metrics.realized_profit} USDT</span><span>Obchody: {metrics.closed_trades}</span><span>Drawdown: {metrics.max_drawdown_percent} %</span>{currentCoverage && <span className={currentCoverage.complete ? 'positive' : 'negative'}>Dáta: {currentCoverage.candles}/{currentCoverage.expected_candles} sviečok {currentCoverage.complete ? '✓' : '⚠'}</span>}</div>}</section>
-    <section className="workspace"><aside className="settings panel"><div className="section-title"><span>01</span><div><h3>Konfigurátor stratégie</h3><p>Vyber coiny a hranice simulácie.</p></div></div><h4>Vybrané coiny <small>{selected.length}</small></h4><div className="coin-grid">{coins.map(coin => <label className={selected.includes(coin) ? 'coin active' : 'coin'} key={coin}><input type="checkbox" checked={selected.includes(coin)} onChange={event => update('selected_pairs', event.target.checked ? [...selected, coin] : selected.filter(item => item !== coin))} /><span>{coin.replace('/USDT', '')}</span><small>USDT</small></label>)}</div>{groups.map(([title, keys]) => <details key={title} open={title !== 'Rozšírené indikátory'}><summary>{title}<span>⌄</span></summary><div className="field-grid">{keys.map(key => <label key={key}>{fields[key]}{key === 'timeframe' ? <select value={String(config[key])} onChange={event => update(key, event.target.value)}>{['1m', '3m', '5m', '15m'].map(value => <option key={value}>{value}</option>)}</select> : <div className="number"><input type="number" value={Number(config[key])} step="0.01" onChange={event => update(key, Number(event.target.value))} /><span>{key.includes('percent') || key.includes('ratio') || key.includes('stop') || key.includes('trailing') || key.includes('rebound') ? '%' : key.includes('capital') || key.includes('amount') || key.includes('volume') ? 'USDT' : ''}</span></div>}</label>)}</div></details>)}</aside>
+    <section className="panel market-panel"><div className="section-title"><span>LIVE</span><div><h3>Aktuálne sviečky z burzy</h3><p>Verejné spot dáta OKX · bez API kľúča · {config.timeframe}</p></div><select className="market-pair" value={marketPair} onChange={event => setMarketPair(event.target.value)}>{selected.map(pair => <option key={pair}>{pair}</option>)}</select></div><MarketChart market={market} error={marketError} />{simulation && <div className="simulation-result"><b>Výsledok poslednej simulácie · {currentPair}</b><span>Hodnota portfólia: {metrics.portfolio_value} USDT</span><span>Zisk/strata: {metrics.realized_profit >= 0 ? '+' : ''}{metrics.realized_profit} USDT</span><span>Obchody: {metrics.closed_trades}</span><span>Drawdown: {metrics.max_drawdown_percent} %</span>{currentCoverage && <span className={currentCoverage.complete ? 'positive' : 'negative'}>Dáta: {currentCoverage.candles}/{currentCoverage.expected_candles} sviečok {currentCoverage.complete ? '✓' : '⚠'}</span>}</div>}</section>
+    <section className="workspace"><aside className="settings panel"><div className="section-title"><span>01</span><div><h3>Konfigurátor stratégie</h3><p>Vyber coiny a hranice simulácie.</p></div></div><div className="universe-actions"><button className="ghost" onClick={proposeUniverse} disabled={universeLoading}>{universeLoading ? 'Vyhodnocujem OKX…' : 'Navrhnúť z OKX'}</button>{universeProposal?.status === 'ok' && <button onClick={acceptUniverse}>Použiť návrh</button>}</div>{universeProposal && <div className={`universe-proposal ${universeProposal.status}`}><b>{universeProposal.status === 'ok' ? 'Návrh – zatiaľ nepoužitý' : 'Návrh nevytvorený'}</b><p>{universeProposal.message}</p>{universeProposal.picks?.map((item: any) => <span key={item.pair}>{item.pair} <strong>{item.score}/100</strong><small>spread {(item.spread_ratio * 100).toFixed(3)} % · ATR {(item.atr_ratio * 100).toFixed(2)} %</small></span>)}{universeProposal.data_quality?.incomplete_pairs?.length > 0 && <small>Neúplné dáta: {universeProposal.data_quality.incomplete_pairs.join(', ')}</small>}</div>}<h4>Vybrané coiny <small>{selected.length}</small></h4><div className="coin-grid">{availableCoins.map(coin => <label className={selected.includes(coin) ? 'coin active' : 'coin'} key={coin}><input type="checkbox" checked={selected.includes(coin)} onChange={event => update('selected_pairs', event.target.checked ? [...selected, coin] : selected.filter(item => item !== coin))} /><span>{coin.replace('/USDT', '')}</span><small>USDT</small></label>)}</div>{groups.map(([title, keys]) => <details key={title} open={title !== 'Rozšírené indikátory'}><summary>{title}<span>⌄</span></summary><div className="field-grid">{keys.map(key => <label key={key}>{fields[key]}{key === 'timeframe' ? <select value={String(config[key])} onChange={event => update(key, event.target.value)}>{['1m', '3m', '5m', '15m'].map(value => <option key={value}>{value}</option>)}</select> : <div className="number"><input type="number" value={Number(config[key])} step="0.01" onChange={event => update(key, Number(event.target.value))} /><span>{key.includes('percent') || key.includes('ratio') || key.includes('stop') || key.includes('trailing') || key.includes('rebound') ? '%' : key.includes('capital') || key.includes('amount') || key.includes('volume') ? 'USDT' : ''}</span></div>}</label>)}</div></details>)}</aside>
       <div className="results"><section className="panel chart-panel"><div className="section-title"><span>02</span><div><h3>Výsledok simulácie · {currentPair}</h3><p>Kapitál vybraného coinu po uzatvorených obchodoch.</p></div><span className="saved-progress">Priebeh uložený</span></div><div className="chart-controls"><span>Časový raster:</span><button className={chartRange === 'hour' ? 'active' : 'ghost'} onClick={() => setChartRange('hour')}>Hodiny</button><button className={chartRange === 'day' ? 'active' : 'ghost'} onClick={() => setChartRange('day')}>Dni / 24 h</button><button className={chartRange === 'week' ? 'active' : 'ghost'} onClick={() => setChartRange('week')}>Týždne</button></div><EquityChart points={currentEquityCurve} range={chartRange} /></section><section className="two-col"><div className="panel"><h3>Dôvody nevstúpenia</h3><Rejections reasons={simulation?.rejections || dashboard.analytics?.rejections || {}} /></div><div className="panel"><h3>Simulované obchody · {currentPair}</h3><TradeList trades={currentTrades} /></div></section><section className="panel"><div className="section-title"><span>03</span><div><h3>Verzie a backtesty</h3><p>Ulož parametre pred každým backtestom.</p></div><button className="ghost push" onClick={saveVersion}>Nová verzia</button></div><VersionList versions={versions} /><div className="compare"><h4>Porovnanie backtestov</h4><select value={left} onChange={event => setLeft(event.target.value)}><option value="">Prvý backtest</option>{backtests.map(item => <option key={item.id} value={item.id}>{item.id.slice(0, 8)} · {item.timerange}</option>)}</select><span>vs</span><select value={right} onChange={event => setRight(event.target.value)}><option value="">Druhý backtest</option>{backtests.map(item => <option key={item.id} value={item.id}>{item.id.slice(0, 8)} · {item.timerange}</option>)}</select><button onClick={compare}>Porovnať</button></div>{comparison && <Comparison data={comparison} />}</section></div>
     </section><section className="settings-info"><div className="info-heading"><span className="eyebrow">INFO</span><h3>Vysvetlenie nastavení stratégie</h3><p>Otvor bod, ktorý chceš upraviť. Nájdeš tu význam parametra, jeho vplyv aj spôsob fungovania v simulácii.</p></div><div className="info-grid">{Object.entries(settingInfo).map(([key, info]) => <details key={key}><summary>{fields[key] || 'Vybrané coiny'}<span>+</span></summary><div><p><b>Na čo slúži:</b> {info.purpose}</p><p><b>Čo ovplyvní:</b> {info.effect}</p><p><b>Ako funguje:</b> {info.mechanism}</p></div></details>)}</div></section><p className="message">{message}</p>
   </main>;

@@ -5,7 +5,8 @@ import re
 import asyncio
 import math
 from uuid import uuid4
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from statistics import median
 from typing import Any, Literal
 
 import httpx
@@ -63,6 +64,26 @@ class StrategyVersionCreate(BaseModel):
     name: str = Field(min_length=2, max_length=80)
     note: str = Field(default="", max_length=500)
     settings: StrategySettings
+    universe: dict[str, Any] | None = None
+
+
+class UniversePickRequest(BaseModel):
+    quote_ccy: str = "USDT"
+    max_picks: int = Field(5, ge=1, le=8)
+    timeframe: Literal["5m", "15m"] = "5m"
+    trade_notional_usdt: float = Field(50, ge=5, le=10000)
+    lookback_hours: int = Field(48, ge=24, le=72)
+    lock_hours: int = Field(12, ge=6, le=24)
+    correlation_lookback_hours: int = Field(24, ge=12, le=48)
+    max_pairwise_correlation: float = Field(.75, ge=.2, le=.99)
+    min_listing_age_days: int = Field(14, ge=1, le=365)
+    min_quote_volume_24h: float = Field(2_000_000, ge=0)
+    max_spread_ratio: float = Field(.0008, gt=0, le=.01)
+    max_book_impact_ratio: float = Field(.001, gt=0, le=.02)
+    min_atr_ratio: float = Field(.004, ge=0, le=.1)
+    max_atr_ratio: float = Field(.025, gt=0, le=.2)
+    max_abs_change_24h_ratio: float = Field(.25, gt=0, le=2)
+    max_data_age_seconds: int = Field(30, ge=5, le=300)
 
 
 class BacktestResultCreate(BaseModel):
@@ -104,13 +125,16 @@ local_store = LocalStore()
 app = FastAPI(title="Revoltis Bot Strategy API", version="1.0.0")
 origins = os.getenv("CORS_ORIGINS", "http://localhost:5173,http://localhost:8080").split(",")
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
-# Binance's dedicated market-data host serves public candles without API keys
-# and is suitable for cloud regions where the trading API returns HTTP 451.
-BINANCE_KLINES_URL = "https://data-api.binance.vision/api/v3/klines"
-OKX_TICKERS_URL = "https://www.okx.com/api/v5/market/tickers"
+OKX_BASE_URL = "https://www.okx.com"
+OKX_TICKERS_URL = f"{OKX_BASE_URL}/api/v5/market/tickers"
+OKX_INSTRUMENTS_URL = f"{OKX_BASE_URL}/api/v5/public/instruments"
+OKX_BOOKS_URL = f"{OKX_BASE_URL}/api/v5/market/books"
+OKX_CANDLES_URL = f"{OKX_BASE_URL}/api/v5/market/candles"
+OKX_HISTORY_CANDLES_URL = f"{OKX_BASE_URL}/api/v5/market/history-candles"
 ALLOWED_TIMEFRAMES = {"1m", "3m", "5m", "15m", "30m", "1h", "4h", "1d"}
 TIMEFRAME_MILLISECONDS = {"1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000, "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000}
 optimizer_jobs: dict[str, dict[str, Any]] = {}
+okx_history_semaphore = asyncio.Semaphore(8)
 
 
 def supabase_headers() -> dict[str, str]:
@@ -230,55 +254,223 @@ async def market_scan(quote: str = "USDT", limit: int = 12):
 
 @app.get("/api/market/candles")
 async def market_candles(pair: str, timeframe: str = "3m", limit: int = 480):
-    """Read public Binance spot candles. This endpoint cannot place orders."""
-    symbol = pair.replace("/", "").upper()
-    if not re.fullmatch(r"[A-Z0-9]{5,20}", symbol):
+    """Read public OKX spot candles. This endpoint cannot place orders."""
+    instrument = pair.replace("/", "-").upper()
+    if not re.fullmatch(r"[A-Z0-9]+-[A-Z0-9]+", instrument):
         raise HTTPException(422, "Neplatný obchodný pár.")
     if timeframe not in ALLOWED_TIMEFRAMES:
         raise HTTPException(422, "Nepodporovaný interval sviečok.")
     if not 10 <= limit <= 1500:
         raise HTTPException(422, "Počet sviečok musí byť 10 až 1500.")
     try:
-        # Ask by timestamp, not only by count, to guarantee a complete last 24 h
-        # view for 1-minute candles (which needs more than Binance's 1,000-row page).
-        minutes = int(timeframe.removesuffix("m")) if timeframe.endswith("m") else 60
+        minutes = TIMEFRAME_MILLISECONDS[timeframe] // 60_000
         end_time = int(datetime.now(UTC).timestamp() * 1000)
         start_time = end_time - (limit * minutes * 60 * 1000)
-        candles = await load_binance_candles(pair, timeframe, limit, start_time, end_time)
+        candles = await load_okx_candles(pair, timeframe, limit, start_time, end_time)
     except httpx.HTTPError as error:
-        raise HTTPException(502, f"Dáta z Binance nie sú dostupné: {error}")
-    return {"source": "Binance public spot API", "pair": pair.upper(), "timeframe": timeframe, "candles": candles, "live_trading": False}
+        raise HTTPException(502, f"Dáta z OKX nie sú dostupné: {error}")
+    return {"source": "OKX public spot API", "pair": pair.upper(), "timeframe": timeframe, "candles": candles, "live_trading": False}
 
 
-async def load_binance_candles(pair: str, timeframe: str, limit: int, start_time: int | None = None, end_time: int | None = None) -> list[dict[str, Any]]:
-    symbol = pair.replace("/", "").upper()
-    # Binance sends at most 1,000 candles per response, so collect pages.
-    remaining, cursor, rows = limit, start_time, []
-    async with httpx.AsyncClient(timeout=12) as client:
-        while remaining > 0:
-            parameters: dict[str, Any] = {"symbol": symbol, "interval": timeframe, "limit": min(1000, remaining)}
-            if cursor is not None:
-                parameters["startTime"] = cursor
-            if end_time is not None:
-                parameters["endTime"] = end_time
-            response = await client.get(BINANCE_KLINES_URL, params=parameters)
-            response.raise_for_status()
-            batch = response.json()
-            if not batch:
-                break
-            rows.extend(batch)
-            remaining -= len(batch)
-            if len(batch) < parameters["limit"] or cursor is None:
-                break
-            cursor = int(batch[-1][6]) + 1
-            if end_time is not None and cursor >= end_time:
-                break
-    return [{"open_time": row[0], "open": float(row[1]), "high": float(row[2]), "low": float(row[3]), "close": float(row[4]), "volume": float(row[5]), "close_time": row[6]} for row in rows]
+async def load_okx_candles(pair: str, timeframe: str, limit: int, start_time: int | None = None, end_time: int | None = None) -> list[dict[str, Any]]:
+    """Load complete OKX history in parallel 100-candle pages."""
+    instrument = pair.replace("/", "-").upper()
+    step = TIMEFRAME_MILLISECONDS[timeframe]
+    end = end_time or int(datetime.now(UTC).timestamp() * 1000)
+    start = start_time if start_time is not None else end - limit * step
+    page_size = 100
+    pages = max(1, min(450, math.ceil(min(limit, max(1, (end - start) // step + 1)) / page_size)))
+    async def fetch_page(index: int) -> list[list[str]]:
+        page_end = end - index * page_size * step + step
+        async with okx_history_semaphore:
+            async with httpx.AsyncClient(timeout=15, trust_env=False) as client:
+                for attempt in range(4):
+                    response = await client.get(OKX_HISTORY_CANDLES_URL, params={"instId": instrument, "bar": timeframe, "after": page_end, "limit": page_size})
+                    if response.status_code != 429:
+                        break
+                    await asyncio.sleep(.35 * (attempt + 1))
+                response.raise_for_status()
+                payload = response.json()
+                if payload.get("code") != "0":
+                    raise httpx.HTTPStatusError(payload.get("msg") or "OKX candle error", request=response.request, response=response)
+                return payload.get("data", [])
+
+    batches = await asyncio.gather(*(fetch_page(index) for index in range(pages)))
+    unique: dict[int, list[str]] = {}
+    for batch in batches:
+        for row in batch:
+            timestamp = int(row[0])
+            if start <= timestamp <= end:
+                unique[timestamp] = row
+    rows = [unique[key] for key in sorted(unique)][-limit:]
+    return [{"open_time": int(row[0]), "open": float(row[1]), "high": float(row[2]), "low": float(row[3]), "close": float(row[4]), "volume": float(row[5]), "quote_volume": float(row[7] or 0), "close_time": int(row[0]) + step - 1} for row in rows]
+
+
+def percentile_rank(values: list[float], value: float, reverse: bool = False) -> float:
+    if len(values) < 2:
+        return 1.0
+    rank = sum(1 for item in values if item <= value) / len(values)
+    return 1 - rank + 1 / len(values) if reverse else rank
+
+
+def pearson(left: list[float], right: list[float]) -> float:
+    size = min(len(left), len(right))
+    if size < 12:
+        return 0.0
+    left, right = left[-size:], right[-size:]
+    left_mean, right_mean = sum(left) / size, sum(right) / size
+    numerator = sum((a - left_mean) * (b - right_mean) for a, b in zip(left, right))
+    denominator = math.sqrt(sum((a - left_mean) ** 2 for a in left) * sum((b - right_mean) ** 2 for b in right))
+    return numerator / denominator if denominator else 0.0
+
+
+def candle_metrics(candles: list[dict[str, Any]], request: UniversePickRequest) -> dict[str, Any]:
+    closes = [float(item["close"]) for item in candles]
+    if len(closes) < 30:
+        raise ValueError("insufficient_candles")
+    true_ranges = []
+    for index in range(1, len(candles)):
+        item, previous = candles[index], candles[index - 1]
+        true_ranges.append(max(float(item["high"]) - float(item["low"]), abs(float(item["high"]) - float(previous["close"])), abs(float(item["low"]) - float(previous["close"]))))
+    atr_ratio = sum(true_ranges[-14:]) / min(14, len(true_ranges)) / closes[-1]
+    path = sum(abs(closes[index] - closes[index - 1]) for index in range(1, len(closes)))
+    trend_strength = abs(closes[-1] - closes[0]) / path if path else 0.0
+    crosses = 0
+    previous_side = None
+    for index in range(19, len(closes)):
+        mid = sum(closes[index - 19:index + 1]) / 20
+        side = closes[index] >= mid
+        if previous_side is not None and side != previous_side:
+            crosses += 1
+        previous_side = side
+    volumes = [float(item.get("quote_volume") or float(item["volume"]) * float(item["close"])) for item in candles]
+    volume_stability = min(1.0, median(volumes) / (sum(volumes) / len(volumes))) if volumes and sum(volumes) else 0.0
+    returns = [math.log(closes[index] / closes[index - 1]) for index in range(1, len(closes)) if closes[index - 1] > 0 and closes[index] > 0]
+    return {"atr_ratio": atr_ratio, "trend_strength": trend_strength, "bb_mid_crosses": crosses, "volume_stability": volume_stability, "returns": returns}
+
+
+@app.post("/api/market/universe/pick")
+async def pick_market_universe(request: UniversePickRequest):
+    """Propose, but never silently apply, a diversified OKX spot universe."""
+    if request.quote_ccy.upper() != "USDT":
+        raise HTTPException(422, "Automatický návrh zatiaľ podporuje iba USDT.")
+    now = datetime.now(UTC)
+    try:
+        async with httpx.AsyncClient(timeout=15, trust_env=False) as client:
+            instrument_response, ticker_response = await asyncio.gather(
+                client.get(OKX_INSTRUMENTS_URL, params={"instType": "SPOT"}),
+                client.get(OKX_TICKERS_URL, params={"instType": "SPOT"}),
+            )
+            instrument_response.raise_for_status(); ticker_response.raise_for_status()
+            instrument_payload, ticker_payload = instrument_response.json(), ticker_response.json()
+    except (httpx.HTTPError, ValueError) as error:
+        raise HTTPException(502, f"OKX universe nie je dostupný: {error}")
+    if instrument_payload.get("code") != "0" or ticker_payload.get("code") != "0":
+        raise HTTPException(502, "OKX vrátil neplatné údaje o trhoch.")
+
+    instruments = {item.get("instId"): item for item in instrument_payload.get("data", [])}
+    rejected: list[dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
+    for ticker in ticker_payload.get("data", []):
+        inst_id = str(ticker.get("instId", ""))
+        instrument = instruments.get(inst_id, {})
+        if not inst_id.endswith("-USDT") or instrument.get("state") != "live":
+            continue
+        base = str(instrument.get("baseCcy") or inst_id.split("-")[0])
+        reasons = []
+        if re.search(r"(?:3|5)[LS]$", base): reasons.append("leveraged_token")
+        try:
+            listed_at = datetime.fromtimestamp(int(instrument.get("listTime") or 0) / 1000, UTC)
+            age_days = (now - listed_at).days
+            last, bid, ask, opened = (float(ticker.get(key) or 0) for key in ("last", "bidPx", "askPx", "open24h"))
+            volume = float(ticker.get("volCcy24h") or 0)
+            timestamp = int(ticker.get("ts") or 0)
+            spread = (ask - bid) / ((ask + bid) / 2) if bid > 0 and ask > 0 else 1.0
+            change = last / opened - 1 if opened > 0 else 9.0
+        except (TypeError, ValueError, OverflowError):
+            reasons.append("invalid_ticker"); age_days = 0; last = bid = ask = volume = timestamp = 0; spread = 1; change = 9
+        if age_days < request.min_listing_age_days: reasons.append("listing_too_new")
+        if volume < request.min_quote_volume_24h: reasons.append("low_volume")
+        if spread > request.max_spread_ratio: reasons.append("wide_spread")
+        if abs(change) > request.max_abs_change_24h_ratio: reasons.append("explosive_move")
+        if timestamp <= 0 or (now.timestamp() * 1000 - timestamp) > request.max_data_age_seconds * 1000: reasons.append("stale_ticker")
+        if last <= 0 or last and request.trade_notional_usdt / last < float(instrument.get("minSz") or 0): reasons.append("minimum_size")
+        row = {"pair": inst_id.replace("-", "/"), "instrument_id": inst_id, "base_ccy": base, "last": last, "volume_24h": volume, "spread_ratio": spread, "change_24h_ratio": change, "listing_age_days": age_days, "min_size": instrument.get("minSz"), "tick_size": instrument.get("tickSz")}
+        if reasons:
+            rejected.append({**row, "reasons": reasons})
+        else:
+            candidates.append(row)
+
+    candidates.sort(key=lambda item: item["volume_24h"], reverse=True)
+    # Books and candles are expensive and rate-limited. The liquid top 12 form
+    # the actual detailed candidate pool; no missing member may be ignored.
+    candidate_pool = candidates[:12]
+    candle_count = math.ceil(request.lookback_hours * 3_600_000 / TIMEFRAME_MILLISECONDS[request.timeframe]) + 2
+    end_time = int(now.timestamp() * 1000)
+    start_time = end_time - request.lookback_hours * 3_600_000
+
+    async def enrich(row: dict[str, Any]) -> dict[str, Any]:
+        async with httpx.AsyncClient(timeout=15, trust_env=False) as client:
+            book_response = await client.get(OKX_BOOKS_URL, params={"instId": row["instrument_id"], "sz": 5})
+            book_response.raise_for_status()
+            book_payload = book_response.json()
+        candles = await load_okx_candles(row["pair"], request.timeframe, candle_count, start_time, end_time)
+        if book_payload.get("code") != "0" or not book_payload.get("data") or len(candles) < candle_count * .9:
+            raise ValueError("incomplete_candidate_data")
+        asks = book_payload["data"][0].get("asks", [])
+        remaining, worst, best = request.trade_notional_usdt, 0.0, float(asks[0][0]) if asks else 0.0
+        for level in asks:
+            price, size = float(level[0]), float(level[1])
+            consumed = min(remaining, price * size)
+            remaining -= consumed; worst = price
+            if remaining <= .000001: break
+        if remaining > .000001 or best <= 0:
+            impact = 1.0
+        else:
+            impact = (worst - best) / best
+        return {**row, "book_impact_ratio": impact, **candle_metrics(candles, request)}
+
+    detailed: list[dict[str, Any]] = []
+    data_errors: list[str] = []
+    results = await asyncio.gather(*(enrich(row) for row in candidate_pool), return_exceptions=True)
+    for row, result in zip(candidate_pool, results):
+        if isinstance(result, Exception):
+            data_errors.append(row["pair"])
+        elif result["book_impact_ratio"] > request.max_book_impact_ratio:
+            rejected.append({**row, "reasons": ["book_impact"]})
+        elif not request.min_atr_ratio <= result["atr_ratio"] <= request.max_atr_ratio:
+            rejected.append({**row, "reasons": ["atr_outside_range"]})
+        else:
+            detailed.append(result)
+
+    proposal_id = str(uuid4())
+    base_response = {"proposal_id": proposal_id, "generated_at": now.isoformat(), "source": "OKX public spot API", "status": "ok", "picks": [], "rejected": rejected, "data_quality": {"candidate_pool": len(candidate_pool), "complete_candidates": len(detailed), "incomplete_pairs": data_errors}, "lock": {"hours": request.lock_hours, "expires_at": (now + timedelta(hours=request.lock_hours)).isoformat()}, "method": {"weights": {"volume": .30, "spread": .25, "range": .20, "atr_fit": .15, "bb_crosses": .10}, "max_correlation": request.max_pairwise_correlation}}
+    if data_errors or len(detailed) < request.max_picks:
+        return {**base_response, "status": "no_pick", "message": "Návrh sa nevytvoril, pretože údaje kandidátov nie sú úplné." if data_errors else "Tvrdé filtre prešlo príliš málo trhov."}
+
+    volumes = [item["volume_24h"] for item in detailed]; spreads = [item["spread_ratio"] for item in detailed]
+    crosses = [item["bb_mid_crosses"] for item in detailed]; ranges = [1 - item["trend_strength"] for item in detailed]
+    atr_mid = (request.min_atr_ratio + request.max_atr_ratio) / 2
+    for item in detailed:
+        atr_fit = max(0.0, 1 - abs(item["atr_ratio"] - atr_mid) / max(atr_mid - request.min_atr_ratio, .000001))
+        raw = .30 * percentile_rank(volumes, item["volume_24h"]) + .25 * percentile_rank(spreads, item["spread_ratio"], True) + .20 * percentile_rank(ranges, 1 - item["trend_strength"]) + .15 * atr_fit + .10 * percentile_rank(crosses, item["bb_mid_crosses"])
+        item["score"] = round(raw * 100, 1)
+    detailed.sort(key=lambda item: item["score"], reverse=True)
+    picks: list[dict[str, Any]] = []
+    for item in detailed:
+        correlations = [abs(pearson(item["returns"], picked["returns"])) for picked in picks]
+        if correlations and max(correlations) > request.max_pairwise_correlation:
+            rejected.append({"pair": item["pair"], "reasons": ["correlation"], "max_correlation": round(max(correlations), 3)})
+            continue
+        picks.append(item)
+        if len(picks) >= request.max_picks: break
+    public_picks = [{key: value for key, value in item.items() if key != "returns"} for item in picks]
+    return {**base_response, "status": "ok" if len(public_picks) >= 3 else "no_pick", "message": "Návrh je pripravený na potvrdenie." if len(public_picks) >= 3 else "Po korelačnom filtri ostali menej než tri trhy.", "picks": public_picks}
 
 
 @app.post("/api/simulations/run")
 async def run_standalone_simulation(request: SimulationRequest):
-    """Run a complete backtest from public Binance candles without Freqtrade."""
+    """Run a complete backtest from public OKX candles without Freqtrade."""
     settings = request.settings.model_dump()
     pairs = settings["selected_pairs"]
     if not pairs:
@@ -286,9 +478,9 @@ async def run_standalone_simulation(request: SimulationRequest):
     if request.start_time and request.end_time and request.start_time >= request.end_time:
         raise HTTPException(422, "Začiatok testu musí byť pred koncom testu.")
     try:
-        candle_sets = await asyncio.gather(*(load_binance_candles(pair, settings["timeframe"], request.candle_limit, request.start_time, request.end_time) for pair in pairs))
+        candle_sets = await asyncio.gather(*(load_okx_candles(pair, settings["timeframe"], request.candle_limit, request.start_time, request.end_time) for pair in pairs))
     except httpx.HTTPError as error:
-        raise HTTPException(502, f"Simuláciu nebolo možné načítať z Binance: {error}")
+        raise HTTPException(502, f"Simuláciu nebolo možné načítať z OKX: {error}")
     expected_count = request.candle_limit
     if request.start_time is not None and request.end_time is not None:
         expected_count = min(request.candle_limit, max(1, (request.end_time - request.start_time + TIMEFRAME_MILLISECONDS[settings["timeframe"]] - 1) // TIMEFRAME_MILLISECONDS[settings["timeframe"]]))
@@ -313,7 +505,7 @@ async def run_standalone_simulation(request: SimulationRequest):
     now = datetime.now(UTC).isoformat()
     record = {"id": str(uuid4()), "status": "completed", "started_at": now, "finished_at": now, "test_start": request.start_time, "test_end": request.end_time, "timeframe": settings["timeframe"], "pairs": pairs, "summary": result["metrics"], "progress": {"equity_curve": result["equity_curve"], "per_pair_metrics": result["per_pair_metrics"], "per_pair_equity_curves": result["per_pair_equity_curves"], "data_coverage": data_coverage, "rejections": result["rejections"]}}
     await supabase_upsert("simulation_runs", record)
-    return {"source": "Binance public spot API", "timeframe": settings["timeframe"], "mode": "simulation", "live_trading": False, "data_coverage": data_coverage, "run": record, **result}
+    return {"source": "OKX public spot API", "timeframe": settings["timeframe"], "mode": "simulation", "live_trading": False, "data_coverage": data_coverage, "run": record, **result}
 
 
 async def run_optimizer_job(job_id: str, request: OptimizerRequest) -> None:
@@ -326,7 +518,7 @@ async def run_optimizer_job(job_id: str, request: OptimizerRequest) -> None:
         for number, (pair, timeframe) in enumerate(markets, 1):
             count = min(45000, max(100, request.history_days * 86_400_000 // TIMEFRAME_MILLISECONDS[timeframe]))
             job.update({"phase": "downloading", "message": f"Načítavam {pair} · {timeframe}", "progress": round(number / max(1, len(markets)) * 30)})
-            candles = await load_binance_candles(pair, timeframe, int(count), start_time, end_time)
+            candles = await load_okx_candles(pair, timeframe, int(count), start_time, end_time)
             if len(candles) >= 100:
                 candle_sets[(pair, timeframe)] = candles
         if not candle_sets:
@@ -407,6 +599,22 @@ async def dashboard():
 
 @app.put("/api/strategy")
 async def save_strategy(settings: StrategySettings):
+    versions = await supabase_get("strategy_versions", "order=created_at.desc&limit=20")
+    now = datetime.now(UTC)
+    for version in versions:
+        metadata = (version.get("settings") or {}).get("_universe") or {}
+        expires_at = (metadata.get("lock") or {}).get("expires_at")
+        if not expires_at:
+            continue
+        try:
+            active = datetime.fromisoformat(expires_at.replace("Z", "+00:00")) > now
+        except (TypeError, ValueError):
+            active = False
+        locked_pairs = metadata.get("pairs") or []
+        if active and set(settings.selected_pairs) != set(locked_pairs):
+            raise HTTPException(409, f"Zoznam coinov je uzamknutý do {expires_at}. Parametre stratégie môžeš meniť, universe zatiaľ nie.")
+        if active:
+            break
     record = {"id": "default", "settings": settings.model_dump(), "updated_at": datetime.now(UTC).isoformat()}
     try:
         await supabase_upsert("strategy_settings", record)
@@ -427,7 +635,7 @@ async def list_strategy_versions():
 async def create_strategy_version(version: StrategyVersionCreate):
     record = {
         "id": str(uuid4()), "name": version.name, "note": version.note,
-        "settings": version.settings.model_dump(), "created_at": datetime.now(UTC).isoformat(),
+        "settings": version.settings.model_dump() | ({"_universe": version.universe} if version.universe else {}), "created_at": datetime.now(UTC).isoformat(),
     }
     try:
         saved = await supabase_upsert("strategy_versions", record)
@@ -491,7 +699,7 @@ async def export_freqtrade(settings: StrategySettings):
         "dry_run": True, "dry_run_wallet": settings.initial_capital,
         "stake_currency": "USDT", "stake_amount": settings.stake_amount,
         "max_open_trades": settings.max_open_trades,
-        "exchange": {"name": "binance", "pair_whitelist": settings.selected_pairs, "pair_blacklist": []},
+        "exchange": {"name": "okx", "pair_whitelist": settings.selected_pairs, "pair_blacklist": []},
         "revoltis_parameters": settings.model_dump(exclude={"selected_pairs", "timeframe", "initial_capital", "stake_amount", "max_open_trades"}),
         "safety": {"live_trading": False, "requires_backtest_before_dry_run": True},
     }
