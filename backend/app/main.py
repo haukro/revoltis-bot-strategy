@@ -430,9 +430,20 @@ async def pick_market_universe(request: UniversePickRequest):
             impact = (worst - best) / best
         return {**row, "book_impact_ratio": impact, **candle_metrics(candles, request)}
 
+    async def enrich_with_retry(row: dict[str, Any]) -> dict[str, Any]:
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                return await enrich(row)
+            except (httpx.HTTPError, ValueError) as error:
+                last_error = error
+                if attempt == 0:
+                    await asyncio.sleep(.8)
+        raise last_error or ValueError("incomplete_candidate_data")
+
     detailed: list[dict[str, Any]] = []
     data_errors: list[str] = []
-    results = await asyncio.gather(*(enrich(row) for row in candidate_pool), return_exceptions=True)
+    results = await asyncio.gather(*(enrich_with_retry(row) for row in candidate_pool), return_exceptions=True)
     for row, result in zip(candidate_pool, results):
         if isinstance(result, Exception):
             data_errors.append(row["pair"])
