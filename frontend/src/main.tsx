@@ -212,6 +212,42 @@ function App() {
     };
     await runOnce();
   };
+  const testScannerPair = async (pair: string) => {
+    if (!config || isRunning) return;
+    const nextConfig = { ...config, selected_pairs: [pair] };
+    const hours = 24;
+    const endTime = Date.now();
+    const startTime = endTime - hours * 60 * 60 * 1000;
+    const minutes = Number(String(nextConfig.timeframe).replace('m', '')) || 3;
+    const wantedCandles = Math.ceil(hours * 60 / minutes);
+    const controller = new AbortController();
+    runAbortRef.current = controller;
+    setMarketPair(pair);
+    setConfig(nextConfig);
+    setHistoricalMode(true);
+    setHistoricalHours(hours);
+    setTimeLimited(false);
+    setIsRunning(true);
+    setRunStatus('running');
+    setMessage(`Historický test ${pair} prebieha: posledných 24 hodín.`);
+    window.setTimeout(() => document.querySelector('.simulation-control')?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50);
+    try {
+      const response = await fetch('/api/simulations/run', { method: 'POST', signal: controller.signal, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ settings: nextConfig, candle_limit: Math.min(45000, Math.max(100, wantedCandles)), start_time: startTime, end_time: endTime, force_close_at_end: true }) });
+      if (!response.ok) throw new Error('scanner_backtest_failed');
+      const result = await response.json();
+      setSimulation(result);
+      setLastRun(result.run);
+      setRunStatus('completed');
+      setMessage(`Test ${pair} dokončený: ${result.metrics.closed_trades} uzatvorených obchodov.`);
+    } catch (error: any) {
+      if (error?.name === 'AbortError') return;
+      setRunStatus('failed');
+      setMessage(`Test ${pair} zlyhal. Skontroluj pripojenie k trhovým dátam.`);
+    } finally {
+      setIsRunning(false);
+      runAbortRef.current = null;
+    }
+  };
   const stopSimulation = () => { liveEnabledRef.current = false; if (liveTimerRef.current !== null) window.clearTimeout(liveTimerRef.current); liveTimerRef.current = null; runAbortRef.current?.abort(); runAbortRef.current = null; setIsRunning(false); setRunStatus('stopped'); setMessage('Simulácia bola zastavená.'); };
   useEffect(() => () => { liveEnabledRef.current = false; if (liveTimerRef.current !== null) window.clearTimeout(liveTimerRef.current); if (optimizerTimerRef.current !== null) window.clearTimeout(optimizerTimerRef.current); runAbortRef.current?.abort(); }, []);
   const setQuickRange = (hours: number) => { const now = Date.now(); setTestStart(inputDateTime(new Date(now))); setTestEnd(inputDateTime(new Date(now + hours * 60 * 60 * 1000))); };
@@ -237,7 +273,7 @@ function App() {
   return <main>
     <header className="topbar"><div className="brand"><div className="brand-mark">R</div><div><h1>Revoltis <b>Bot Strategy</b></h1><p>Navrhuj · testuj · porovnávaj</p></div></div><div className="top-actions"><span className="mode"><i />SIMULÁCIA</span><button className="install-app" onClick={installApp}>⇩ Inštalovať aplikáciu</button><button className="ghost" onClick={exportConfig}>Export dry-run</button><button onClick={save}>Uložiť</button></div></header>
     <section className="hero"><div><span className="eyebrow">AKTÍVNY PRACOVNÝ PRIESTOR</span><h2>Stratégia pre pohyb trhu,<br /><em>nie pre domnienky.</em></h2><p>Každá úprava parametrov ostáva v bezpečnom dry-run režime. Pred ďalším krokom ju porovnaj s historickým výsledkom.</p></div><div className="hero-status"><span>Stav synchronizácie</span><strong>{dashboard.last_sync ? 'Dáta prijaté' : 'Čaká na údaje'}</strong><small>{dashboard.last_sync?.received_at ? new Date(dashboard.last_sync.received_at).toLocaleString('sk-SK') : 'Zatiaľ bez simulovaných obchodov'}</small></div></section>
-    <BotControlCenter scanner={scanner} error={scannerError} loading={scannerLoading} running={paperBotRunning} onRefresh={scanOkx} onToggle={togglePaperBot} onChoose={chooseScannerPair} dailyLoss={Math.min(5, Number(config.stop_loss_percent || 4))} stake={Number(config.stake_amount || 0)} />
+    <BotControlCenter scanner={scanner} error={scannerError} loading={scannerLoading} running={paperBotRunning} onRefresh={scanOkx} onToggle={togglePaperBot} onChoose={testScannerPair} dailyLoss={Math.min(5, Number(config.stop_loss_percent || 4))} stake={Number(config.stake_amount || 0)} />
     <section className={`simulation-control status-${runStatus}`}>
       <div className="run-state"><span className="state-dot" /><div><small>STAV SIMULÁCIE</small><strong>{runStatus === 'running' ? (historicalMode ? 'HISTORICKÝ TEST PREBIEHA' : 'PREBIEHA') : runStatus === 'completed' ? (historicalMode ? 'Historický test dokončený' : 'Čas simulácie uplynul – dokončená') : runStatus === 'stopped' ? 'Simulácia zastavená' : runStatus === 'failed' ? 'Simulácia zlyhala' : 'Simulácia nebeží'}</strong><p>{runStatus === 'running' ? (historicalMode ? 'Spracúvam zvolené historické sviečky zrýchlene.' : timeLimited ? `Aktívna do ${new Date(testEnd).toLocaleString('sk-SK')}. Stav zostane rozsvietený až do ukončenia.` : 'Stav zostáva aktívny, kým nestlačíš Zastaviť simuláciu.') : lastRun ? `Posledné vyhodnotenie: ${new Date(lastRun.finished_at).toLocaleString('sk-SK')}` : 'Spusti živú simuláciu alebo zapni historický test.'}</p></div></div>
       <div className="run-actions">{isRunning ? <button className="stop-button" onClick={stopSimulation}>■ Zastaviť simuláciu</button> : <button className="run-button" onClick={runSimulation}>▶ Spustiť simuláciu</button>}</div>
@@ -268,7 +304,7 @@ function BotControlCenter({ scanner, error, loading, running, onRefresh, onToggl
   const best = leaders[0];
   const money = (value: number) => new Intl.NumberFormat('sk-SK', { notation: 'compact', maximumFractionDigits: 1 }).format(value || 0);
   return <section className={`bot-control ${running ? 'bot-running' : ''}`}>
-    <div className="bot-control-head"><div><span className="eyebrow">OKX PAPER BOT</span><h3>Bot Control Center</h3><p>Automatický výber spot trhu podľa reálnej likvidity, spreadu a volatility. Bez API kľúča a bez reálnych príkazov.</p></div><div className="bot-head-actions"><button className="ghost" onClick={onRefresh} disabled={loading}>{loading ? 'Skenujem…' : 'Obnoviť trhy'}</button><button className={running ? 'stop-button' : 'run-button'} onClick={onToggle} disabled={!best}>{running ? '■ Zastaviť paper bota' : '▶ Spustiť paper bota'}</button></div></div>
+    <div className="bot-control-head"><div><span className="eyebrow">OKX SIMULAČNÝ BOT</span><h3>Riadiace centrum bota</h3><p>Automatický výber spot trhu podľa reálnej likvidity, spreadu a volatility. Bez API kľúča a bez reálnych príkazov.</p></div><div className="bot-head-actions"><button className="ghost" onClick={onRefresh} disabled={loading}>{loading ? 'Skenujem…' : 'Obnoviť trhy'}</button><button className={running ? 'stop-button' : 'run-button'} onClick={onToggle} disabled={!best}>{running ? '■ Zastaviť simulačného bota' : '▶ Spustiť simulačného bota'}</button></div></div>
     <div className="bot-status-grid">
       <article><span>STAV</span><b className={running ? 'positive' : ''}>{running ? 'SLEDUJE TRHY' : 'PRIPRAVENÝ'}</b><small>{running ? 'Reálne obchodovanie vypnuté' : 'Čaká na spustenie'}</small></article>
       <article><span>NAJLEPŠÍ TRH</span><b>{best?.pair || '—'}</b><small>{best ? `Skóre ${best.score}/100` : 'Čakám na OKX dáta'}</small></article>
