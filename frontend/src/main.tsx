@@ -131,12 +131,11 @@ function App() {
     const pairs = universeProposal.picks.map((item: any) => item.pair);
     const nextConfig = { ...config, selected_pairs: pairs };
     const universe = { proposal_id: universeProposal.proposal_id, source: universeProposal.source, accepted_at: new Date().toISOString(), lock: universeProposal.lock, pairs, method: universeProposal.method };
-    const [strategyResponse, versionResponse] = await Promise.all([
-      fetch('/api/strategy', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(nextConfig) }),
-      fetch('/api/strategy-versions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: `OKX universe ${new Date().toLocaleDateString('sk-SK')}`, note: `Automatický návrh ${universeProposal.proposal_id}; uzamknutý na ${universeProposal.lock.hours} h.`, settings: nextConfig, universe }) }),
-    ]);
-    if (!strategyResponse.ok || !versionResponse.ok) { setMessage('Návrh sa nepodarilo uložiť ako novú verziu stratégie.'); return; }
-    setConfig(nextConfig); setMarketPair(pairs[0]); setMessage(`Použitý a zamknutý návrh: ${pairs.join(', ')}.`); await load();
+    const versionResponse = await fetch('/api/strategy-versions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: `OKX universe ${new Date().toLocaleDateString('sk-SK')}`, note: `Automatický návrh ${universeProposal.proposal_id}; uzamknutý na ${universeProposal.lock.hours} h.`, settings: nextConfig, universe }) });
+    if (!versionResponse.ok) { setMessage('Návrh sa nepodarilo uložiť ako novú verziu stratégie.'); return; }
+    const strategyResponse = await fetch('/api/strategy', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(nextConfig) });
+    if (!strategyResponse.ok) { setMessage('Nová verzia vznikla, ale nepodarilo sa ju nastaviť ako aktívnu.'); return; }
+    setConfig(nextConfig); setMarketPair(pairs[0]); setUniverseProposal(null); setMessage(`Návrh bol použitý, uložený a zamknutý: ${pairs.join(', ')}.`); await load();
   };
   const compare = async () => { if (!left || !right || left === right) { setMessage('Vyber dve rozdielne verzie backtestu.'); return; } const response = await fetch(`/api/backtests/compare?left=${encodeURIComponent(left)}&right=${encodeURIComponent(right)}`); if (response.ok) setComparison(await response.json()); else setMessage('Backtesty sa nepodarilo porovnať.'); };
   const exportConfig = async () => { const response = await fetch('/api/export/freqtrade', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config) }); const blob = new Blob([JSON.stringify(await response.json(), null, 2)], { type: 'application/json' }); const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = 'revoltis-dry-run-config.json'; link.click(); URL.revokeObjectURL(link.href); };
