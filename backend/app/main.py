@@ -138,7 +138,7 @@ okx_history_semaphore = asyncio.Semaphore(1)
 okx_history_rate_lock = asyncio.Lock()
 okx_history_last_request = 0.0
 okx_candle_cache: dict[tuple[str, str, int, int, int], tuple[float, list[dict[str, Any]]]] = {}
-OKX_HISTORY_MIN_INTERVAL = .14
+OKX_HISTORY_MIN_INTERVAL = .15
 OKX_CANDLE_CACHE_SECONDS = 15 * 60
 
 
@@ -277,7 +277,7 @@ async def market_candles(pair: str, timeframe: str = "3m", limit: int = 480):
     return {"source": "OKX public spot API", "pair": pair.upper(), "timeframe": timeframe, "candles": candles, "live_trading": False}
 
 
-async def load_okx_candles(pair: str, timeframe: str, limit: int, start_time: int | None = None, end_time: int | None = None, progress_callback: Any | None = None) -> list[dict[str, Any]]:
+async def load_okx_candles(pair: str, timeframe: str, limit: int, start_time: int | None = None, end_time: int | None = None, progress_callback: Any | None = None, cache_info: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """Load complete OKX history without exceeding the public rate limit."""
     global okx_history_last_request
     instrument = pair.replace("/", "-").upper()
@@ -288,35 +288,59 @@ async def load_okx_candles(pair: str, timeframe: str, limit: int, start_time: in
     cached = okx_candle_cache.get(cache_key)
     now = asyncio.get_running_loop().time()
     if cached and now - cached[0] < OKX_CANDLE_CACHE_SECONDS:
+        if cache_info is not None:
+            cache_info.update({"key": f"okx:{instrument}:{timeframe}:{start}:{end}", "cached": True, "retries_429": 0})
         return cached[1]
+    if cache_info is not None:
+        cache_info.update({"key": f"okx:{instrument}:{timeframe}:{start}:{end}", "cached": False, "retries_429": 0})
     page_size = 100
-    pages = max(1, min(450, math.ceil(min(limit, max(1, (end - start) // step + 1)) / page_size)))
+    expected = min(limit, max(1, (end - start) // step + 1))
     batches: list[list[list[str]]] = []
     async with okx_history_semaphore:
         async with httpx.AsyncClient(timeout=20, trust_env=False) as client:
-            for index in range(pages):
-                if progress_callback:
-                    progress_callback(index + 1, pages)
-                page_end = end - index * page_size * step + step
+            async def request_page(url: str, params: dict[str, Any]) -> list[list[str]]:
+                nonlocal client
+                global okx_history_last_request
                 response = None
-                for attempt in range(8):
+                for attempt in range(5):
                     async with okx_history_rate_lock:
                         elapsed = asyncio.get_running_loop().time() - okx_history_last_request
                         if elapsed < OKX_HISTORY_MIN_INTERVAL:
                             await asyncio.sleep(OKX_HISTORY_MIN_INTERVAL - elapsed)
-                        response = await client.get(OKX_HISTORY_CANDLES_URL, params={"instId": instrument, "bar": timeframe, "after": page_end, "limit": page_size})
+                        response = await client.get(url, params=params)
                         okx_history_last_request = asyncio.get_running_loop().time()
                     if response.status_code != 429:
                         break
+                    if cache_info is not None:
+                        cache_info["retries_429"] = int(cache_info.get("retries_429", 0)) + 1
                     retry_after = response.headers.get("Retry-After")
-                    delay = float(retry_after) if retry_after and retry_after.replace(".", "", 1).isdigit() else min(8.0, .75 * (2 ** attempt))
+                    delay = float(retry_after) if retry_after and retry_after.replace(".", "", 1).isdigit() else min(8.0, float(2 ** attempt))
                     await asyncio.sleep(delay)
                 assert response is not None
                 response.raise_for_status()
                 payload = response.json()
                 if payload.get("code") != "0":
                     raise httpx.HTTPStatusError(payload.get("msg") or "OKX candle error", request=response.request, response=response)
-                batches.append(payload.get("data", []))
+                return payload.get("data", [])
+
+            # The current-candles endpoint reduces the number of historical pages.
+            recent = await request_page(OKX_CANDLES_URL, {"instId": instrument, "bar": timeframe, "limit": min(300, int(expected))})
+            batches.append(recent)
+            cursor = min((int(row[0]) for row in recent), default=end + step)
+            history_pages = max(0, min(450, math.ceil(max(0, cursor - start) / step / page_size)))
+            for index in range(history_pages):
+                if progress_callback:
+                    progress_callback(index + 1, history_pages)
+                batch = await request_page(OKX_HISTORY_CANDLES_URL, {"instId": instrument, "bar": timeframe, "after": cursor, "limit": page_size})
+                if not batch:
+                    break
+                batches.append(batch)
+                next_cursor = min(int(row[0]) for row in batch)
+                if next_cursor >= cursor:
+                    break
+                cursor = next_cursor
+                if cursor <= start:
+                    break
     unique: dict[int, list[str]] = {}
     for batch in batches:
         for row in batch:
@@ -548,34 +572,63 @@ async def run_standalone_simulation(request: SimulationRequest):
 async def run_optimizer_job(job_id: str, request: OptimizerRequest) -> None:
     job = optimizer_jobs[job_id]
     try:
-        end_time = int(datetime.now(UTC).timestamp() * 1000)
+        job_pairs = list(request.pairs)
+        versions = await supabase_get("strategy_versions", "order=created_at.desc&limit=20")
+        now_utc = datetime.now(UTC)
+        for version in versions:
+            universe = (version.get("settings") or {}).get("_universe") or {}
+            expires_at = (universe.get("lock") or {}).get("expires_at")
+            try:
+                lock_active = bool(expires_at and datetime.fromisoformat(str(expires_at).replace("Z", "+00:00")) > now_utc)
+            except (TypeError, ValueError):
+                lock_active = False
+            if lock_active and universe.get("pairs"):
+                job_pairs = list(universe["pairs"])
+                break
+        job_timeframes = ["15m", "5m"]
+        # Stable candle boundary makes an immediate repeat use the same cache key.
+        smallest_step = min(TIMEFRAME_MILLISECONDS[item] for item in job_timeframes)
+        end_time = int(datetime.now(UTC).timestamp() * 1000) // smallest_step * smallest_step - 1
         start_time = end_time - request.history_days * 86_400_000
         candle_sets: dict[tuple[str, str], list[dict[str, Any]]] = {}
         timeframe_order = {"15m": 0, "5m": 1, "3m": 2, "1m": 3}
-        markets = sorted(((pair, timeframe) for pair in request.pairs for timeframe in request.timeframes), key=lambda item: (timeframe_order.get(item[1], 9), item[0]))
+        markets = sorted(((pair, timeframe) for pair in job_pairs for timeframe in job_timeframes), key=lambda item: (timeframe_order.get(item[1], 9), item[0]))
         download_errors: list[dict[str, str]] = []
+        coverage_by_pair: dict[str, dict[str, Any]] = {}
         for number, (pair, timeframe) in enumerate(markets, 1):
             count = min(45000, max(100, request.history_days * 86_400_000 // TIMEFRAME_MILLISECONDS[timeframe]))
-            job.update({"phase": "downloading", "message": f"Načítavam {pair} · {timeframe}", "progress": round(number / max(1, len(markets)) * 30)})
+            cache_state: dict[str, Any] = {}
+            job.update({"phase": "fetching_candles", "bar": timeframe, "inst_id": pair.replace("/", "-"), "message": f"Načítavam {pair} · {timeframe}", "progress": round(number / max(1, len(markets)) * 30), "cached": False, "retries_429": 0})
             def download_progress(page: int, total: int, current_pair: str = pair, current_timeframe: str = timeframe) -> None:
-                job.update({"phase": "downloading", "message": f"Sťahujem {current_pair} · {current_timeframe}: {page}/{total} strán", "download_page": page, "download_pages": total})
+                job.update({"phase": "fetching_candles", "bar": current_timeframe, "inst_id": current_pair.replace("/", "-"), "page": page, "pages_est": total, "message": f"Sťahujem {current_pair} · {current_timeframe}: {page}/{total} strán", "cached": bool(cache_state.get("cached")), "retries_429": int(cache_state.get("retries_429", 0))})
             try:
-                candles = await load_okx_candles(pair, timeframe, int(count), start_time, end_time, download_progress)
+                candles = await load_okx_candles(pair, timeframe, int(count), start_time, end_time, download_progress, cache_state)
                 coverage = len(candles) / max(1, int(count))
+                coverage_by_pair.setdefault(pair, {})[timeframe] = {"candles": len(candles), "expected": int(count), "coverage": round(coverage, 4), "cached": bool(cache_state.get("cached")), "retries_429": int(cache_state.get("retries_429", 0))}
                 if len(candles) >= 100 and coverage >= .95:
                     candle_sets[(pair, timeframe)] = candles
                 else:
                     download_errors.append({"pair": pair, "timeframe": timeframe, "reason": f"neúplné dáta ({coverage:.1%})"})
             except Exception as error:
+                coverage_by_pair.setdefault(pair, {})[timeframe] = {"candles": 0, "expected": int(count), "coverage": 0, "cached": bool(cache_state.get("cached")), "retries_429": int(cache_state.get("retries_429", 0))}
                 download_errors.append({"pair": pair, "timeframe": timeframe, "reason": str(error)[:180]})
-        if not candle_sets:
+        required_timeframes = set(job_timeframes)
+        pairs_ready = [pair for pair in job_pairs if required_timeframes.issubset({timeframe for candidate_pair, timeframe in candle_sets if candidate_pair == pair})]
+        pairs_dropped = []
+        for pair in job_pairs:
+            if pair not in pairs_ready:
+                reasons = [item["reason"] for item in download_errors if item["pair"] == pair]
+                pairs_dropped.append({"inst_id": pair.replace("/", "-"), "reason": reasons[0] if reasons else "data_incomplete"})
+        candle_sets = {key: value for key, value in candle_sets.items() if key[0] in pairs_ready}
+        job.update({"phase": "scoring", "pairs_ready": [pair.replace("/", "-") for pair in pairs_ready], "pairs_dropped": pairs_dropped})
+        if not pairs_ready:
             raise ValueError("Pre optimalizáciu sa nepodarilo načítať aspoň 95 % sviečok pre žiadny trh.")
 
         loop = asyncio.get_running_loop()
         def update_progress(done: int, total: int, market: str) -> None:
             loop.call_soon_threadsafe(job.update, {"phase": "testing", "message": f"Testujem {market}", "progress": 30 + round(done / total * 68), "tested": done, "total": total})
         result = await asyncio.to_thread(optimize, candle_sets, request.settings.model_dump(), request.trials_per_market, update_progress)
-        result["data_errors"] = download_errors
+        result.update({"source": "okx", "pairs_ready": [pair.replace("/", "-") for pair in pairs_ready], "pairs_dropped": pairs_dropped, "candle_coverage": coverage_by_pair, "data_errors": download_errors})
         now = datetime.now(UTC).isoformat()
         record = {"id": job_id, "status": "completed", "created_at": job["created_at"], "finished_at": now, "request": request.model_dump(), "result": result}
         await supabase_upsert("optimizer_runs", record)
