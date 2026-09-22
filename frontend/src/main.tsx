@@ -117,12 +117,45 @@ function App() {
   const startOptimizer = async () => {
     if (!config || optimizerRunning) return;
     setOptimizerRunning(true); setOptimizer({ status: 'running', progress: 0, message: 'Pripravujem optimalizáciu…' });
-    const response = await fetch('/api/optimizer/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ settings: config, pairs: coins, timeframes: ['1m', '3m', '5m', '15m'], history_days: optimizerDays, trials_per_market: optimizerTrials }) });
-    if (!response.ok) { setOptimizerRunning(false); setOptimizer({ status: 'failed', message: 'Agenta sa nepodarilo spustiť.' }); return; }
-    const started = await response.json(); setOptimizer(started);
-    if (started.status !== 'running') { setOptimizerRunning(false); return; }
-    const poll = async () => { const status = await fetch(`/api/optimizer/${started.id}`); const job = await status.json(); setOptimizer(job); if (job.status === 'running') optimizerTimerRef.current = window.setTimeout(poll, 1500); else { setOptimizerRunning(false); optimizerTimerRef.current = null; } };
-    optimizerTimerRef.current = window.setTimeout(poll, 700);
+    try {
+      // Vercel must finish an optimizer request before returning it. Running all
+      // markets in one request exceeds the function limit, so process one coin
+      // at a time and keep the best independently validated result.
+      const completed: any[] = [];
+      for (let index = 0; index < coins.length; index += 1) {
+        const pair = coins[index];
+        setOptimizer({ status: 'running', progress: Math.round(index / coins.length * 100), message: `Testujem ${pair} (${index + 1}/${coins.length})` });
+        const response = await fetch('/api/optimizer/run', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ settings: config, pairs: [pair], timeframes: ['1m', '3m', '5m', '15m'], history_days: optimizerDays, trials_per_market: optimizerTrials }),
+        });
+        if (!response.ok) {
+          const detail = await response.text();
+          throw new Error(detail || `HTTP ${response.status}`);
+        }
+        let job = await response.json();
+        while (job.status === 'running') {
+          await new Promise(resolve => window.setTimeout(resolve, 1200));
+          const status = await fetch(`/api/optimizer/${job.id}`);
+          if (!status.ok) throw new Error(await status.text());
+          job = await status.json();
+        }
+        if (job.status === 'failed') throw new Error(job.message || `Test ${pair} zlyhal.`);
+        if (job.result) completed.push(job.result);
+      }
+      if (!completed.length) throw new Error('Optimalizácia nevrátila žiadny výsledok.');
+      completed.sort((a, b) => Number(Boolean(b.qualified)) - Number(Boolean(a.qualified)) || Number(b.score) - Number(a.score));
+      const best = completed[0];
+      best.tested_combinations = completed.reduce((sum, item) => sum + Number(item.tested_combinations || 0), 0);
+      best.top_results = completed.slice(0, 5).map(item => ({ pair: item.pair, timeframe: item.timeframe, variant: item.variant, score: item.score, validation_metrics: item.validation_metrics }));
+      setOptimizer({ status: 'completed', progress: 100, message: 'Optimalizácia dokončená', result: best });
+    } catch (error) {
+      const raw = error instanceof Error ? error.message : String(error);
+      setOptimizer({ status: 'failed', message: `Výpočet sa prerušil. ${raw.slice(0, 300)}` });
+    } finally {
+      setOptimizerRunning(false);
+    }
   };
   const copyAlgorithm = async () => { const code = optimizer?.result?.strategy_code; if (!code) return; await navigator.clipboard.writeText(code); setMessage('Výsledný algoritmus bol skopírovaný.'); };
   const installApp = async () => { if (installPrompt) { await installPrompt.prompt(); await installPrompt.userChoice; setInstallPrompt(null); return; } setMessage('iPhone/iPad: v Safari stlač Zdieľať a potom „Pridať na plochu“. Android: otvor menu prehliadača a vyber „Inštalovať aplikáciu“.'); };
