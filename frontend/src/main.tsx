@@ -214,7 +214,7 @@ function App() {
   };
   const testScannerPair = async (pair: string) => {
     if (!config || isRunning) return;
-    const nextConfig = { ...config, selected_pairs: [pair] };
+    const nextConfig: Config = { ...(config as Config), selected_pairs: [pair] };
     const hours: 24 = 24;
     const endTime = Date.now();
     const startTime = endTime - hours * 60 * 60 * 1000;
