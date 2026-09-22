@@ -1,0 +1,19 @@
+services:
+  api:
+    build: ./backend
+    environment:
+      REVOLTIS_DATA_DIR: /app/data
+      SUPABASE_URL: ${SUPABASE_URL:-}
+      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:-}
+      REVOLTIS_SYNC_TOKEN: ${REVOLTIS_SYNC_TOKEN:-}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://localhost:8080}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./runtime_data:/app/data
+  web:
+    build: ./frontend
+    ports:
+      - "8080:80"
+    depends_on:
+      - api
