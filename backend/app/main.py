@@ -134,7 +134,12 @@ OKX_HISTORY_CANDLES_URL = f"{OKX_BASE_URL}/api/v5/market/history-candles"
 ALLOWED_TIMEFRAMES = {"1m", "3m", "5m", "15m", "30m", "1h", "4h", "1d"}
 TIMEFRAME_MILLISECONDS = {"1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000, "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000}
 optimizer_jobs: dict[str, dict[str, Any]] = {}
-okx_history_semaphore = asyncio.Semaphore(8)
+okx_history_semaphore = asyncio.Semaphore(1)
+okx_history_rate_lock = asyncio.Lock()
+okx_history_last_request = 0.0
+okx_candle_cache: dict[tuple[str, str, int, int, int], tuple[float, list[dict[str, Any]]]] = {}
+OKX_HISTORY_MIN_INTERVAL = .14
+OKX_CANDLE_CACHE_SECONDS = 15 * 60
 
 
 def supabase_headers() -> dict[str, str]:
@@ -272,30 +277,46 @@ async def market_candles(pair: str, timeframe: str = "3m", limit: int = 480):
     return {"source": "OKX public spot API", "pair": pair.upper(), "timeframe": timeframe, "candles": candles, "live_trading": False}
 
 
-async def load_okx_candles(pair: str, timeframe: str, limit: int, start_time: int | None = None, end_time: int | None = None) -> list[dict[str, Any]]:
-    """Load complete OKX history in parallel 100-candle pages."""
+async def load_okx_candles(pair: str, timeframe: str, limit: int, start_time: int | None = None, end_time: int | None = None, progress_callback: Any | None = None) -> list[dict[str, Any]]:
+    """Load complete OKX history without exceeding the public rate limit."""
+    global okx_history_last_request
     instrument = pair.replace("/", "-").upper()
     step = TIMEFRAME_MILLISECONDS[timeframe]
     end = end_time or int(datetime.now(UTC).timestamp() * 1000)
     start = start_time if start_time is not None else end - limit * step
+    cache_key = (instrument, timeframe, int(limit), int(start), int(end))
+    cached = okx_candle_cache.get(cache_key)
+    now = asyncio.get_running_loop().time()
+    if cached and now - cached[0] < OKX_CANDLE_CACHE_SECONDS:
+        return cached[1]
     page_size = 100
     pages = max(1, min(450, math.ceil(min(limit, max(1, (end - start) // step + 1)) / page_size)))
-    async def fetch_page(index: int) -> list[list[str]]:
-        page_end = end - index * page_size * step + step
-        async with okx_history_semaphore:
-            async with httpx.AsyncClient(timeout=15, trust_env=False) as client:
-                for attempt in range(4):
-                    response = await client.get(OKX_HISTORY_CANDLES_URL, params={"instId": instrument, "bar": timeframe, "after": page_end, "limit": page_size})
+    batches: list[list[list[str]]] = []
+    async with okx_history_semaphore:
+        async with httpx.AsyncClient(timeout=20, trust_env=False) as client:
+            for index in range(pages):
+                if progress_callback:
+                    progress_callback(index + 1, pages)
+                page_end = end - index * page_size * step + step
+                response = None
+                for attempt in range(8):
+                    async with okx_history_rate_lock:
+                        elapsed = asyncio.get_running_loop().time() - okx_history_last_request
+                        if elapsed < OKX_HISTORY_MIN_INTERVAL:
+                            await asyncio.sleep(OKX_HISTORY_MIN_INTERVAL - elapsed)
+                        response = await client.get(OKX_HISTORY_CANDLES_URL, params={"instId": instrument, "bar": timeframe, "after": page_end, "limit": page_size})
+                        okx_history_last_request = asyncio.get_running_loop().time()
                     if response.status_code != 429:
                         break
-                    await asyncio.sleep(.35 * (attempt + 1))
+                    retry_after = response.headers.get("Retry-After")
+                    delay = float(retry_after) if retry_after and retry_after.replace(".", "", 1).isdigit() else min(8.0, .75 * (2 ** attempt))
+                    await asyncio.sleep(delay)
+                assert response is not None
                 response.raise_for_status()
                 payload = response.json()
                 if payload.get("code") != "0":
                     raise httpx.HTTPStatusError(payload.get("msg") or "OKX candle error", request=response.request, response=response)
-                return payload.get("data", [])
-
-    batches = await asyncio.gather(*(fetch_page(index) for index in range(pages)))
+                batches.append(payload.get("data", []))
     unique: dict[int, list[str]] = {}
     for batch in batches:
         for row in batch:
@@ -303,7 +324,12 @@ async def load_okx_candles(pair: str, timeframe: str, limit: int, start_time: in
             if start <= timestamp <= end:
                 unique[timestamp] = row
     rows = [unique[key] for key in sorted(unique)][-limit:]
-    return [{"open_time": int(row[0]), "open": float(row[1]), "high": float(row[2]), "low": float(row[3]), "close": float(row[4]), "volume": float(row[5]), "quote_volume": float(row[7] or 0), "close_time": int(row[0]) + step - 1} for row in rows]
+    result = [{"open_time": int(row[0]), "open": float(row[1]), "high": float(row[2]), "low": float(row[3]), "close": float(row[4]), "volume": float(row[5]), "quote_volume": float(row[7] or 0), "close_time": int(row[0]) + step - 1} for row in rows]
+    okx_candle_cache[cache_key] = (asyncio.get_running_loop().time(), result)
+    if len(okx_candle_cache) > 64:
+        oldest = min(okx_candle_cache, key=lambda key: okx_candle_cache[key][0])
+        okx_candle_cache.pop(oldest, None)
+    return result
 
 
 def percentile_rank(values: list[float], value: float, reverse: bool = False) -> float:
@@ -525,20 +551,31 @@ async def run_optimizer_job(job_id: str, request: OptimizerRequest) -> None:
         end_time = int(datetime.now(UTC).timestamp() * 1000)
         start_time = end_time - request.history_days * 86_400_000
         candle_sets: dict[tuple[str, str], list[dict[str, Any]]] = {}
-        markets = [(pair, timeframe) for pair in request.pairs for timeframe in request.timeframes]
+        timeframe_order = {"15m": 0, "5m": 1, "3m": 2, "1m": 3}
+        markets = sorted(((pair, timeframe) for pair in request.pairs for timeframe in request.timeframes), key=lambda item: (timeframe_order.get(item[1], 9), item[0]))
+        download_errors: list[dict[str, str]] = []
         for number, (pair, timeframe) in enumerate(markets, 1):
             count = min(45000, max(100, request.history_days * 86_400_000 // TIMEFRAME_MILLISECONDS[timeframe]))
             job.update({"phase": "downloading", "message": f"Načítavam {pair} · {timeframe}", "progress": round(number / max(1, len(markets)) * 30)})
-            candles = await load_okx_candles(pair, timeframe, int(count), start_time, end_time)
-            if len(candles) >= 100:
-                candle_sets[(pair, timeframe)] = candles
+            def download_progress(page: int, total: int, current_pair: str = pair, current_timeframe: str = timeframe) -> None:
+                job.update({"phase": "downloading", "message": f"Sťahujem {current_pair} · {current_timeframe}: {page}/{total} strán", "download_page": page, "download_pages": total})
+            try:
+                candles = await load_okx_candles(pair, timeframe, int(count), start_time, end_time, download_progress)
+                coverage = len(candles) / max(1, int(count))
+                if len(candles) >= 100 and coverage >= .95:
+                    candle_sets[(pair, timeframe)] = candles
+                else:
+                    download_errors.append({"pair": pair, "timeframe": timeframe, "reason": f"neúplné dáta ({coverage:.1%})"})
+            except Exception as error:
+                download_errors.append({"pair": pair, "timeframe": timeframe, "reason": str(error)[:180]})
         if not candle_sets:
-            raise ValueError("Pre optimalizáciu sa nepodarilo načítať dostatok sviečok.")
+            raise ValueError("Pre optimalizáciu sa nepodarilo načítať aspoň 95 % sviečok pre žiadny trh.")
 
         loop = asyncio.get_running_loop()
         def update_progress(done: int, total: int, market: str) -> None:
             loop.call_soon_threadsafe(job.update, {"phase": "testing", "message": f"Testujem {market}", "progress": 30 + round(done / total * 68), "tested": done, "total": total})
         result = await asyncio.to_thread(optimize, candle_sets, request.settings.model_dump(), request.trials_per_market, update_progress)
+        result["data_errors"] = download_errors
         now = datetime.now(UTC).isoformat()
         record = {"id": job_id, "status": "completed", "created_at": job["created_at"], "finished_at": now, "request": request.model_dump(), "result": result}
         await supabase_upsert("optimizer_runs", record)
