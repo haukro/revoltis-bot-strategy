@@ -43,3 +43,15 @@ Následne API `GET /api/backtests` vráti výsledky zoradené od najnovšieho. K
 - `simulation` režim je viditeľný v rozhraní aj API.
 - Formulár nenastavuje burzové príkazy; ukladá iba parametre simulácie.
 - Nastavenia obchodu obmedzia rozhranie na 1–5 otvorených pozícií a denný limit 1–100; odporúčaná hodnota je 1 pozícia a 10 obchodov denne.
+
+## Overenie výpočtového jadra
+
+```text
+python -m unittest discover -s backend/tests -v
+python scripts/stress_test_simulation.py
+```
+
+Historický test povinne uzatvorí otvorené pozície poslednou dostupnou cenou,
+zahrnie obidve strany transakčných nákladov a počíta drawdown priebežne z
+mark-to-market hodnoty. Optimalizátor neoznačí variant za overený, ak má menej
+ako 5 validačných obchodov, záporný zisk/skóre alebo drawdown nad 15 %.

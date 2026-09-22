@@ -95,23 +95,31 @@ def optimize(candle_sets: dict[tuple[str, str], list[dict[str, Any]]], base: dic
         for index, variant in enumerate(variants):
             settings = base | variant | {"selected_pairs": [pair], "timeframe": timeframe, "max_open_trades": 1}
             # 0.15% per side approximates exchange fee plus modest execution friction.
-            train_result = simulate({pair: train}, settings, fee=0.0015)
-            validation_result = simulate({pair: validation}, settings, fee=0.0015)
+            train_result = simulate({pair: train}, settings, fee=0.0015, force_close_at_end=True)
+            validation_result = simulate({pair: validation}, settings, fee=0.0015, force_close_at_end=True)
             train_metrics, validation_metrics = train_result["metrics"], validation_result["metrics"]
             train_profit_pct = float(train_metrics["realized_profit"]) / capital * 100
+            candidate_score = score(validation_metrics, capital, train_profit_pct)
+            qualified = (
+                int(validation_metrics["closed_trades"]) >= 5
+                and float(validation_metrics["realized_profit"]) > 0
+                and float(validation_metrics["max_drawdown_percent"]) <= 15
+                and candidate_score > 0
+            )
             results.append({
                 "pair": pair, "timeframe": timeframe, "variant": index + 1, "settings": settings,
                 "train_metrics": train_metrics, "validation_metrics": validation_metrics,
-                "score": score(validation_metrics, capital, train_profit_pct),
+                "score": candidate_score, "qualified": qualified,
             })
             completed += 1
             if progress:
                 progress(completed, total, f"{pair} · {timeframe}")
-    results.sort(key=lambda row: row["score"], reverse=True)
+    results.sort(key=lambda row: (row["qualified"], row["score"]), reverse=True)
     best = results[0]
     best["strategy_code"] = generate_freqtrade_strategy(best["pair"], best["timeframe"], best["settings"])
     best["tested_combinations"] = total
     best["method"] = "70 % tréning / 30 % nezávislé overenie"
     best["cost_model"] = "0,15 % na každej strane obchodu (poplatok + rezerva na vykonanie)"
+    best["verdict"] = "overený kandidát" if best["qualified"] else "nedostatočné dôkazy – nepoužiť na live obchodovanie"
     best["top_results"] = [{k: row[k] for k in ("pair", "timeframe", "variant", "score", "validation_metrics")} for row in results[:5]]
     return best
