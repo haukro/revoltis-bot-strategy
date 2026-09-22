@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from random import Random
+from statistics import pstdev
 from typing import Any, Callable
 
 from .simulation import simulate
@@ -31,13 +32,55 @@ def candidates(base: dict[str, Any], count: int) -> list[dict[str, Any]]:
     return result
 
 
-def score(metrics: dict[str, Any], capital: float, train_profit_pct: float) -> float:
+PRIMARY_TIMEFRAMES = {"5m", "15m"}
+COST_PER_SIDE = {"1m": 0.0022, "3m": 0.0018, "5m": 0.0015, "15m": 0.0013}
+MIN_VALIDATION_TRADES = 20
+MAX_DRAWDOWN_PERCENT = 10.0
+
+
+def score(metrics: dict[str, Any], capital: float, stability_penalty: float) -> float:
     profit_pct = float(metrics["realized_profit"]) / capital * 100
     drawdown = float(metrics["max_drawdown_percent"])
     trades = int(metrics["closed_trades"])
-    stability_penalty = abs(train_profit_pct - profit_pct) * 0.25
-    low_trade_penalty = max(0, 3 - trades) * 1.5
-    return round(profit_pct - 1.5 * drawdown - stability_penalty - low_trade_penalty + min(trades, 20) * 0.03, 5)
+    low_trade_penalty = max(0, MIN_VALIDATION_TRADES - trades) * 0.15
+    return round(profit_pct - 1.5 * drawdown - stability_penalty - low_trade_penalty + min(trades, 40) * 0.02, 5)
+
+
+def aggregate_metrics(items: list[dict[str, Any]], capital: float) -> dict[str, Any]:
+    trades = sum(int(item["closed_trades"]) for item in items)
+    wins = sum(int(round(int(item["closed_trades"]) * float(item["win_rate"]) / 100)) for item in items)
+    profit = sum(float(item["realized_profit"]) for item in items)
+    return {
+        "initial_capital": capital,
+        "portfolio_value": round(capital + profit, 4),
+        "realized_profit": round(profit, 4),
+        "unrealized_profit": 0,
+        "closed_trades": trades,
+        "win_rate": round(wins / trades * 100, 1) if trades else 0,
+        "max_drawdown_percent": round(max((float(item["max_drawdown_percent"]) for item in items), default=0), 2),
+    }
+
+
+def walk_forward_windows(candles: list[dict[str, Any]]) -> tuple[list[tuple[list[dict[str, Any]], list[dict[str, Any]]]], list[dict[str, Any]]]:
+    """Keep the final 20% untouched and build three chronological expanding windows."""
+    holdout_start = max(120, int(len(candles) * 0.8))
+    development, holdout = candles[:holdout_start], candles[max(0, holdout_start - 40):]
+    boundaries = ((0.50, 2 / 3), (2 / 3, 5 / 6), (5 / 6, 1.0))
+    windows = []
+    for train_ratio, validation_ratio in boundaries:
+        train_end = max(80, int(len(development) * train_ratio))
+        validation_end = max(train_end + 40, int(len(development) * validation_ratio))
+        train = development[:train_end]
+        validation = development[max(0, train_end - 40):min(len(development), validation_end)]
+        windows.append((train, validation))
+    return windows, holdout
+
+
+def buy_and_hold_percent(candles: list[dict[str, Any]], cost_per_side: float) -> float:
+    if len(candles) < 2:
+        return 0.0
+    first, last = float(candles[0]["close"]), float(candles[-1]["close"])
+    return round(((last / first - 1) - 2 * cost_per_side) * 100, 4) if first else 0.0
 
 
 def generate_freqtrade_strategy(pair: str, timeframe: str, settings: dict[str, Any]) -> str:
@@ -90,36 +133,55 @@ def optimize(candle_sets: dict[tuple[str, str], list[dict[str, Any]]], base: dic
     completed, results = 0, []
     capital = float(base["initial_capital"])
     for (pair, timeframe), candles in candle_sets.items():
-        split = max(40, int(len(candles) * 0.7))
-        train, validation = candles[:split], candles[max(0, split - 40):]
+        windows, holdout = walk_forward_windows(candles)
+        cost_per_side = COST_PER_SIDE.get(timeframe, 0.0018)
         for index, variant in enumerate(variants):
             settings = base | variant | {"selected_pairs": [pair], "timeframe": timeframe, "max_open_trades": 1}
-            # 0.15% per side approximates exchange fee plus modest execution friction.
-            train_result = simulate({pair: train}, settings, fee=0.0015, force_close_at_end=True)
-            validation_result = simulate({pair: validation}, settings, fee=0.0015, force_close_at_end=True)
-            train_metrics, validation_metrics = train_result["metrics"], validation_result["metrics"]
-            train_profit_pct = float(train_metrics["realized_profit"]) / capital * 100
-            candidate_score = score(validation_metrics, capital, train_profit_pct)
-            qualified = (
-                int(validation_metrics["closed_trades"]) >= 5
-                and float(validation_metrics["realized_profit"]) > 0
-                and float(validation_metrics["max_drawdown_percent"]) <= 15
+            train_metrics, validation_window_metrics = [], []
+            for train, validation in windows:
+                train_metrics.append(simulate({pair: train}, settings, fee=cost_per_side, force_close_at_end=True)["metrics"])
+                validation_window_metrics.append(simulate({pair: validation}, settings, fee=cost_per_side, force_close_at_end=True)["metrics"])
+            validation_metrics = aggregate_metrics(validation_window_metrics, capital)
+            window_profit_pcts = [float(item["realized_profit"]) / capital * 100 for item in validation_window_metrics]
+            stability = pstdev(window_profit_pcts) if len(window_profit_pcts) > 1 else 0.0
+            candidate_score = score(validation_metrics, capital, stability)
+            validation_passed = (
+                timeframe in PRIMARY_TIMEFRAMES
+                and int(validation_metrics["closed_trades"]) >= MIN_VALIDATION_TRADES
+                and all(float(item["realized_profit"]) > 0 for item in validation_window_metrics)
+                and float(validation_metrics["max_drawdown_percent"]) <= MAX_DRAWDOWN_PERCENT
                 and candidate_score > 0
             )
             results.append({
                 "pair": pair, "timeframe": timeframe, "variant": index + 1, "settings": settings,
                 "train_metrics": train_metrics, "validation_metrics": validation_metrics,
-                "score": candidate_score, "qualified": qualified,
+                "validation_windows": validation_window_metrics, "holdout_candles": holdout,
+                "cost_per_side": cost_per_side, "score": candidate_score, "validation_passed": validation_passed,
             })
             completed += 1
             if progress:
                 progress(completed, total, f"{pair} · {timeframe}")
-    results.sort(key=lambda row: (row["qualified"], row["score"]), reverse=True)
+    results.sort(key=lambda row: (row["validation_passed"], row["score"]), reverse=True)
     best = results[0]
+    holdout_result = simulate({best["pair"]: best.pop("holdout_candles")}, best["settings"], fee=best["cost_per_side"], force_close_at_end=True)
+    holdout_metrics = holdout_result["metrics"]
+    holdout_profit_pct = float(holdout_metrics["realized_profit"]) / capital * 100
+    holdout_market = walk_forward_windows(candle_sets[(best["pair"], best["timeframe"])])[1]
+    hold_return = buy_and_hold_percent(holdout_market, best["cost_per_side"])
+    best["holdout_metrics"] = holdout_metrics
+    best["validation_metrics"] = holdout_metrics
+    best["buy_hold_percent"] = hold_return
+    best["qualified"] = bool(
+        best["validation_passed"]
+        and int(holdout_metrics["closed_trades"]) >= 3
+        and holdout_profit_pct >= hold_return
+        and float(holdout_metrics["max_drawdown_percent"]) <= MAX_DRAWDOWN_PERCENT
+    )
     best["strategy_code"] = generate_freqtrade_strategy(best["pair"], best["timeframe"], best["settings"])
     best["tested_combinations"] = total
-    best["method"] = "70 % tréning / 30 % nezávislé overenie"
-    best["cost_model"] = "0,15 % na každej strane obchodu (poplatok + rezerva na vykonanie)"
-    best["verdict"] = "overený kandidát" if best["qualified"] else "nedostatočné dôkazy – nepoužiť na live obchodovanie"
+    best["method"] = "3× walk-forward + 20 % nedotknutý holdout"
+    best["cost_model"] = f"{best['cost_per_side'] * 100:.2f} % na každej strane podľa intervalu (fee + spread/sklz)"
+    best["verdict"] = "prešiel holdoutom – pokračovať iba do paper režimu" if best["qualified"] else "holdout nepotvrdil výhodu – nepoužiť na live obchodovanie"
     best["top_results"] = [{k: row[k] for k in ("pair", "timeframe", "variant", "score", "validation_metrics")} for row in results[:5]]
+    best.pop("holdout_candles", None)
     return best
