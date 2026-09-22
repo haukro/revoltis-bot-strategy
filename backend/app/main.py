@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import asyncio
+import math
 from uuid import uuid4
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -87,6 +88,7 @@ class SimulationRequest(BaseModel):
     candle_limit: int = Field(default=500, ge=100, le=45000)
     start_time: int | None = Field(default=None, ge=0)
     end_time: int | None = Field(default=None, ge=0)
+    force_close_at_end: bool = False
 
 
 class OptimizerRequest(BaseModel):
@@ -105,6 +107,7 @@ app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=Fals
 # Binance's dedicated market-data host serves public candles without API keys
 # and is suitable for cloud regions where the trading API returns HTTP 451.
 BINANCE_KLINES_URL = "https://data-api.binance.vision/api/v3/klines"
+OKX_TICKERS_URL = "https://www.okx.com/api/v5/market/tickers"
 ALLOWED_TIMEFRAMES = {"1m", "3m", "5m", "15m", "30m", "1h", "4h", "1d"}
 TIMEFRAME_MILLISECONDS = {"1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000, "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000}
 optimizer_jobs: dict[str, dict[str, Any]] = {}
@@ -162,6 +165,67 @@ async def supabase_upsert_many(table: str, records: list[dict]) -> list[dict]:
 async def health():
     configured = bool(os.getenv("SUPABASE_URL") and os.getenv("SUPABASE_SERVICE_ROLE_KEY"))
     return {"status": "ok", "mode": "supabase" if configured else "demo", "live_trading": False}
+
+
+@app.get("/api/market/scan")
+async def market_scan(quote: str = "USDT", limit: int = 12):
+    """Rank public OKX spot markets. Read-only and does not require credentials."""
+    quote = quote.upper()
+    if quote not in {"USDT", "USDC", "EUR"}:
+        raise HTTPException(422, "Podporované meny sú USDT, USDC a EUR.")
+    if not 3 <= limit <= 30:
+        raise HTTPException(422, "Limit musí byť 3 až 30 trhov.")
+    try:
+        async with httpx.AsyncClient(timeout=12, trust_env=False) as client:
+            response = await client.get(OKX_TICKERS_URL, params={"instType": "SPOT"})
+            response.raise_for_status()
+            payload = response.json()
+    except (httpx.HTTPError, ValueError) as error:
+        raise HTTPException(502, f"OKX skener nie je dostupný: {error}")
+    if payload.get("code") != "0":
+        raise HTTPException(502, payload.get("msg") or "OKX vrátil neplatnú odpoveď.")
+
+    markets = []
+    excluded_bases = {"USDT", "USDC", "USD", "EUR", "DAI", "FDUSD"}
+    for ticker in payload.get("data", []):
+        instrument = str(ticker.get("instId", ""))
+        if not instrument.endswith(f"-{quote}"):
+            continue
+        base = instrument.removesuffix(f"-{quote}")
+        if base in excluded_bases:
+            continue
+        try:
+            last = float(ticker.get("last") or 0)
+            bid = float(ticker.get("bidPx") or 0)
+            ask = float(ticker.get("askPx") or 0)
+            open_24h = float(ticker.get("open24h") or 0)
+            high_24h = float(ticker.get("high24h") or 0)
+            low_24h = float(ticker.get("low24h") or 0)
+            quote_volume = float(ticker.get("volCcy24h") or 0)
+        except (TypeError, ValueError):
+            continue
+        if min(last, bid, ask, open_24h) <= 0 or quote_volume <= 0:
+            continue
+        spread = max(0.0, (ask - bid) / ((ask + bid) / 2) * 100)
+        volatility = max(0.0, (high_24h - low_24h) / open_24h * 100)
+        change = (last / open_24h - 1) * 100
+        # Prefer liquid, tight markets with enough movement to cover costs.
+        liquidity_points = min(55.0, max(0.0, (math.log10(quote_volume) - 4) * 13.75))
+        spread_points = max(0.0, 25.0 - spread * 125)
+        volatility_points = max(0.0, 20.0 - abs(volatility - 5.0) * 2.5)
+        score = round(liquidity_points + spread_points + volatility_points, 1)
+        markets.append({
+            "pair": f"{base}/{quote}", "instrument": instrument, "last": last,
+            "change_24h_percent": round(change, 2), "volume_24h": round(quote_volume, 2),
+            "spread_percent": round(spread, 4), "volatility_24h_percent": round(volatility, 2),
+            "score": score,
+        })
+    markets.sort(key=lambda market: (market["score"], market["volume_24h"]), reverse=True)
+    return {
+        "source": "OKX public spot API", "quote": quote, "scanned": len(markets),
+        "generated_at": datetime.now(UTC).isoformat(), "markets": markets[:limit],
+        "live_trading": False, "method": "likvidita 55 % · spread 25 % · volatilita 20 %",
+    }
 
 
 @app.get("/api/market/candles")
@@ -237,7 +301,7 @@ async def run_standalone_simulation(request: SimulationRequest):
             "first_open_time": candles[0]["open_time"] if candles else None,
             "last_close_time": candles[-1]["close_time"] if candles else None,
         }
-    result = simulate(dict(zip(pairs, candle_sets)), settings)
+    result = simulate(dict(zip(pairs, candle_sets)), settings, force_close_at_end=request.force_close_at_end)
     if result["equity_curve"] and request.start_time:
         start_iso = datetime.fromtimestamp(request.start_time / 1000, UTC).isoformat()
         result["equity_curve"][0]["time"] = start_iso
