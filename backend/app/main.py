@@ -575,6 +575,7 @@ async def run_optimizer_job(job_id: str, request: OptimizerRequest) -> None:
         job_pairs = list(request.pairs)
         versions = await supabase_get("strategy_versions", "order=created_at.desc&limit=20")
         now_utc = datetime.now(UTC)
+        locked_pairs: list[str] = []
         for version in versions:
             universe = (version.get("settings") or {}).get("_universe") or {}
             expires_at = (universe.get("lock") or {}).get("expires_at")
@@ -583,8 +584,12 @@ async def run_optimizer_job(job_id: str, request: OptimizerRequest) -> None:
             except (TypeError, ValueError):
                 lock_active = False
             if lock_active and universe.get("pairs"):
-                job_pairs = list(universe["pairs"])
+                locked_pairs = list(universe["pairs"])
                 break
+        if locked_pairs:
+            job_pairs = [pair for pair in request.pairs if pair in locked_pairs]
+            if not job_pairs:
+                raise ValueError("Požadovaný pár nie je súčasťou zamknutého universe.")
         job_timeframes = ["15m", "5m"]
         # Stable candle boundary makes an immediate repeat use the same cache key.
         smallest_step = min(TIMEFRAME_MILLISECONDS[item] for item in job_timeframes)
