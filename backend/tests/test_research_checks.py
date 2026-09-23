@@ -7,7 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.costs import book_costs, net_return
-from app.main import app, return_correlation, buy_hold_risk_metrics
+from app.main import app, return_correlation, buy_hold_risk_metrics, load_okx_candles, okx_candle_cache
 from app.optimizer import present_optimizer_record
 from app.simulation import simulate
 from test_simulation import candles, settings
@@ -128,6 +128,33 @@ def test_correlation_aligns_by_timestamp_and_does_not_use_unmatched_returns():
     assert return_correlation(left, right) == pytest.approx(1.)
     with pytest.raises(ValueError):
         return_correlation(left, {'later': 1.})
+
+
+def test_past_candle_window_anchors_history_at_requested_end_and_skips_live_endpoint():
+    step = 300_000
+    start = 1_700_000_000_000
+    last_open = start + 2 * step
+    end = last_open + step - 1
+    rows = [
+        [str(ts), "100", "101", "99", "100", "1", "0", "100", "1"]
+        for ts in (last_open, start + step, start)
+    ]
+    calls = []
+
+    def respond(request):
+        calls.append((request.url.path, dict(request.url.params)))
+        assert request.url.path.endswith("/history-candles")
+        assert int(request.url.params["after"]) == end + step
+        return httpx.Response(200, json={"code": "0", "data": rows})
+
+    real_client = httpx.AsyncClient
+    okx_candle_cache.clear()
+    with patch("app.main.httpx.AsyncClient", side_effect=lambda **kw: real_client(transport=httpx.MockTransport(respond))), \
+         patch("app.main.asyncio.sleep", AsyncMock()):
+        result = asyncio.run(load_okx_candles("ZEC/USDT", "5m", 3, start, end))
+    assert [row["open_time"] for row in result] == [start, start + step, last_open]
+    assert all(not path.endswith("/market/candles") for path, _ in calls)
+    okx_candle_cache.clear()
 
 
 def test_universe_rejects_wide_bonk_and_leveraged_tokens_and_partial_outage_returns_no_pick():
