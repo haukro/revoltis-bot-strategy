@@ -90,6 +90,30 @@ class SimulationAuditTests(unittest.TestCase):
         self.assertAlmostEqual(result["metrics"]["portfolio_value"], expected, places=3)
         self.assertEqual(result["metrics"]["unrealized_profit"], 0)
 
+    def test_max_no_trail_hours_closes_only_when_trailing_never_activated(self):
+        prices = [100.0] * 25 + [90.0, 91.0] + [91.0] * 20
+        result = simulation.simulate(
+            {"TEST/USDT": candles(prices)},
+            settings(max_no_trail_hours=0.05),
+            force_close_at_end=True,
+        )
+        timed = [trade for trade in result["trades"] if trade["exit_reason"] == "max_no_trail_hours"]
+        self.assertEqual(len(timed), 1)
+        self.assertGreaterEqual(timed[0]["raw"]["duration_min"], 3.0)
+
+    def test_max_no_trail_hours_does_not_fire_after_trailing_activation(self):
+        prices = [100.0] * 25 + [90.0, 91.0, 110.0] + [109.9] * 10
+        result = simulation.simulate(
+            {"TEST/USDT": candles(prices)},
+            settings(
+                max_no_trail_hours=0.05,
+                trailing_start_percent=10,
+                trailing_distance_percent=50,
+            ),
+            force_close_at_end=True,
+        )
+        self.assertFalse(any(trade["exit_reason"] == "max_no_trail_hours" for trade in result["trades"]))
+
 
 if __name__ == "__main__":
     unittest.main()
