@@ -7,7 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.costs import book_costs, net_return
-from app.main import app, return_correlation
+from app.main import app, return_correlation, buy_hold_risk_metrics
 from app.optimizer import present_optimizer_record
 from app.simulation import simulate
 from test_simulation import candles, settings
@@ -53,6 +53,27 @@ def test_new_cost_model_changes_only_net_accounting_not_exit_signal():
     assert new['profit_usdt'] == pytest.approx(round(50 * net_return(85 / 91, profile), 6))
     assert new['raw']['cost_components'] == profile
     assert 'cost_components' not in old['raw']
+
+
+def test_buy_hold_risk_uses_same_cost_model_and_marks_drawdown_from_initial_capital():
+    profile = {
+        "entry_cost_rate": 0.001,
+        "exit_cost_rate": 0.001,
+    }
+    data = [
+        {"close": 100},
+        {"close": 120},
+        {"close": 90},
+        {"close": 110},
+    ]
+    result = buy_hold_risk_metrics(data, profile, 100)
+    expected_return = net_return(110 / 100, profile) * 100
+    assert result["return_percent"] == pytest.approx(round(expected_return, 4))
+    equity_120 = 100 * (1 + net_return(1.2, profile))
+    equity_90 = 100 * (1 + net_return(.9, profile))
+    expected_dd = (equity_120 - equity_90) / equity_120 * 100
+    assert result["max_drawdown_percent"] == pytest.approx(round(expected_dd, 4))
+    assert result["bars"] == 4
 
 
 def test_diagnostic_moves_to_uni_17_positive_without_running_or_promoting_anything():
