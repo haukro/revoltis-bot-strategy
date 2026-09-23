@@ -41,6 +41,7 @@ class StrategySettings(BaseModel):
     stop_loss_percent: float = Field(4.0, ge=0.1, le=50)
     trailing_start_percent: float = Field(1.2, ge=0.1, le=20)
     trailing_distance_percent: float = Field(0.5, ge=0.05, le=10)
+    max_no_trail_hours: float = Field(0, ge=0, le=168)
 
 
 class SimulatedTrade(BaseModel):
@@ -119,7 +120,7 @@ class OptimizerRequest(BaseModel):
     version_id: str | None = None
     pairs: list[str] = Field(default_factory=list, min_length=1, max_length=20)
     timeframes: list[Literal["1m", "3m", "5m", "15m"]] = Field(default_factory=lambda: ["1m", "3m", "5m", "15m"])
-    history_days: Literal[1, 7, 14, 30] = 7
+    history_days: Literal[1, 7, 14, 30, 90] = 7
     trials_per_market: int = Field(default=3, ge=1, le=8)
 
 
@@ -709,7 +710,9 @@ async def run_optimizer_job(job_id: str, request: OptimizerRequest) -> None:
                 cost_models[pair] = await load_pair_cost_model(pair, float(request.settings.stake_amount))
             except (httpx.HTTPError, ValueError, KeyError) as error:
                 cost_errors.append({"pair": pair, "timeframe": "book", "reason": f"cost_model_unavailable: {error}"})
-        job_timeframes = ["15m", "5m"]
+        job_timeframes = list(dict.fromkeys(tf for tf in request.timeframes if tf in {"15m", "5m"}))
+        if not job_timeframes:
+            raise ValueError("Optimalizácia podporuje iba intervaly 15m a 5m.")
         # Stable candle boundary makes an immediate repeat use the same cache key.
         smallest_step = min(TIMEFRAME_MILLISECONDS[item] for item in job_timeframes)
         end_time = int(datetime.now(UTC).timestamp() * 1000) // smallest_step * smallest_step - 1
