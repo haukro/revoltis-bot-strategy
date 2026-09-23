@@ -102,3 +102,44 @@ def test_expectancy_precedes_payoff_and_insufficient_sample_cannot_rank():
     assert validation_rank(short)[0] == float("-inf")
     assert payoff_note(low_payoff["walk_forward_metrics"], 10, beats_hold=True) == "slaby_pomer"
     assert payoff_note(short["walk_forward_metrics"], 20) is None
+
+
+def test_optimizer_persists_entry_diagnostics_for_each_wf_window():
+    data = candles([100] * 600)
+    pairs = ["UNI/USDT"]
+
+    call_number = 0
+
+    def simulation(markets, config, **kwargs):
+        nonlocal call_number
+        call_number += 1
+        start = kwargs.get("trading_start_time")
+        result = {"metrics": metrics([1] * 8)}
+        if start is not None:
+            result["entry_diagnostics"] = {
+                "n_bars": 100 + call_number,
+                "skip_bollinger": 10,
+                "skip_rsi": 20,
+                "skip_reversal": 30,
+                "skip_rebound": 40,
+                "skip_atr": 50,
+                "skip_volume": 60,
+                "skip_other": 0,
+                "passed_entry": 8,
+            }
+        return result
+
+    with patch("app.optimizer.simulate", side_effect=simulation):
+        result = optimize(
+            {("UNI/USDT", bar): data for bar in ("15m", "5m")},
+            settings(),
+            2,
+            locked_pairs=pairs,
+        )
+
+    for row in result["variant_results"]:
+        windows = row["entry_diagnostics_windows"]
+        assert [window["window"] for window in windows] == ["wf1", "wf2", "wf3"]
+        assert all(window["skip_rsi"] == 20 for window in windows)
+        assert all(window["skip_rebound"] == 40 for window in windows)
+        assert all(window["passed_entry"] == 8 for window in windows)
