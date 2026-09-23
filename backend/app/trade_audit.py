@@ -9,6 +9,7 @@ import json
 import zlib
 from collections import Counter
 from math import isfinite
+from statistics import median
 from typing import Any
 
 from .simulation import simulate
@@ -52,22 +53,38 @@ def unpack_snapshot(snapshot: dict) -> list[dict]:
 
 
 def trade_tape(result: dict, pair: str, bar: str, variant_id: str, window: str, fee: float) -> list[dict]:
-    reasons = {"stop_loss": "stop_loss", "trailing_profit": "trailing", "end_of_test": "window_end"}
+    # The engine owns exit priority and the canonical reason. Audit only maps
+    # the engine's reason into the reporting taxonomy; it never infers a reason
+    # from prices, PnL, duration or excursion data.
+    reasons = {
+        "stop_loss": "stop_loss",
+        "trailing_profit": "trailing_profit",
+        "max_no_trail_hours": "max_no_trail",
+        "end_of_test": "end_of_test",
+    }
+    bar_minutes = {"1m": 1, "3m": 3, "5m": 5, "15m": 15}.get(bar)
     tape = []
     for trade in result.get("trades", []):
         raw = trade.get("raw", {})
+        hold_minutes = raw.get("duration_min")
+        hold_bars = raw.get("holding_candles")
+        if hold_bars is None and hold_minutes is not None and bar_minutes:
+            hold_bars = int(round(float(hold_minutes) / bar_minutes))
+        trailing_activated = raw.get("trailing_start_reached")
         tape.append({"pair": pair, "bar": bar, "variant_id": variant_id, "window": window,
                      "entry_ts": trade["opened_at"], "exit_ts": trade["closed_at"],
-                     "duration_min": raw.get("duration_min"),
+                     "duration_min": hold_minutes, "hold_minutes": hold_minutes, "hold_bars": hold_bars,
                      "entry_px": trade["entry_rate"], "exit_px": trade["exit_rate"],
                      "pnl_net": trade["profit_usdt"], "stake_amount": trade["stake_amount"],
                      "cost_per_side": fee, "mae": raw.get("mae"), "mfe": raw.get("mfe"),
                      "cost_components": raw.get("cost_components"),
                      "excursion_unit": "gross_price_percent",
                      "exit_reason": reasons.get(trade.get("exit_reason"), "other"),
+                     "engine_exit_reason": trade.get("exit_reason"),
                      "sl_before_trail": raw.get("sl_before_trail", False),
                      "trailing_start_percent": raw.get("trailing_start_percent"),
-                     "mfe_reached_trailing_start": raw.get("trailing_start_reached"),
+                     "trailing_activated": trailing_activated,
+                     "mfe_reached_trailing_start": trailing_activated,
                      "trail_active_before_exit_candle": raw.get("trail_active_before_exit_candle")})
     return tape
 
@@ -77,18 +94,33 @@ def tape_summary(trades: list[dict]) -> dict:
     losses = [t for t in trades if t["pnl_net"] < 0]
     counts = Counter(t["exit_reason"] for t in trades)
     mfe_known = all(t.get("mfe") is not None for t in losses)
+    hold_minutes = [float(t["hold_minutes"]) for t in trades if t.get("hold_minutes") is not None]
+    timeout = [t for t in trades if t.get("exit_reason") == "max_no_trail"]
+    timeout_wins = [t for t in timeout if t["pnl_net"] > 0]
+    timeout_losses = [t for t in timeout if t["pnl_net"] < 0]
+    trail_known = [t for t in trades if t.get("trailing_activated") is not None]
+    trail_activated = [t for t in trail_known if t.get("trailing_activated") is True]
     return {"n": len(trades), "win": len(wins), "loss": len(losses),
             "breakeven": len(trades) - len(wins) - len(losses),
             "pnl_net": round(sum(t["pnl_net"] for t in trades), 6),
             "avg_win": sum(t["pnl_net"] for t in wins) / len(wins) if wins else None,
             "avg_loss": -sum(t["pnl_net"] for t in losses) / len(losses) if losses else None,
             "exit_reasons": {reason: {"n": counts[reason], "share_percent": 100 * counts[reason] / len(trades) if trades else 0}
-                             for reason in ("stop_loss", "trailing", "window_end", "other")},
+                             for reason in ("stop_loss", "trailing_profit", "max_no_trail", "end_of_test", "other")},
             "avg_mfe_losses": sum(t["mfe"] for t in losses) / len(losses) if losses and mfe_known else None,
             "losses_mfe_at_least_trailing_start": sum(t.get("mfe_reached_trailing_start") is True for t in losses)
                 if losses and mfe_known else None,
-            "sl_before_trail": sum(t.get("sl_before_trail") is True for t in trades)}
-
+            "sl_before_trail": sum(t.get("sl_before_trail") is True for t in trades),
+            "avg_hold_minutes": sum(hold_minutes) / len(hold_minutes) if hold_minutes else None,
+            "median_hold_minutes": median(hold_minutes) if hold_minutes else None,
+            "timeout_positive": len(timeout_wins),
+            "timeout_negative": len(timeout_losses),
+            "timeout_breakeven": len(timeout) - len(timeout_wins) - len(timeout_losses),
+            "timeout_profitable_share_percent": 100 * len(timeout_wins) / len(timeout) if timeout else None,
+            "trailing_activated": len(trail_activated),
+            "trailing_activated_share_percent": 100 * len(trail_activated) / len(trail_known) if trail_known else None,
+            "trail_never_activated": len(trail_known) - len(trail_activated),
+            "trail_never_activated_share_percent": 100 * (len(trail_known) - len(trail_activated)) / len(trail_known) if trail_known else None}
 
 def matches_target(row: dict) -> bool:
     expected = AUDIT_TARGETS.get(row.get("pair"))

@@ -480,7 +480,7 @@ function FreqtradeVisual({ result, activeVersionId }: { result: any, activeVersi
 function AlgorithmResult({ result, onCopy }: { result: any, onCopy: () => void }) {
   const view = normalizeOptimizerResult(result);
   const m = view.holdout_metrics;
-  const parameterKeys = ['bb_period', 'bb_deviation', 'rsi_period', 'rsi_oversold', 'atr_period', 'atr_min_percent', 'atr_max_percent', 'min_volume_ratio', 'rebound_min_percent', 'rebound_max_percent', 'stop_loss_percent', 'trailing_start_percent', 'trailing_distance_percent'];
+  const parameterKeys = ['bb_period', 'bb_deviation', 'rsi_period', 'rsi_oversold', 'atr_period', 'atr_min_percent', 'atr_max_percent', 'min_volume_ratio', 'rebound_min_percent', 'rebound_max_percent', 'stop_loss_percent', 'trailing_start_percent', 'trailing_distance_percent', 'max_no_trail_hours'];
   return <div className={`algorithm-result ${view.qualified ? '' : 'algorithm-rejected'}`}>
     <div className="result-title"><div>
       <span>{view.job_verdict}</span>
@@ -576,8 +576,9 @@ function CurrentTradeAuditPanel({ view }: { view: any }) {
   const lossHitTrailThenStop = losses.filter((trade: any) =>
     trade.mfe_reached_trailing_start === true && trade.exit_reason === 'stop_loss'
   ).length;
-  const winningTrailing = wins.filter((trade: any) => trade.exit_reason === 'trailing').length;
-  const winningWindowEnd = wins.filter((trade: any) => trade.exit_reason === 'window_end').length;
+  const canonicalReason = (trade: any) => trade.exit_reason === 'trailing' ? 'trailing_profit' : trade.exit_reason === 'window_end' ? 'end_of_test' : trade.exit_reason;
+  const winningTrailing = wins.filter((trade: any) => canonicalReason(trade) === 'trailing_profit').length;
+  const winningWindowEnd = wins.filter((trade: any) => canonicalReason(trade) === 'end_of_test').length;
   const medianWinMfe = median(wins.map((trade: any) => Number(trade.mfe)).filter(Number.isFinite));
   const medianLossMae = median(losses.map((trade: any) => Math.abs(Number(trade.mae))).filter(Number.isFinite));
 
@@ -636,11 +637,11 @@ function TradeTapePanel({ view }: { view: any }) {
         {!complete ? <p className="diagnostics-missing"><strong>replay_unavailable</strong> · Páska sa v pôvodnom behu neuložila. Detaily sa nedajú odvodiť zo súhrnu. Bez pôvodného snapshotu a zhody všetkých WF súhrnov sa replay nevykoná.</p> : <>
           <p>Obchody {trades.length} · výhry {wins.length} · straty {losses.length} · nulové {trades.length - wins.length - losses.length}. Priemerná čistá výhra {number(avg(wins, 'pnl_net'))} USDT · strata {number(losses.length ? -avg(losses, 'pnl_net')! : null)} USDT.</p>
           <p>Priemerné MFE pri stratách {number(avg(losses, 'mfe'))} % · straty s MFE ≥ trailing start: {losses.filter((t: any) => t.mfe_reached_trailing_start === true).length}/{losses.length}.</p>
-          <p>{['stop_loss', 'trailing', 'window_end', 'other'].map(reason => { const n = trades.filter((t: any) => t.exit_reason === reason).length; return `${reason}: ${n} (${number(n / trades.length * 100, 1)} %)`; }).join(' · ')}</p>
+          <p>{['stop_loss', 'trailing_profit', 'max_no_trail', 'end_of_test', 'other'].map(reason => { const n = trades.filter((t: any) => (t.exit_reason === 'trailing' ? 'trailing_profit' : t.exit_reason === 'window_end' ? 'end_of_test' : t.exit_reason) === reason).length; return `${reason}: ${n} (${number(n / trades.length * 100, 1)} %)`; }).join(' · ')}</p>
           <div className="trade-tape-scroll" tabIndex={0} role="region" aria-label={`Obchody ${row.pair}, posúvaj vodorovne`}><table className="trade-tape">
             <caption>{row.pair} · 5m · v2. Časy vstupu a výstupu sú UTC.</caption>
-            <thead><tr>{['Okno', 'Vstup UTC', 'Výstup UTC', 'Trvanie min', 'Cena vstupu', 'Cena výstupu', 'Čisté PnL USDT', 'MAE %', 'MFE %', 'Dôvod', 'SL pred trailingom', 'MFE ≥ trailing start', 'Trailing aktívny pred výstupnou sviečkou'].map(label => <th key={label} scope="col">{label}</th>)}</tr></thead>
-            <tbody>{trades.map((t: any, index: number) => <tr key={`${t.window}:${t.entry_ts}:${index}`}><th scope="row">{t.window}</th><td>{t.entry_ts}</td><td>{t.exit_ts}</td><td>{number(t.duration_min, 2)}</td><td>{number(t.entry_px, 8)}</td><td>{number(t.exit_px, 8)}</td><td>{number(t.pnl_net, 6)}</td><td>{number(t.mae)}</td><td>{number(t.mfe)}</td><td>{t.exit_reason}</td><td>{t.sl_before_trail ? 'áno' : 'nie'}</td><td>{t.mfe_reached_trailing_start == null ? '—' : t.mfe_reached_trailing_start ? 'áno' : 'nie'}</td><td>{t.trail_active_before_exit_candle == null ? '—' : t.trail_active_before_exit_candle ? 'áno' : 'nie'}</td></tr>)}</tbody>
+            <thead><tr>{['Okno', 'Vstup UTC', 'Výstup UTC', 'Hold barov', 'Hold min', 'Cena vstupu', 'Cena výstupu', 'Čisté PnL USDT', 'MAE %', 'MFE %', 'Dôvod', 'Trailing aktivovaný', 'SL pred trailingom', 'Trailing aktívny pred výstupnou sviečkou'].map(label => <th key={label} scope="col">{label}</th>)}</tr></thead>
+            <tbody>{trades.map((t: any, index: number) => <tr key={`${t.window}:${t.entry_ts}:${index}`}><th scope="row">{t.window}</th><td>{t.entry_ts}</td><td>{t.exit_ts}</td><td>{number(t.hold_bars, 0)}</td><td>{number(t.hold_minutes ?? t.duration_min, 2)}</td><td>{number(t.entry_px, 8)}</td><td>{number(t.exit_px, 8)}</td><td>{number(t.pnl_net, 6)}</td><td>{number(t.mae)}</td><td>{number(t.mfe)}</td><td>{t.exit_reason}</td><td>{(t.trailing_activated ?? t.mfe_reached_trailing_start) == null ? '—' : (t.trailing_activated ?? t.mfe_reached_trailing_start) ? 'áno' : 'nie'}</td><td>{t.sl_before_trail ? 'áno' : 'nie'}</td><td>{t.trail_active_before_exit_candle == null ? '—' : t.trail_active_before_exit_candle ? 'áno' : 'nie'}</td></tr>)}</tbody>
           </table></div>
         </>}
       </details>;
