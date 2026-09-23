@@ -126,3 +126,24 @@ test('recorded tape renders all 44 validation trades and no train or holdout tra
   assert.doesNotMatch(html, /HOLDOUT_MUST_NOT_RENDER|TRAIN_MUST_NOT_RENDER/);
   assert.match(html, /<button disabled="">Kopírovať algoritmus/);
 });
+
+
+test('read-only current trade audit summarizes stored tape without starting work', () => {
+  const html = renderToStaticMarkup(React.createElement(exports.View, { onCopy() {}, result: {
+    pair: 'ZEC/USDT', timeframe: '5m', variant: 2, qualified: false,
+    selection_policy_version: 3, validation_passed: true, holdout_evaluated: true,
+    walk_forward_metrics: { closed_trades: 25 }, holdout_metrics: { closed_trades: 12 },
+    settings: { initial_capital: 100 }, buy_hold_percent: 17.8,
+    trades: [
+      { window: 'wf1', entry_ts: 'A', exit_ts: 'B', pnl_net: 1, mae: -1, mfe: 2, exit_reason: 'trailing', mfe_reached_trailing_start: true },
+      { window: 'wf2', entry_ts: 'C', exit_ts: 'D', pnl_net: -3, mae: -4, mfe: 2, exit_reason: 'stop_loss', mfe_reached_trailing_start: true },
+      { window: 'holdout', entry_ts: 'E', exit_ts: 'F', pnl_net: 1, mae: -.5, mfe: 3, exit_reason: 'window_end', mfe_reached_trailing_start: true },
+    ],
+  } }));
+  assert.match(html, /Read-only audit aktuálneho výsledku/);
+  assert.match(html, /Straty s MFE ≥ trailing start a následným stop-lossom:/);
+  assert.match(html, /1\/1/);
+  assert.match(html, /Medián MFE výhier/);
+  assert.match(html, /medián \|MAE\| strát/);
+  assert.doesNotMatch(html, /Spustiť|optimizer\/run/);
+});
