@@ -209,7 +209,7 @@ def variant_diagnostic(row: dict[str, Any]) -> dict[str, Any]:
     if evaluated:
         reasons.extend(reason_map[reason] for reason in row.get("rejection_reasons", []) if reason in reason_map)
     return {**{key: row.get(key) for key in ("pair", "timeframe", "variant", "variant_id", "score", "settings",
-            "validation_windows", "walk_forward_metrics", "validation_passed", "profitable_validation_windows", "cost_per_side",
+            "validation_windows", "entry_diagnostics_windows", "walk_forward_metrics", "validation_passed", "profitable_validation_windows", "cost_per_side",
             "trades", "trade_tape_version", "validation_boundaries", "snapshot_id", "settings_sha256", "cost_components")},
             "is_finalist": bool(row.get("is_finalist")), "holdout_evaluated": evaluated,
             "holdout_metrics": row.get("holdout_metrics") if evaluated else None,
@@ -322,7 +322,7 @@ def optimize(candle_sets: dict[tuple[str, str], list[dict[str, Any]]], base: dic
         for index, variant in enumerate(variants):
             settings = base | variant | {"selected_pairs": [pair], "timeframe": timeframe, "max_open_trades": 1}
             variant_id = f"{pair}:{timeframe}:v{index + 1}"
-            train_metrics, validation_window_metrics, trades = [], [], []
+            train_metrics, validation_window_metrics, entry_diagnostics_windows, trades = [], [], [], []
             for number, (train, validation) in enumerate(windows, 1):
                 train_metrics.append(simulate({pair: train}, settings, fee=cost_per_side, force_close_at_end=True, **cost_options)["metrics"])
                 validation_start = int(candles[len(train)]["open_time"])
@@ -331,6 +331,10 @@ def optimize(candle_sets: dict[tuple[str, str], list[dict[str, Any]]], base: dic
                     trading_start_time=validation_start, **cost_options,
                 )
                 validation_window_metrics.append(validation_run["metrics"])
+                entry_diagnostics_windows.append({
+                    "window": f"wf{number}",
+                    **validation_run.get("entry_diagnostics", {}),
+                })
                 trades.extend(trade_tape(validation_run, pair, timeframe, variant_id, f"wf{number}", cost_per_side))
             validation_metrics = aggregate_metrics(validation_window_metrics, capital)
             window_profit_pcts = [float(item["realized_profit"]) / capital * 100 for item in validation_window_metrics]
@@ -341,6 +345,7 @@ def optimize(candle_sets: dict[tuple[str, str], list[dict[str, Any]]], base: dic
                 "pair": pair, "timeframe": timeframe, "variant": index + 1, "settings": settings,
                 "train_metrics": train_metrics, "walk_forward_metrics": validation_metrics,
                 "validation_metrics": validation_metrics, "validation_windows": validation_window_metrics,
+                "entry_diagnostics_windows": entry_diagnostics_windows,
                 "cost_per_side": cost_per_side, "score": candidate_score, **validation,
                 "cost_components": cost_models[pair] if cost_models is not None else None,
                 "variant_id": variant_id, "trades": trades, "trade_tape_version": 1,
