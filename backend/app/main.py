@@ -396,10 +396,23 @@ async def load_okx_candles(pair: str, timeframe: str, limit: int, start_time: in
                     raise httpx.HTTPStatusError(payload.get("msg") or "OKX candle error", request=response.request, response=response)
                 return payload.get("data", [])
 
-            # The current-candles endpoint reduces the number of historical pages.
-            recent = await request_page(OKX_CANDLES_URL, {"instId": instrument, "bar": timeframe, "limit": min(300, int(expected))})
-            batches.append(recent)
-            cursor = min((int(row[0]) for row in recent), default=end + step)
+            # For a window ending well in the past, anchor history directly at
+            # the requested end. Starting from the live candles endpoint would
+            # waste pages walking back from "now" and can truncate old windows.
+            wall_clock_ms = int(datetime.now(UTC).timestamp() * 1000)
+            historical_only = end < wall_clock_ms - 2 * step
+            if historical_only:
+                cursor = end + step
+                if cache_info is not None:
+                    cache_info["historical_anchor"] = True
+            else:
+                # The current-candles endpoint reduces the number of historical pages
+                # for windows that reach the present.
+                recent = await request_page(OKX_CANDLES_URL, {"instId": instrument, "bar": timeframe, "limit": min(300, int(expected))})
+                batches.append(recent)
+                cursor = min((int(row[0]) for row in recent), default=end + step)
+                if cache_info is not None:
+                    cache_info["historical_anchor"] = False
             history_pages = max(0, min(450, math.ceil(max(0, cursor - start) / step / page_size)))
             for index in range(history_pages):
                 if progress_callback:
