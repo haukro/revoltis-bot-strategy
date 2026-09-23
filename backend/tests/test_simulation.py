@@ -50,6 +50,22 @@ class SimulationAuditTests(unittest.TestCase):
                                      trading_start_time=data[40]["open_time"])
         self.assertEqual(result["metrics"]["closed_trades"], 0)
 
+    def test_entry_diagnostics_are_observational_and_complete(self):
+        data = candles([100.0] * 25 + [90.0, 91.0, 91.0, 91.0] + [100.0] * 30)
+        result = simulation.simulate({"TEST/USDT": data}, settings(), force_close_at_end=True)
+        diagnostics = result["entry_diagnostics"]
+        self.assertEqual(
+            set(diagnostics),
+            {
+                "n_bars", "skip_bollinger", "skip_rsi", "skip_reversal",
+                "skip_rebound", "skip_atr", "skip_volume", "skip_other",
+                "passed_entry",
+            },
+        )
+        self.assertGreater(diagnostics["n_bars"], 0)
+        self.assertGreaterEqual(diagnostics["passed_entry"], 0)
+        self.assertLessEqual(diagnostics["passed_entry"], diagnostics["n_bars"])
+
     def test_force_close_leaves_no_hidden_open_position(self):
         prices = [100.0] * 25 + [90.0, 91.0, 91.0, 91.0]
         result = simulation.simulate({"TEST/USDT": candles(prices)}, settings(), force_close_at_end=True)
