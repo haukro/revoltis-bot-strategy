@@ -98,6 +98,17 @@ def simulate(
     daily_entries: dict[str, int] = defaultdict(int)
     equity_curve = [{"time": "start", "value": round(cash, 4)}]
     rejection_counts: dict[str, int] = defaultdict(int)
+    entry_diagnostics = {
+        "n_bars": 0,
+        "skip_bollinger": 0,
+        "skip_rsi": 0,
+        "skip_reversal": 0,
+        "skip_rebound": 0,
+        "skip_atr": 0,
+        "skip_volume": 0,
+        "skip_other": 0,
+        "passed_entry": 0,
+    }
     latest_prices: dict[str, float] = {}
     peak, drawdown = initial_capital, 0.0
     pair_peaks = {pair: initial_capital for pair in candles_by_pair}
@@ -199,12 +210,40 @@ def simulate(
         rebound_percent = ((close / previous_low) - 1) * 100 if previous_low else 0
         day = _iso(close_time)[:10]
         atr_ratio = current_atr / close if current_atr and close else 0
+
+        bollinger_ok = float(previous["close"]) < lower_band
+        rsi_ok = bool(previous_rsi is not None and previous_rsi < float(settings["rsi_oversold"]))
+        reversal_ok = close > float(previous["close"]) and close > float(candle["open"])
+        rebound_ok = float(settings["rebound_min_percent"]) <= rebound_percent <= float(settings["rebound_max_percent"])
+        atr_ok = float(settings["atr_min_percent"]) / 100 <= atr_ratio <= float(settings["atr_max_percent"]) / 100
+        volume_ok = (
+            float(candle["volume"]) >= float(settings["min_volume_ratio"]) * volume_mean
+            and float(candle["volume"]) * close >= float(settings["min_quote_volume_usdt"])
+        )
+
+        # Diagnostics are observational only. The legacy condition groups below
+        # remain logically identical, so entries/exits and all qualification
+        # thresholds are unchanged.
+        entry_diagnostics["n_bars"] += 1
+        if not bollinger_ok:
+            entry_diagnostics["skip_bollinger"] += 1
+        if not rsi_ok:
+            entry_diagnostics["skip_rsi"] += 1
+        if not reversal_ok:
+            entry_diagnostics["skip_reversal"] += 1
+        if not rebound_ok:
+            entry_diagnostics["skip_rebound"] += 1
+        if not atr_ok:
+            entry_diagnostics["skip_atr"] += 1
+        if not volume_ok:
+            entry_diagnostics["skip_volume"] += 1
+
         conditions = {
-            "pokles pod Bollinger pásmo": float(previous["close"]) < lower_band,
-            "RSI nie je prepredané": bool(previous_rsi is not None and previous_rsi < float(settings["rsi_oversold"])),
-            "potvrdenie otočenia": close > float(previous["close"]) and close > float(candle["open"]) and float(settings["rebound_min_percent"]) <= rebound_percent <= float(settings["rebound_max_percent"]),
-            "ATR volatilita": float(settings["atr_min_percent"]) / 100 <= atr_ratio <= float(settings["atr_max_percent"]) / 100,
-            "objem": float(candle["volume"]) >= float(settings["min_volume_ratio"]) * volume_mean and float(candle["volume"]) * close >= float(settings["min_quote_volume_usdt"]),
+            "pokles pod Bollinger pásmo": bollinger_ok,
+            "RSI nie je prepredané": rsi_ok,
+            "potvrdenie otočenia": reversal_ok and rebound_ok,
+            "ATR volatilita": atr_ok,
+            "objem": volume_ok,
         }
         if not all(conditions.values()):
             for reason, passed in conditions.items():
@@ -213,16 +252,20 @@ def simulate(
             continue
         if len(positions) >= int(settings["max_open_trades"]):
             rejection_counts["limit otvorených pozícií"] += 1
+            entry_diagnostics["skip_other"] += 1
             continue
         if daily_entries[day] >= int(settings["daily_trade_limit"]):
             rejection_counts["denný limit obchodov"] += 1
+            entry_diagnostics["skip_other"] += 1
             continue
         stake = min(float(settings["stake_amount"]), cash)
         if stake < 5:
             rejection_counts["nedostatok simulovaného kapitálu"] += 1
+            entry_diagnostics["skip_other"] += 1
             continue
         cash -= stake
         daily_entries[day] += 1
+        entry_diagnostics["passed_entry"] += 1
         positions.append({"pair": pair, "entry_rate": close, "stake": stake, "opened_at": _iso(close_time), "high_watermark": close, "low_watermark": close, "entry_ts_ms": close_time, "entry_index": index})
 
     if force_close_at_end:
@@ -274,4 +317,4 @@ def simulate(
             "open_trades": sum(1 for position in positions if position["pair"] == pair),
         }
         per_pair_equity_curves[pair] = pair_curve
-    return {"trades": trades, "open_positions": len(positions), "metrics": {**trade_statistics(trades), "initial_capital": initial_capital, "portfolio_value": round(portfolio_value, 4), "realized_profit": round(sum(item["profit_usdt"] for item in trades), 4), "unrealized_profit": round(unrealized, 4), "closed_trades": len(trades), "win_rate": round(wins / len(trades) * 100, 1) if trades else 0, "max_drawdown_percent": round(drawdown, 2)}, "per_pair_metrics": per_pair_metrics, "per_pair_equity_curves": per_pair_equity_curves, "equity_curve": equity_curve, "rejections": dict(sorted(rejection_counts.items(), key=lambda item: item[1], reverse=True)[:8])}
+    return {"trades": trades, "open_positions": len(positions), "metrics": {**trade_statistics(trades), "initial_capital": initial_capital, "portfolio_value": round(portfolio_value, 4), "realized_profit": round(sum(item["profit_usdt"] for item in trades), 4), "unrealized_profit": round(unrealized, 4), "closed_trades": len(trades), "win_rate": round(wins / len(trades) * 100, 1) if trades else 0, "max_drawdown_percent": round(drawdown, 2)}, "per_pair_metrics": per_pair_metrics, "per_pair_equity_curves": per_pair_equity_curves, "equity_curve": equity_curve, "rejections": dict(sorted(rejection_counts.items(), key=lambda item: item[1], reverse=True)[:8]), "entry_diagnostics": entry_diagnostics}
