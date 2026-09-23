@@ -46,6 +46,26 @@ def _iso(milliseconds: int) -> str:
     return datetime.fromtimestamp(milliseconds / 1000, UTC).isoformat()
 
 
+def payoff_statistics(wins: int, losses: int, breakeven: int, winning_pnl: float, losing_pnl: float) -> dict[str, Any]:
+    """Amounts are already net of both sides' fee/spread/slippage model."""
+    count = wins + losses + breakeven
+    avg_win = winning_pnl / wins if wins else 0.0
+    avg_loss = losing_pnl / losses if losses else 0.0
+    return {"winning_trades": wins, "losing_trades": losses, "breakeven_trades": breakeven,
+            "winning_pnl": round(winning_pnl, 8), "losing_pnl": round(losing_pnl, 8),
+            "avg_win": round(avg_win, 8), "avg_loss": round(avg_loss, 8),
+            "payoff": round(avg_win / avg_loss, 8) if avg_loss > 0 else None,
+            # Zero-PnL trades count in N, but must not be counted as losses.
+            "expectancy": round((winning_pnl - losing_pnl) / count, 8) if count else None}
+
+
+def trade_statistics(trades: list[dict[str, Any]]) -> dict[str, Any]:
+    profits = [float(trade["profit_usdt"]) for trade in trades if trade.get("status") == "closed"]
+    wins = [profit for profit in profits if profit > 0]
+    losses = [-profit for profit in profits if profit < 0]
+    return payoff_statistics(len(wins), len(losses), len(profits) - len(wins) - len(losses), sum(wins), sum(losses))
+
+
 def simulate(
     candles_by_pair: dict[str, list[dict[str, Any]]],
     settings: dict[str, Any],
@@ -193,6 +213,7 @@ def simulate(
             pair_drawdown = max(pair_drawdown, (pair_peak - pair_equity) / pair_peak * 100 if pair_peak else 0)
             pair_curve.append({"time": trade.get("closed_at") or trade.get("opened_at"), "value": round(pair_equity, 4)})
         per_pair_metrics[pair] = {
+            **trade_statistics(pair_trades),
             "initial_capital": initial_capital,
             "portfolio_value": round(initial_capital + pair_realized + pair_unrealized, 4),
             "realized_profit": round(pair_realized, 4),
@@ -203,4 +224,4 @@ def simulate(
             "open_trades": sum(1 for position in positions if position["pair"] == pair),
         }
         per_pair_equity_curves[pair] = pair_curve
-    return {"trades": trades, "open_positions": len(positions), "metrics": {"initial_capital": initial_capital, "portfolio_value": round(portfolio_value, 4), "realized_profit": round(sum(item["profit_usdt"] for item in trades), 4), "unrealized_profit": round(unrealized, 4), "closed_trades": len(trades), "win_rate": round(wins / len(trades) * 100, 1) if trades else 0, "max_drawdown_percent": round(drawdown, 2)}, "per_pair_metrics": per_pair_metrics, "per_pair_equity_curves": per_pair_equity_curves, "equity_curve": equity_curve, "rejections": dict(sorted(rejection_counts.items(), key=lambda item: item[1], reverse=True)[:8])}
+    return {"trades": trades, "open_positions": len(positions), "metrics": {**trade_statistics(trades), "initial_capital": initial_capital, "portfolio_value": round(portfolio_value, 4), "realized_profit": round(sum(item["profit_usdt"] for item in trades), 4), "unrealized_profit": round(unrealized, 4), "closed_trades": len(trades), "win_rate": round(wins / len(trades) * 100, 1) if trades else 0, "max_drawdown_percent": round(drawdown, 2)}, "per_pair_metrics": per_pair_metrics, "per_pair_equity_curves": per_pair_equity_curves, "equity_curve": equity_curve, "rejections": dict(sorted(rejection_counts.items(), key=lambda item: item[1], reverse=True)[:8])}

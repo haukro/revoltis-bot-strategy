@@ -6,7 +6,7 @@ from math import isfinite
 from statistics import pstdev
 from typing import Any, Callable
 
-from .simulation import simulate
+from .simulation import simulate, payoff_statistics
 
 
 SEARCH_SPACE = {
@@ -38,7 +38,7 @@ COST_PER_SIDE = {"1m": 0.0022, "3m": 0.0018, "5m": 0.0015, "15m": 0.0013}
 MIN_VALIDATION_TRADES = 20
 MIN_HOLDOUT_TRADES = 10
 MAX_DRAWDOWN_PERCENT = 15.0
-SELECTION_POLICY_VERSION = 2
+SELECTION_POLICY_VERSION = 3
 
 
 def score(metrics: dict[str, Any], capital: float, stability_penalty: float) -> float:
@@ -53,7 +53,14 @@ def aggregate_metrics(items: list[dict[str, Any]], capital: float) -> dict[str, 
     trades = sum(int(item["closed_trades"]) for item in items)
     wins = sum(int(round(int(item["closed_trades"]) * float(item["win_rate"]) / 100)) for item in items)
     profit = sum(float(item["realized_profit"]) for item in items)
+    statistics = {}
+    if items and all("winning_pnl" in item for item in items):
+        statistics = payoff_statistics(
+            sum(item["winning_trades"] for item in items), sum(item["losing_trades"] for item in items),
+            sum(item["breakeven_trades"] for item in items), sum(item["winning_pnl"] for item in items),
+            sum(item["losing_pnl"] for item in items))
     return {
+        **statistics,
         "initial_capital": capital,
         "portfolio_value": round(capital + profit, 4),
         "realized_profit": round(profit, 4),
@@ -62,6 +69,28 @@ def aggregate_metrics(items: list[dict[str, Any]], capital: float) -> dict[str, 
         "win_rate": round(wins / trades * 100, 1) if trades else 0,
         "max_drawdown_percent": round(max((float(item["max_drawdown_percent"]) for item in items), default=0), 2),
     }
+
+
+def validation_rank(row: dict[str, Any]) -> tuple[float, float, float]:
+    metrics = row["walk_forward_metrics"]
+    if not row["validation_passed"] or int(metrics["closed_trades"]) < MIN_VALIDATION_TRADES:
+        return (float("-inf"), float("-inf"), float("-inf"))
+    expectancy = metrics.get("expectancy")
+    if expectancy is None:
+        expectancy = float(metrics["realized_profit"]) / int(metrics["closed_trades"])
+    payoff = metrics.get("payoff")
+    return (float(expectancy), float(payoff) if payoff is not None else float("-inf"), -float(metrics["max_drawdown_percent"]))
+
+
+def payoff_note(metrics: dict[str, Any], minimum: int, *, beats_hold: bool = False) -> str | None:
+    payoff = metrics.get("payoff")
+    if int(metrics.get("closed_trades", 0)) < minimum or payoff is None:
+        return None
+    if payoff < .8:
+        return "slaby_pomer"
+    if payoff < 1:
+        return "podmienecne_ok" if float(metrics.get("win_rate", 0)) >= 55 and beats_hold else "upozornenie_pomer"
+    return "slusny_pomer"
 
 
 def walk_forward_windows(candles: list[dict[str, Any]], warmup: int = 40) -> tuple[list[tuple[list[dict[str, Any]], list[dict[str, Any]]]], list[dict[str, Any]]]:
@@ -86,11 +115,40 @@ def buy_and_hold_percent(candles: list[dict[str, Any]], cost_per_side: float) ->
     return round(((last / first - 1) - 2 * cost_per_side) * 100, 4) if first else 0.0
 
 
+def assess_validation(metrics: dict[str, Any], windows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Eligibility uses validation only; score ranks eligible variants."""
+    profitable = sum(float(window["realized_profit"]) > 0 for window in windows)
+    reasons = []
+    if int(metrics["closed_trades"]) < MIN_VALIDATION_TRADES:
+        reasons.append("malo_obchodov")
+    if not float(metrics["realized_profit"]) > 0:
+        reasons.append("zaporny_pnl")
+    if not 0 <= float(metrics["max_drawdown_percent"]) <= MAX_DRAWDOWN_PERCENT:
+        reasons.append("drawdown")
+    if len(windows) != 3 or profitable < 2:
+        reasons.append("nestabilita")
+    return {"validation_passed": not reasons, "validation_rejection_reasons": reasons,
+            "profitable_validation_windows": profitable}
+
+
 def assess_candidate(row: dict[str, Any], locked_pairs: list[str]) -> dict[str, Any]:
     """All gates are mandatory. Training metrics never enter this verdict."""
     validation = row.get("walk_forward_metrics") or {}
     holdout = row.get("holdout_metrics") or {}
     validation_trades = int(validation.get("closed_trades", 0))
+    if not row.get("validation_passed"):
+        codes = row.get("validation_rejection_reasons") or []
+        reasons = ["walk_forward_failed"]
+        if validation_trades < MIN_VALIDATION_TRADES:
+            reasons.append("insufficient_validation_trades")
+        if row.get("pair") not in locked_pairs:
+            reasons.append("outside_locked_universe")
+        verdict = ("NEDOSTATOK OBCHODOV" if validation_trades < MIN_VALIDATION_TRADES else
+                   "NEPREŠIEL — drawdown validácie" if "drawdown" in codes else
+                   "NEPREŠIEL — PnL validácie nie je kladné" if "zaporny_pnl" in codes else
+                   "NEPREŠIEL — nestabilné WF okná" if "nestabilita" in codes else "NEPREŠIEL — validácia")
+        return {"qualified": False, "result_status": "insufficient_trades" if validation_trades < MIN_VALIDATION_TRADES else "validation_failed",
+                "verdict": verdict, "rejection_reasons": reasons, "holdout_profit_percent": None}
     holdout_trades = int(holdout.get("closed_trades", 0))
     capital = float(row.get("settings", {}).get("initial_capital", 0))
     profit = float(holdout.get("realized_profit", float("nan")))
@@ -128,6 +186,29 @@ def assess_candidate(row: dict[str, Any], locked_pairs: list[str]) -> dict[str, 
         status, verdict = "no_valid_variant", "ŽIADNY PLATNÝ VARIANT"
     return {"qualified": not reasons, "result_status": status, "verdict": verdict,
             "rejection_reasons": reasons, "holdout_profit_percent": round(profit_pct, 4) if isfinite(profit_pct) else None}
+
+
+def variant_diagnostic(row: dict[str, Any]) -> dict[str, Any]:
+    """Serialise evidence without evaluating any additional holdouts."""
+    evaluated = bool(row["validation_passed"] and row.get("holdout_evaluated"))
+    reason_map = {"insufficient_holdout_trades": "holdout_malo_obchodov",
+                  "non_positive_holdout_pnl": "zaporny_pnl", "underperformed_buy_and_hold": "horsie_ako_hold",
+                  "drawdown_limit_exceeded": "drawdown"}
+    reasons = list(row["validation_rejection_reasons"])
+    if evaluated:
+        reasons.extend(reason_map[reason] for reason in row.get("rejection_reasons", []) if reason in reason_map)
+    return {**{key: row.get(key) for key in ("pair", "timeframe", "variant", "variant_id", "score", "settings",
+            "validation_windows", "walk_forward_metrics", "validation_passed", "profitable_validation_windows", "cost_per_side")},
+            "is_finalist": bool(row.get("is_finalist")), "holdout_evaluated": evaluated,
+            "holdout_metrics": row.get("holdout_metrics") if evaluated else None,
+            "holdout_profit_percent": row.get("holdout_profit_percent") if evaluated else None,
+            "buy_hold_percent": row.get("buy_hold_percent") if evaluated else None,
+            "vs_hold_percentage_points": round(row["holdout_profit_percent"] - row["buy_hold_percent"], 4) if evaluated else None,
+            "rejection_reasons": list(dict.fromkeys(reasons)),
+            "rejection_phase": "holdout" if evaluated else "validation" if reasons else None,
+            "payoff_warning": payoff_note(row.get("holdout_metrics") or {}, MIN_HOLDOUT_TRADES,
+                beats_hold=bool(evaluated and row["holdout_profit_percent"] >= row["buy_hold_percent"])) if evaluated else None,
+            "status": "rejected" if reasons else "accepted" if evaluated and row.get("qualified") else "not_selected"}
 
 
 def present_optimizer_record(record: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -204,6 +285,8 @@ def optimize(candle_sets: dict[tuple[str, str], list[dict[str, Any]]], base: dic
     # An identical prefix warms every variant. Its candles cannot create trades.
     warmup = max(40, *(int(v[key]) + 2 for v in variants for key in ("bb_period", "rsi_period", "atr_period")))
     for (pair, timeframe), candles in candle_sets.items():
+        if timeframe not in PRIMARY_TIMEFRAMES:
+            raise ValueError("Optimalizácia podporuje iba intervaly 15m a 5m.")
         if len(candles) < 200:
             raise ValueError("Nedostatok sviečok pre tri validačné okná a holdout.")
         windows, _ = walk_forward_windows(candles, warmup)
@@ -222,30 +305,31 @@ def optimize(candle_sets: dict[tuple[str, str], list[dict[str, Any]]], base: dic
             window_profit_pcts = [float(item["realized_profit"]) / capital * 100 for item in validation_window_metrics]
             stability = pstdev(window_profit_pcts) if len(window_profit_pcts) > 1 else 0.0
             candidate_score = score(validation_metrics, capital, stability)
-            validation_passed = (
-                timeframe in PRIMARY_TIMEFRAMES
-                and int(validation_metrics["closed_trades"]) >= MIN_VALIDATION_TRADES
-                and all(float(item["realized_profit"]) > 0 for item in validation_window_metrics)
-                and float(validation_metrics["max_drawdown_percent"]) <= MAX_DRAWDOWN_PERCENT
-                and candidate_score > 0
-            )
+            validation = assess_validation(validation_metrics, validation_window_metrics)
             results.append({
                 "pair": pair, "timeframe": timeframe, "variant": index + 1, "settings": settings,
                 "train_metrics": train_metrics, "walk_forward_metrics": validation_metrics,
                 "validation_metrics": validation_metrics, "validation_windows": validation_window_metrics,
-                "cost_per_side": cost_per_side, "score": candidate_score, "validation_passed": validation_passed,
+                "cost_per_side": cost_per_side, "score": candidate_score, **validation,
+                "variant_id": f"{pair}:{timeframe}:v{index + 1}",
+                "holdout_evaluated": False, "holdout_metrics": None, "buy_hold_percent": None,
+                "holdout_profit_percent": None, "qualified": False, "strategy_code": None,
             })
             completed += 1
             if progress:
                 progress(completed, total, f"{pair} · {timeframe}")
 
-    # Freeze ONE finalist per coin using validation only, across both timeframes.
+    # Freeze ONE eligible finalist per coin using validation only, across both timeframes.
     # Holdout is a veto, never a second parameter search or a fallback loop.
-    results.sort(key=lambda row: (row["validation_passed"], row["score"]), reverse=True)
+    results.sort(key=lambda row: (row["validation_passed"], *validation_rank(row)), reverse=True)
     finalists: dict[str, dict[str, Any]] = {}
     for row in results:
         finalists.setdefault(row["pair"], row)
     for row in finalists.values():
+        if not row["validation_passed"]:
+            row.update(assess_candidate(row, locked_pairs))
+            continue
+        row["is_finalist"] = True
         candles = candle_sets[(row["pair"], row["timeframe"])]
         _, holdout = walk_forward_windows(candles, warmup)
         boundary = max(120, int(len(candles) * 0.8))
@@ -258,6 +342,7 @@ def optimize(candle_sets: dict[tuple[str, str], list[dict[str, Any]]], base: dic
         row["buy_hold_percent"] = buy_and_hold_percent(candles[boundary:], row["cost_per_side"])
         row["holdout_from_ms"] = holdout_start
         row["holdout_to_ms"] = int(candles[-1]["close_time"])
+        row["holdout_evaluated"] = True
         row.update(assess_candidate(row, locked_pairs))
         row["strategy_code"] = generate_freqtrade_strategy(row["pair"], row["timeframe"], row["settings"]) if row["qualified"] else None
 
@@ -265,12 +350,13 @@ def optimize(candle_sets: dict[tuple[str, str], list[dict[str, Any]]], base: dic
     selected = qualified[0] if qualified else next(iter(finalists.values()))
     summary_keys = ("pair", "timeframe", "variant", "score", "walk_forward_metrics", "holdout_metrics",
                     "buy_hold_percent", "holdout_profit_percent", "qualified", "result_status",
-                    "verdict", "rejection_reasons")
+                    "verdict", "rejection_reasons", "validation_passed", "holdout_evaluated")
     return {
         **selected,
         "winner": {**selected} if qualified else None,
         "selection_policy_version": SELECTION_POLICY_VERSION,
         "selection_method": "validation_only_per_coin_then_holdout_veto",
+        "ranking_method": "validation_expectancy_then_payoff_then_lower_drawdown",
         "locked_pairs": locked_pairs,
         "tested_combinations": total,
         "max_validation_trades": max(int(row["walk_forward_metrics"]["closed_trades"]) for row in results),
@@ -281,5 +367,7 @@ def optimize(candle_sets: dict[tuple[str, str], list[dict[str, Any]]], base: dic
         "method": "3× walk-forward + 20 % nedotknutý holdout",
         "cost_model": f"{selected['cost_per_side'] * 100:.2f} % na každej strane podľa intervalu (fee + spread/sklz)",
         "per_coin_results": [{key: row[key] for key in summary_keys} for row in finalists.values()],
+        "variant_results": [variant_diagnostic(row) for row in sorted(results, key=lambda item: (item["pair"], item["timeframe"], item["variant"]))],
+        "all_variants_insufficient_trades": all("malo_obchodov" in row["validation_rejection_reasons"] for row in results),
         "top_results": [{key: row[key] for key in ("pair", "timeframe", "variant", "score", "validation_metrics")} for row in results[:5]],
     }

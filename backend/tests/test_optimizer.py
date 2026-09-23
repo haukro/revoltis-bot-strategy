@@ -103,7 +103,9 @@ def test_no_relaxation_if_all_validation_samples_too_small():
     assert result["max_validation_trades"] == 18
     assert result["winner"] is None
     assert result["tested_combinations"] == 5
-    assert len(calls) == 1
+    assert len(calls) == 0
+    assert result["holdout_metrics"] is None
+    assert result["all_variants_insufficient_trades"]
 
 
 def test_validation_windows_only_overlap_for_indicator_warmup():
