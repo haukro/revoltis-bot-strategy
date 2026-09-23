@@ -123,6 +123,11 @@ class OptimizerRequest(BaseModel):
     trials_per_market: int = Field(default=3, ge=1, le=8)
 
 
+class OptimizerFinalizeRequest(BaseModel):
+    version_id: str
+    source_job_ids: list[str] = Field(min_length=1, max_length=20)
+
+
 class ValidationReplayRequest(BaseModel):
     # Deliberately no settings, dates, pair, timeframe or grid parameters.
     source_job_ids: list[str] = Field(min_length=1, max_length=2)
@@ -828,10 +833,240 @@ async def optimizer_status(job_id: str):
     return present_optimizer_record(stored[0])
 
 
+def combine_optimizer_lock_results(
+    results: list[dict[str, Any]],
+    locked_pairs: list[str],
+    version_id: str,
+) -> dict[str, Any]:
+    """Combine one completed optimizer result per locked coin into one durable lock result."""
+    if not results:
+        raise ValueError("Chýbajú výsledky optimalizácie.")
+
+    def rank(row: dict[str, Any]) -> tuple[float, float, float, float, float]:
+        metrics = row.get("walk_forward_metrics") or {}
+        closed = int(metrics.get("closed_trades") or 0)
+        expectancy = metrics.get("expectancy")
+        if expectancy is None:
+            expectancy = (
+                float(metrics.get("realized_profit") or 0) / closed
+                if closed > 0
+                else float("-inf")
+            )
+        payoff = metrics.get("payoff")
+        drawdown = metrics.get("max_drawdown_percent")
+        return (
+            1.0 if row.get("qualified") else 0.0,
+            1.0 if row.get("validation_passed") and closed >= 20 else 0.0,
+            float(expectancy),
+            float(payoff) if payoff is not None else float("-inf"),
+            -float(drawdown) if drawdown is not None else float("-inf"),
+        )
+
+    rows = sorted(results, key=rank, reverse=True)
+    selected = dict(rows[0])
+    variant_results = [
+        variant
+        for row in rows
+        for variant in (row.get("variant_results") or [])
+    ]
+
+    combined = {
+        **selected,
+        "version_id": version_id,
+        "locked_pairs": list(locked_pairs),
+        "tested_combinations": sum(
+            int(row.get("tested_combinations") or 0) for row in rows
+        ),
+        "max_validation_trades": max(
+            int(
+                row.get("max_validation_trades")
+                or (row.get("walk_forward_metrics") or {}).get("closed_trades")
+                or 0
+            )
+            for row in rows
+        ),
+        "per_coin_results": [
+            item
+            for row in rows
+            for item in (
+                row.get("per_coin_results")
+                or [{
+                    "pair": row.get("pair"),
+                    "timeframe": row.get("timeframe"),
+                    "verdict": row.get("verdict"),
+                    "walk_forward_metrics": row.get("walk_forward_metrics"),
+                    "holdout_metrics": row.get("holdout_metrics"),
+                }]
+            )
+        ],
+        "variant_results": variant_results,
+        "pairs_ready": list(dict.fromkeys(
+            pair
+            for row in rows
+            for pair in (row.get("pairs_ready") or [])
+        )),
+        "pairs_dropped": [
+            item
+            for row in rows
+            for item in (row.get("pairs_dropped") or [])
+        ],
+        "replay_snapshots": {
+            key: value
+            for row in rows
+            for key, value in (row.get("replay_snapshots") or {}).items()
+        },
+        "cost_profiles": {
+            key: value
+            for row in rows
+            for key, value in (row.get("cost_profiles") or {}).items()
+        },
+        "source_job_ids": list(dict.fromkeys(
+            row["source_job_id"]
+            for row in rows
+            if row.get("source_job_id")
+        )),
+        "source_job_id": None,
+        "aggregate_lock_result": True,
+        "all_variants_insufficient_trades": bool(variant_results) and all(
+            "malo_obchodov" in (row.get("rejection_reasons") or [])
+            for row in variant_results
+        ),
+    }
+
+    qualified = bool(selected.get("qualified"))
+    combined["qualified"] = qualified
+    combined["winner"] = selected.get("winner") if qualified else None
+    combined["strategy_code"] = selected.get("strategy_code") if qualified else None
+    combined["job_verdict"] = "KANDIDÁT" if qualified else "ŽIADNY PLATNÝ VARIANT"
+    return combined
+
+
+@app.post("/api/optimizer/finalize")
+async def finalize_optimizer(request: OptimizerFinalizeRequest):
+    """Persist exactly one aggregate result for the currently locked universe."""
+    require_durable_production_store()
+
+    versions = await supabase_get(
+        "strategy_versions",
+        "order=created_at.desc&limit=50",
+    )
+    lock = active_universe(universe_version(versions))
+    if not lock or request.version_id != lock["version_id"]:
+        raise HTTPException(
+            409,
+            "Zamknutá verzia sa zmenila. Finálny výsledok sa neuložil.",
+        )
+
+    source_job_ids = list(dict.fromkeys(request.source_job_ids))
+    if len(source_job_ids) != len(lock["pairs"]):
+        raise HTTPException(
+            422,
+            "Finálny výsledok musí obsahovať presne jeden beh pre každý coin locku.",
+        )
+
+    records: list[dict[str, Any]] = []
+    for job_id in source_job_ids:
+        stored = await supabase_get(
+            "optimizer_runs",
+            f"id=eq.{job_id}&limit=1",
+        )
+        if not stored:
+            raise HTTPException(404, f"Optimizer run {job_id} nebol nájdený.")
+
+        record = stored[0]
+        if record.get("status") != "completed":
+            raise HTTPException(422, "Nie všetky optimizer runy sú dokončené.")
+
+        result = record.get("result") or {}
+        if result.get("version_id") != request.version_id:
+            raise HTTPException(409, "Optimizer run patrí inej verzii locku.")
+
+        pairs = (record.get("request") or {}).get("pairs") or []
+        if len(pairs) != 1:
+            raise HTTPException(
+                422,
+                "Každý zdrojový optimizer run musí patriť presne jednému coinu.",
+            )
+        records.append(record)
+
+    covered_pairs = [
+        (record.get("request") or {}).get("pairs", [None])[0]
+        for record in records
+    ]
+    if (
+        len(set(covered_pairs)) != len(lock["pairs"])
+        or set(covered_pairs) != set(lock["pairs"])
+    ):
+        raise HTTPException(
+            422,
+            "Zdrojové optimizer runy nepokrývajú presne aktuálny lock.",
+        )
+
+    recent = await supabase_get(
+        "optimizer_runs",
+        "order=finished_at.desc&limit=100",
+    )
+    source_key = sorted(source_job_ids)
+    existing = next(
+        (
+            row
+            for row in recent
+            if (row.get("request") or {}).get("kind") == "aggregate"
+            and (row.get("request") or {}).get("version_id") == request.version_id
+            and sorted(
+                (row.get("request") or {}).get("source_job_ids") or []
+            ) == source_key
+        ),
+        None,
+    )
+    if existing:
+        return present_optimizer_record(existing)
+
+    combined = combine_optimizer_lock_results(
+        [record["result"] for record in records],
+        lock["pairs"],
+        request.version_id,
+    )
+    combined["source_job_ids"] = source_job_ids
+
+    now = datetime.now(UTC).isoformat()
+    aggregate_record = {
+        "id": str(uuid4()),
+        "status": "completed",
+        "created_at": now,
+        "finished_at": now,
+        "request": {
+            "kind": "aggregate",
+            "version_id": request.version_id,
+            "source_job_ids": source_job_ids,
+        },
+        "result": combined,
+    }
+    saved = await supabase_upsert("optimizer_runs", aggregate_record)
+    return present_optimizer_record(saved)
+
+
 @app.get("/api/optimizer-latest")
 async def optimizer_latest():
-    stored = await supabase_get("optimizer_runs", "order=finished_at.desc&limit=1")
-    return present_optimizer_record(stored[0]) if stored else None
+    context = await strategy_context()
+    lock = context.get("active_universe")
+    if not lock:
+        return None
+
+    stored = await supabase_get(
+        "optimizer_runs",
+        "order=finished_at.desc&limit=100",
+    )
+    aggregate = next(
+        (
+            row
+            for row in stored
+            if (row.get("request") or {}).get("kind") == "aggregate"
+            and (row.get("result") or {}).get("version_id") == lock["version_id"]
+        ),
+        None,
+    )
+    return present_optimizer_record(aggregate) if aggregate else None
 
 
 @app.get("/api/dashboard")
