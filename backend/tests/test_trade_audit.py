@@ -36,7 +36,40 @@ def test_observation_preserves_original_close_execution_and_excludes_entry_wicks
     assert raw['trail_active_before_exit_candle'] is False
     tape = trade_tape(run, 'UNI/USDT', '5m', 'UNI/USDT:5m:v2', 'wf2', .0015)
     assert tape[0]['window'] == 'wf2'
-    assert tape[0]['exit_reason'] == {'stop_loss': 'stop_loss', 'trailing_profit': 'trailing', 'end_of_test': 'window_end'}[reason]
+    assert tape[0]['exit_reason'] == {'stop_loss': 'stop_loss', 'trailing_profit': 'trailing_profit', 'end_of_test': 'end_of_test'}[reason]
+
+
+def test_max_no_trail_reason_is_named_from_engine_and_keeps_hold_and_trail_flags():
+    run = {"trades": [{
+        "opened_at": "2026-09-01T00:00:00+00:00",
+        "closed_at": "2026-09-01T08:00:00+00:00",
+        "entry_rate": 100,
+        "exit_rate": 99,
+        "stake_amount": 50,
+        "profit_usdt": -0.6,
+        "exit_reason": "max_no_trail_hours",
+        "raw": {
+            "duration_min": 480,
+            "holding_candles": 96,
+            "mae": -2,
+            "mfe": 1.2,
+            "trailing_start_percent": 1.6,
+            "trailing_start_reached": False,
+            "trail_active_before_exit_candle": False,
+        },
+    }]}
+    tape = trade_tape(run, "ZEC/USDT", "5m", "ZEC/USDT:5m:v1", "wf1", .001)
+    trade = tape[0]
+    assert trade["engine_exit_reason"] == "max_no_trail_hours"
+    assert trade["exit_reason"] == "max_no_trail"
+    assert trade["hold_minutes"] == 480
+    assert trade["hold_bars"] == 96
+    assert trade["trailing_activated"] is False
+    summary = tape_summary(tape)
+    assert summary["exit_reasons"]["max_no_trail"]["n"] == 1
+    assert summary["exit_reasons"]["other"]["n"] == 0
+    assert summary["timeout_negative"] == 1
+    assert summary["trail_never_activated"] == 1
 
 
 def test_optimizer_keeps_validation_tape_but_never_training_or_rejected_holdout():
