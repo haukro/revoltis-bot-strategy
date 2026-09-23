@@ -500,6 +500,7 @@ function AlgorithmResult({ result, onCopy }: { result: any, onCopy: () => void }
     {view.holdout_visible && <p className="validation-counts">Holdout po nákladoch: priemerná výhra {m.avg_win ?? 'n/a'} USDT · priemerná strata {m.avg_loss ?? 'n/a'} USDT · payoff {m.closed_trades >= 10 ? m.payoff ?? 'n/a' : 'n/a'} · expectancy {m.expectancy ?? 'n/a'} USDT/obchod.</p>}
     {!!Object.keys(view.cost_profiles || {}).length && <details><summary>Náklady podľa páru · {view.fee_schedule}<span>⌄</span></summary><ul className="list">{Object.entries(view.cost_profiles).map(([pair, value]) => { const c = value as any; const pct = (n: number) => `${(n * 100).toFixed(4)} %`; return <li key={pair}><span>{pair} · {c.role}<small>fee {pct(c.fee_rate)} · half-spread {pct(c.half_spread)} · impact nákup {pct(c.buy_impact)} / predaj {pct(c.sell_impact)}</small><small>Aktuálny snapshot knihy {c.book_ts}; nejde o historické L2. {c.thin_L1 ? 'thin_L1' : ''}</small></span></li>; })}</ul></details>}
     <VariantTable view={view} />
+    <CurrentTradeAuditPanel view={view} />
     <TradeTapePanel view={view} />
     {!!view.per_coin_results?.length && <details><summary>Vyhodnotenie po coinoch <span>⌄</span></summary><ul className="list">
       {view.per_coin_results.map((row: any) => <li key={row.pair}><span>{row.pair} · {row.timeframe}<small>Validácia: {row.walk_forward_metrics?.closed_trades ?? 0}/20 · Holdout: {row.validation_passed && row.holdout_metrics ? `${row.holdout_metrics.closed_trades}/10` : '—'}</small></span><b>{row.verdict}</b></li>)}
@@ -550,6 +551,73 @@ function ReplayAvailabilityNotice({ availability }: { availability: any }) {
     </p>
   );
 }
+function CurrentTradeAuditPanel({ view }: { view: any }) {
+  const trades = Array.isArray(view.trades)
+    ? view.trades.filter((trade: any) => ['wf1', 'wf2', 'wf3', 'holdout'].includes(trade.window))
+    : [];
+  if (!trades.length) return null;
+
+  const validation = trades.filter((trade: any) => ['wf1', 'wf2', 'wf3'].includes(trade.window));
+  const holdout = trades.filter((trade: any) => trade.window === 'holdout');
+  const wins = trades.filter((trade: any) => Number(trade.pnl_net) > 0);
+  const losses = trades.filter((trade: any) => Number(trade.pnl_net) < 0);
+
+  const median = (values: number[]) => {
+    if (!values.length) return null;
+    const sorted = [...values].sort((a, b) => a - b);
+    const middle = Math.floor(sorted.length / 2);
+    return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+  };
+  const number = (value: any, digits = 4) =>
+    value != null && Number.isFinite(Number(value))
+      ? Number(value).toLocaleString('sk-SK', { maximumFractionDigits: digits })
+      : '—';
+
+  const lossHitTrailThenStop = losses.filter((trade: any) =>
+    trade.mfe_reached_trailing_start === true && trade.exit_reason === 'stop_loss'
+  ).length;
+  const winningTrailing = wins.filter((trade: any) => trade.exit_reason === 'trailing').length;
+  const winningWindowEnd = wins.filter((trade: any) => trade.exit_reason === 'window_end').length;
+  const medianWinMfe = median(wins.map((trade: any) => Number(trade.mfe)).filter(Number.isFinite));
+  const medianLossMae = median(losses.map((trade: any) => Math.abs(Number(trade.mae))).filter(Number.isFinite));
+
+  return <section className="trade-tape-panel" aria-label="Read-only audit aktuálneho optimizer výsledku">
+    <h4>Read-only audit aktuálneho výsledku · {view.pair} · {view.timeframe} · v{view.variant ?? '—'}</h4>
+    <p>Len už uložená páska z tohto optimizer jobu. Nič sa neprepočítava a nespúšťa sa nový holdout ani grid.</p>
+    <p>
+      Obchody spolu {trades.length} · validácia {validation.length} · holdout {holdout.length} ·
+      výhry {wins.length} · straty {losses.length}.
+    </p>
+    <p>
+      Straty s MFE ≥ trailing start a následným stop-lossom: <strong>{lossHitTrailThenStop}/{losses.length}</strong> ·
+      výhry zatvorené trailingom: <strong>{winningTrailing}</strong> ·
+      výhry zatvorené na konci okna: <strong>{winningWindowEnd}</strong>.
+    </p>
+    <p>
+      Medián MFE výhier: <strong>{number(medianWinMfe)} %</strong> ·
+      medián |MAE| strát: <strong>{number(medianLossMae)} %</strong>.
+    </p>
+    <details>
+      <summary>37-obchodová páska / uložené obchody <span>⌄</span></summary>
+      <div className="trade-tape-scroll" tabIndex={0} role="region" aria-label="Read-only tabuľka obchodov aktuálneho výsledku">
+        <table className="trade-tape">
+          <thead><tr>{['Okno', 'Vstup UTC', 'Výstup UTC', 'PnL USDT', 'MAE %', 'MFE %', 'Dôvod', 'MFE ≥ trail start'].map(label => <th key={label} scope="col">{label}</th>)}</tr></thead>
+          <tbody>{trades.map((trade: any, index: number) => <tr key={`${trade.window}:${trade.entry_ts}:${index}`}>
+            <th scope="row">{trade.window}</th>
+            <td>{trade.entry_ts}</td>
+            <td>{trade.exit_ts}</td>
+            <td>{number(trade.pnl_net, 6)}</td>
+            <td>{number(trade.mae)}</td>
+            <td>{number(trade.mfe)}</td>
+            <td>{trade.exit_reason}</td>
+            <td>{trade.mfe_reached_trailing_start == null ? '—' : trade.mfe_reached_trailing_start ? 'áno' : 'nie'}</td>
+          </tr>)}</tbody>
+        </table>
+      </div>
+    </details>
+  </section>;
+}
+
 function TradeTapePanel({ view }: { view: any }) {
   const rows = (view.variant_results || []).filter((row: any) => ['UNI/USDT', 'ZEC/USDT'].includes(row.pair) && row.timeframe === '5m' && row.variant === 2 && Number(row.walk_forward_metrics?.closed_trades) >= 20);
   const number = (value: any, digits = 4) => value != null && Number.isFinite(Number(value)) ? Number(value).toLocaleString('sk-SK', { maximumFractionDigits: digits }) : '—';
