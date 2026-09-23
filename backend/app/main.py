@@ -17,7 +17,7 @@ from .local_store import LocalStore
 from .simulation import simulate
 from .optimizer import optimize, present_optimizer_record, assess_candidate, aggregate_metrics
 from .trade_audit import matches_target, prepare_replay, replay_validation, unpack_snapshot, trade_tape, tape_summary
-from .costs import book_costs, FEE_SCHEDULE, FEE_TAKER, FEE_MAKER
+from .costs import book_costs, FEE_SCHEDULE, FEE_TAKER, FEE_MAKER, net_return
 
 
 class StrategySettings(BaseModel):
@@ -833,6 +833,30 @@ async def replay_original_validation(request: ValidationReplayRequest):
         return outcome
 
 
+def buy_hold_risk_metrics(candles: list[dict[str, Any]], cost_profile: dict[str, Any], capital: float = 100.0) -> dict[str, Any]:
+    """Same-close benchmark using the stored cost model and mark-to-market liquidation value."""
+    if len(candles) < 2:
+        return {"return_percent": 0.0, "max_drawdown_percent": 0.0, "start_close": None, "end_close": None, "bars": len(candles)}
+    first = float(candles[0]["close"])
+    peak = capital
+    max_drawdown = 0.0
+    last_equity = capital
+    for candle in candles:
+        ratio = float(candle["close"]) / first
+        equity = capital * (1 + net_return(ratio, cost_profile))
+        peak = max(peak, equity)
+        if peak:
+            max_drawdown = max(max_drawdown, (peak - equity) / peak * 100)
+        last_equity = equity
+    return {
+        "return_percent": round((last_equity / capital - 1) * 100, 4),
+        "max_drawdown_percent": round(max_drawdown, 4),
+        "start_close": first,
+        "end_close": float(candles[-1]["close"]),
+        "bars": len(candles),
+    }
+
+
 def _same_numeric_metrics(expected: dict[str, Any], actual: dict[str, Any], tolerance: float = 1e-7) -> bool:
     for key, value in expected.items():
         if key not in actual:
@@ -844,6 +868,74 @@ def _same_numeric_metrics(expected: dict[str, Any], actual: dict[str, Any], tole
             if not math.isfinite(float(value)) or not math.isfinite(float(actual[key])) or abs(float(actual[key]) - float(value)) >= tolerance:
                 return False
     return True
+
+
+@app.get("/api/optimizer/{job_id}/benchmark-risk")
+async def benchmark_risk(job_id: str):
+    """Read-only B&H risk audit on the exact WF and holdout windows of a stored optimizer run."""
+    stored = await supabase_get("optimizer_runs", f"id=eq.{job_id}&limit=1")
+    record = next((row for row in stored if row.get("id") == job_id), None)
+    if record is None or record.get("status") != "completed":
+        raise HTTPException(404, "Completed optimizer run nebol nájdený.")
+
+    result = record.get("result") or {}
+    variants = result.get("variant_results") or []
+    selected_variant_id = result.get("variant_id")
+    row = next((item for item in variants if item.get("variant_id") == selected_variant_id), None)
+    if row is None:
+        raise HTTPException(422, "Run nemá auditovateľný vybraný variant.")
+    profile = row.get("cost_components")
+    if not profile:
+        raise HTTPException(422, "Run nemá uložený cost snapshot.")
+    snapshot = (result.get("replay_snapshots") or {}).get(row.get("snapshot_id"))
+    if not snapshot:
+        raise HTTPException(422, "Run nemá validačný snapshot.")
+
+    development = unpack_snapshot(snapshot)
+    windows = []
+    for boundary in row.get("validation_boundaries") or []:
+        start = int(boundary["trading_start_index"])
+        stop = int(boundary["stop_index"])
+        candles = development[start:stop]
+        metrics = buy_hold_risk_metrics(candles, profile, float(row["settings"]["initial_capital"]))
+        windows.append({"window": boundary["window"], **metrics})
+
+    wf_return_sum = round(sum(float(item["return_percent"]) for item in windows), 4)
+    wf_max_dd = round(max((float(item["max_drawdown_percent"]) for item in windows), default=0.0), 4)
+    wf_profit_dd = round(wf_return_sum / wf_max_dd, 4) if wf_max_dd > 0 else None
+
+    holdout_from = result.get("holdout_from_ms")
+    holdout_to = result.get("holdout_to_ms")
+    if holdout_from is None or holdout_to is None:
+        raise HTTPException(422, "Run nemá presné hranice holdoutu.")
+    timeframe = row["timeframe"]
+    step = TIMEFRAME_MILLISECONDS[timeframe]
+    count = min(45000, max(100, math.ceil((int(holdout_to) - int(holdout_from) + 1) / step)))
+    holdout_candles = await load_okx_candles(row["pair"], timeframe, count, int(holdout_from), int(holdout_to))
+    holdout = buy_hold_risk_metrics(holdout_candles, profile, float(row["settings"]["initial_capital"]))
+    stored_holdout_return = result.get("buy_hold_percent")
+    return {
+        "source_job_id": job_id,
+        "pair": row["pair"],
+        "timeframe": timeframe,
+        "read_only": True,
+        "grid_started": False,
+        "cost_book_ts": profile.get("book_ts"),
+        "wf_windows": windows,
+        "wf": {
+            "return_percent_sum_of_windows": wf_return_sum,
+            "max_drawdown_percent": wf_max_dd,
+            "profit_to_drawdown": wf_profit_dd,
+        },
+        "holdout": {
+            **holdout,
+            "profit_to_drawdown": round(float(holdout["return_percent"]) / float(holdout["max_drawdown_percent"]), 4)
+                if float(holdout["max_drawdown_percent"]) > 0 else None,
+            "stored_buy_hold_percent": stored_holdout_return,
+            "return_matches_stored": stored_holdout_return is not None
+                and abs(float(stored_holdout_return) - float(holdout["return_percent"])) < 1e-4,
+        },
+    }
 
 
 @app.get("/api/optimizer/{job_id}/reaudit")
