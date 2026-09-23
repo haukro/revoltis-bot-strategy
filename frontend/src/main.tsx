@@ -387,7 +387,10 @@ function App() {
       <ReplayAvailabilityNotice availability={replayAvailability} />
       <p className="optimizer-note">Optimalizácia negarantuje budúci zisk. Pred použitím reálnych peňazí musí výsledok prejsť novým backtestom, kontrolou skreslenia a dlhším dry-run testom.</p>
     </section>
-    <FreqtradeVisual candidate={!!optimizer?.result && normalizeOptimizerResult(optimizer.result).qualified} />
+    <FreqtradeVisual
+  result={optimizer?.result || null}
+  activeVersionId={activeUniverse?.version_id || null}
+/>
     <section className="panel market-panel"><div className="section-title"><span>LIVE</span><div><h3>Aktuálne sviečky z burzy</h3><p>Verejné spot dáta OKX · bez API kľúča · {config.timeframe}</p></div><select className="market-pair" value={marketPair} onChange={event => setMarketPair(event.target.value)}>{selected.map(pair => <option key={pair}>{pair}</option>)}</select></div><MarketChart market={market} error={marketError} />{simulation && <div className="simulation-result"><b>Výsledok poslednej simulácie · {currentPair}</b><span>Hodnota portfólia: {metrics.portfolio_value} USDT</span><span>Zisk/strata: {metrics.realized_profit >= 0 ? '+' : ''}{metrics.realized_profit} USDT</span><span>Obchody: {metrics.closed_trades}</span><span>Drawdown: {metrics.max_drawdown_percent} %</span>{currentCoverage && <span className={currentCoverage.complete ? 'positive' : 'negative'}>Dáta: {currentCoverage.candles}/{currentCoverage.expected_candles} sviečok {currentCoverage.complete ? '✓' : '⚠'}</span>}</div>}</section>
     <section className="workspace"><aside className="settings panel"><div className="section-title"><span>01</span><div><h3>Konfigurátor stratégie</h3><p>Vyber coiny a hranice simulácie.</p></div></div><div className="universe-actions"><button className="ghost" onClick={proposeUniverse} disabled={universeLoading || universeSaving || optimizerRunning || isRunning}>{universeLoading ? 'Vyhodnocujem OKX…' : 'Navrhnúť z OKX'}</button>{universeProposal?.status === 'ok' && <button onClick={acceptUniverse} disabled={universeSaving || optimizerRunning || isRunning}>{universeSaving ? 'Ukladám…' : 'Použiť návrh'}</button>}</div>{universeProposal && <div className={`universe-proposal ${universeProposal.status}`}><b>{universeProposal.status === 'ok' ? 'Návrh – zatiaľ nepoužitý' : 'Návrh nevytvorený'}</b><p>{universeProposal.message}</p>{universeProposal.picks?.map((item: any) => <span key={item.pair}>{item.pair} <strong>{item.score}/100</strong><small>spread {(item.spread_ratio * 100).toFixed(3)} % · ATR {(item.atr_ratio * 100).toFixed(2)} %</small></span>)}{universeProposal.data_quality?.incomplete_pairs?.length > 0 && <small>Neúplné dáta: {universeProposal.data_quality.incomplete_pairs.join(', ')}</small>}</div>}<p className="universe-lock" role="status">{universeLocked ? `Uložené a zamknuté: ${activeUniverse.pairs.join(', ')}. Návrh sa ukladá automaticky.` : 'Pre optimalizáciu použi a ulož návrh z OKX tlačidlom „Použiť návrh“.'}</p><h4>Vybrané coiny <small>{selected.length}</small></h4><div className="coin-grid">{availableCoins.map(coin => <label className={selected.includes(coin) ? 'coin active' : 'coin'} key={coin}><input type="checkbox" disabled={universeLocked || optimizerRunning || universeSaving} checked={selected.includes(coin)} onChange={event => update('selected_pairs', event.target.checked ? [...selected, coin] : selected.filter(item => item !== coin))} /><span>{coin.replace('/USDT', '')}</span><small>USDT</small></label>)}</div>{groups.map(([title, keys]) => <details key={title} open={title !== 'Rozšírené indikátory'}><summary>{title}<span>⌄</span></summary><div className="field-grid">{keys.map(key => <label key={key}>{fields[key]}{key === 'timeframe' ? <select value={String(config[key])} onChange={event => update(key, event.target.value)}>{['1m', '3m', '5m', '15m'].map(value => <option key={value}>{value}</option>)}</select> : <div className="number"><input type="number" value={Number(config[key])} step="0.01" onChange={event => update(key, Number(event.target.value))} /><span>{key.includes('percent') || key.includes('ratio') || key.includes('stop') || key.includes('trailing') || key.includes('rebound') ? '%' : key.includes('capital') || key.includes('amount') || key.includes('volume') ? 'USDT' : ''}</span></div>}</label>)}</div></details>)}</aside>
       <div className="results"><section className="panel chart-panel"><div className="section-title"><span>02</span><div><h3>Výsledok simulácie · {currentPair}</h3><p>Kapitál vybraného coinu po uzatvorených obchodoch.</p></div><span className="saved-progress">Priebeh uložený</span></div><div className="chart-controls"><span>Časový raster:</span><button className={chartRange === 'hour' ? 'active' : 'ghost'} onClick={() => setChartRange('hour')}>Hodiny</button><button className={chartRange === 'day' ? 'active' : 'ghost'} onClick={() => setChartRange('day')}>Dni / 24 h</button><button className={chartRange === 'week' ? 'active' : 'ghost'} onClick={() => setChartRange('week')}>Týždne</button></div><EquityChart points={currentEquityCurve} range={chartRange} /></section><section className="two-col"><div className="panel"><h3>Dôvody nevstúpenia</h3><Rejections reasons={simulation?.rejections || dashboard.analytics?.rejections || {}} /></div><div className="panel"><h3>Simulované obchody · {currentPair}</h3><TradeList trades={currentTrades} /></div></section><section className="panel"><div className="section-title"><span>03</span><div><h3>Verzie a backtesty</h3><p>Ulož parametre pred každým backtestom.</p></div><button className="ghost push" onClick={saveVersion}>Nová verzia</button></div><VersionList versions={versions} /><div className="compare"><h4>Porovnanie backtestov</h4><select value={left} onChange={event => setLeft(event.target.value)}><option value="">Prvý backtest</option>{backtests.map(item => <option key={item.id} value={item.id}>{item.id.slice(0, 8)} · {item.timerange}</option>)}</select><span>vs</span><select value={right} onChange={event => setRight(event.target.value)}><option value="">Druhý backtest</option>{backtests.map(item => <option key={item.id} value={item.id}>{item.id.slice(0, 8)} · {item.timerange}</option>)}</select><button onClick={compare}>Porovnať</button></div>{comparison && <Comparison data={comparison} />}</section></div>
@@ -410,9 +413,48 @@ function BotControlCenter({ scanner, error, loading, running, onRefresh, onToggl
     <footer><span>{scanner ? `${scanner.scanned} obchodovateľných párov skontrolovaných` : 'Načítavam verejné OKX trhy…'}</span><span>{scanner?.method || 'Likvidita · spread · volatilita'}</span><span>Výbery cez API: <b>ZAKÁZANÉ</b></span></footer>
   </section>;
 }
-function FreqtradeVisual({ candidate = false }: { candidate?: boolean }) {
-  return <section className="freqtrade-visual"><div className="ft-brand"><div className="ft-logo">F</div><div><span>OVERENIE STRATÉGIE</span><h3>Freqtrade</h3><p>OKX spot · historické dáta a backtest s exportom obchodov</p></div><i className={candidate ? '' : 'ft-blocked'}>{candidate ? 'PRIPRAVENÉ' : 'ZABLOKOVANÉ — CHÝBA KANDIDÁT'}</i></div>
-    <div className="ft-bottom"><div><span>DIAGNOSTICKÝ ROZSAH</span><p>UNI/USDT · ZEC/USDT · 5m · exchange okx · spot</p><p>download-data · backtesting --export trades</p></div><div className="ft-safety"><span>STAV EXPORTU</span><p>{candidate ? 'Kandidát umožňuje export na samostatné overenie.' : 'NEPREŠIEL. Export stratégie aj dry-run sú vypnuté.'}</p><small>Fee 0.001 = taker 0,10 % za stranu. Spread a impact v tomto Freqtrade poplatku nie sú zahrnuté. Žiadny príkaz sa tu automaticky nespúšťa.</small></div></div>
+function FreqtradeVisual({ result, activeVersionId }: { result: any, activeVersionId: string | null }) {
+  const evaluated = Boolean(result && activeVersionId && result.version_id === activeVersionId);
+  const candidate = evaluated && normalizeOptimizerResult(result).qualified;
+
+  return <section className="freqtrade-visual">
+    <div className="ft-brand">
+      <div className="ft-logo">F</div>
+      <div>
+        <span>OVERENIE STRATÉGIE</span>
+        <h3>Freqtrade</h3>
+        <p>OKX spot · historické dáta a backtest s exportom obchodov</p>
+      </div>
+      <i className={candidate ? '' : 'ft-blocked'}>
+        {candidate
+          ? 'PRIPRAVENÉ'
+          : evaluated
+            ? 'ZABLOKOVANÉ — CHÝBA KANDIDÁT'
+            : 'ZABLOKOVANÉ — NEVYHODNOTENÉ'}
+      </i>
+    </div>
+
+    <div className="ft-bottom">
+      <div>
+        <span>DIAGNOSTICKÝ ROZSAH</span>
+        <p>UNI/USDT · ZEC/USDT · 5m · exchange okx · spot</p>
+        <p>download-data · backtesting --export trades</p>
+      </div>
+
+      <div className="ft-safety">
+        <span>STAV EXPORTU</span>
+        <p>
+          {candidate
+            ? 'Kandidát umožňuje export na samostatné overenie.'
+            : evaluated
+              ? 'NEPREŠIEL. Export stratégie aj dry-run sú vypnuté.'
+              : 'NEVYHODNOTENÉ. Aktuálny lock ešte nemá výsledok optimalizácie. Export aj dry-run sú vypnuté.'}
+        </p>
+        <small>
+          Fee 0.001 = taker 0,10 % za stranu. Spread a impact v tomto Freqtrade poplatku nie sú zahrnuté. Žiadny príkaz sa tu automaticky nespúšťa.
+        </small>
+      </div>
+    </div>
   </section>;
 }
 function AlgorithmResult({ result, onCopy }: { result: any, onCopy: () => void }) {
@@ -480,7 +522,13 @@ function VariantTable({ view }: { view: any }) {
 }
 function ReplayAvailabilityNotice({ availability }: { availability: any }) {
   if (availability?.status !== 'replay_unavailable') return null;
-  return <p className="diagnostics-missing" role="status"><strong>replay_unavailable</strong> · Historická páska UNI/ZEC 5m v2: pôvodný report, parametre, okná a snapshot sviečok sa nepodarilo overiť. Replay sa nespustil. Verdikt ostáva NEPREŠIEL.</p>;
+  return (
+    <p className="diagnostics-missing" role="status">
+      <strong>Historická diagnostika UNI/ZEC nedostupná</strong> ·
+      Pôvodný report, parametre, okná a snapshot sviečok pre starý UNI/ZEC 5m v2 replay
+      sa nepodarilo overiť. Tento stav nie je verdiktom aktuálneho locku.
+    </p>
+  );
 }
 function TradeTapePanel({ view }: { view: any }) {
   const rows = (view.variant_results || []).filter((row: any) => ['UNI/USDT', 'ZEC/USDT'].includes(row.pair) && row.timeframe === '5m' && row.variant === 2 && Number(row.walk_forward_metrics?.closed_trades) >= 20);
