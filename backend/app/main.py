@@ -142,6 +142,12 @@ class TimeoutStudyRequest(BaseModel):
     model_config = {"extra": "forbid"}
 
 
+class Previous90dOOSRequest(BaseModel):
+    source_job_id: str
+    version_id: str
+    model_config = {"extra": "forbid"}
+
+
 DEFAULT = StrategySettings()
 local_store = LocalStore()
 app = FastAPI(title="Revoltis Bot Strategy API", version="1.0.0")
@@ -1035,6 +1041,144 @@ async def reaudit_optimizer_run(job_id: str):
         "read_only": True,
         "grid_started": False,
     }
+
+
+@app.post("/api/optimizer/previous-90d-oos")
+async def run_previous_90d_oos(request: Previous90dOOSRequest):
+    """One frozen 4h ZEC OOS run on the immediately preceding non-overlapping 90-day block."""
+    require_durable_production_store()
+
+    source_rows = await supabase_get("optimizer_runs", f"id=eq.{request.source_job_id}&limit=1")
+    source = next((row for row in source_rows if row.get("id") == request.source_job_id), None)
+    if source is None or source.get("status") != "completed":
+        raise HTTPException(404, "Zdrojový completed run nebol nájdený.")
+
+    source_result = source.get("result") or {}
+    if not source_result.get("fixed_window"):
+        raise HTTPException(422, "Zdrojový run nemá zmrazené historické okno.")
+
+    variants = source_result.get("variant_results") or []
+    selected_variant_id = source_result.get("variant_id")
+    source_variant = next((item for item in variants if item.get("variant_id") == selected_variant_id), None)
+    if source_variant is None:
+        raise HTTPException(422, "Zdrojový run nemá auditovateľný vybraný variant.")
+    if source_variant.get("pair") != "ZEC/USDT" or source_variant.get("timeframe") != "5m":
+        raise HTTPException(422, "OOS protokol je zamknutý na ZEC/USDT · 5m.")
+
+    source_settings = dict(source_variant.get("settings") or {})
+    if float(source_settings.get("max_no_trail_hours") or 0) != 4:
+        raise HTTPException(422, "OOS protokol vyžaduje zmrazený 4h baseline.")
+
+    versions = await supabase_get("strategy_versions", f"id=eq.{request.version_id}&limit=10")
+    version = next((row for row in versions if row.get("id") == request.version_id), None)
+    if version is None:
+        raise HTTPException(404, "OOS strategy version nebola nájdená.")
+    version_settings = dict(version.get("settings") or {})
+    version_settings.pop("_universe", None)
+    if version_settings != source_settings:
+        raise HTTPException(409, "OOS strategy version sa líši od zmrazeného 4h baseline.")
+
+    source_from = int(source_result["fixed_history_from_ms"])
+    source_to = int(source_result["fixed_history_to_ms"])
+    window_ms = 90 * 86_400_000
+    oos_from = source_from - window_ms
+    oos_to = source_from - 1
+    if oos_to >= source_from or oos_from >= oos_to:
+        raise HTTPException(409, "Neplatné odvodené OOS okno.")
+
+    pair, timeframe = "ZEC/USDT", "5m"
+    step = TIMEFRAME_MILLISECONDS[timeframe]
+    expected = window_ms // step
+    candles = await load_okx_candles(pair, timeframe, int(expected), oos_from, oos_to)
+    coverage = len(candles) / max(1, int(expected))
+    if len(candles) < 200 or coverage < .995:
+        raise HTTPException(409, f"OOS dáta nie sú úplné: {coverage:.2%}.")
+    if int(candles[0]["open_time"]) != oos_from or int(candles[-1]["close_time"]) != oos_to:
+        raise HTTPException(409, "OOS dataset nesedí na zmrazené hranice.")
+
+    cost_profile = source_variant.get("cost_components")
+    if not cost_profile:
+        raise HTTPException(422, "Zdrojový run nemá fixný cost snapshot.")
+
+    settings = StrategySettings(**version_settings).model_dump()
+    result = await asyncio.to_thread(
+        optimize,
+        {(pair, timeframe): candles},
+        settings,
+        1,
+        None,
+        locked_pairs=[pair],
+        cost_models={pair: cost_profile},
+    )
+
+    selected_id = result.get("variant_id")
+    selected = next((item for item in (result.get("variant_results") or []) if item.get("variant_id") == selected_id), None)
+    if selected is None:
+        raise HTTPException(500, "OOS výsledok nemá auditovateľný variant.")
+
+    development = unpack_snapshot(result["replay_snapshots"][selected["snapshot_id"]])
+    bh_wf = []
+    for boundary in selected.get("validation_boundaries") or []:
+        validation = development[int(boundary["trading_start_index"]):int(boundary["stop_index"])]
+        bh_wf.append({"window": boundary["window"], **buy_hold_risk_metrics(validation, cost_profile, float(settings["initial_capital"]))})
+
+    holdout_boundary = max(120, int(len(candles) * .8))
+    bh_holdout = buy_hold_risk_metrics(candles[holdout_boundary:], cost_profile, float(settings["initial_capital"]))
+    stored_bh = result.get("buy_hold_percent")
+    bh_holdout["stored_buy_hold_percent"] = stored_bh
+    bh_holdout["return_matches_stored"] = stored_bh is not None and abs(float(stored_bh) - float(bh_holdout["return_percent"])) < 1e-4
+
+    strategy_holdout_return = result.get("holdout_profit_percent")
+    strategy_holdout_dd = (result.get("holdout_metrics") or {}).get("max_drawdown_percent")
+    result.update({
+        "source": "okx_fixed_previous_90d",
+        "source_job_id": None,
+        "study_source_job_id": request.source_job_id,
+        "version_id": request.version_id,
+        "pairs_ready": ["ZEC-USDT"],
+        "pairs_dropped": [],
+        "fixed_window": True,
+        "fixed_history_from_ms": oos_from,
+        "fixed_history_to_ms": oos_to,
+        "fixed_cost_book_ts": cost_profile.get("book_ts"),
+        "oos_previous_90d": True,
+        "benchmark_risk": {
+            "wf_windows": bh_wf,
+            "holdout": bh_holdout,
+            "strategy_holdout": {
+                "return_percent": strategy_holdout_return,
+                "max_drawdown_percent": strategy_holdout_dd,
+                "profit_to_drawdown": round(float(strategy_holdout_return) / float(strategy_holdout_dd), 4)
+                    if strategy_holdout_return is not None and strategy_holdout_dd not in (None, 0) else None,
+            },
+        },
+    })
+
+    now = datetime.now(UTC).isoformat()
+    job_id = str(uuid4())
+    result["source_job_id"] = job_id
+    record = {
+        "id": job_id,
+        "status": "completed",
+        "created_at": now,
+        "finished_at": datetime.now(UTC).isoformat(),
+        "request": {
+            "kind": "previous_90d_oos_single",
+            "source_job_id": request.source_job_id,
+            "version_id": request.version_id,
+            "pairs": [pair],
+            "timeframes": [timeframe],
+            "history_days": 90,
+            "trials_per_market": 1,
+            "settings": settings,
+            "fixed_window": True,
+            "start_time": oos_from,
+            "end_time": oos_to,
+        },
+        "result": result,
+    }
+    saved = await supabase_upsert("optimizer_runs", record)
+    return present_optimizer_record(saved)
 
 
 @app.post("/api/optimizer/timeout-study")
