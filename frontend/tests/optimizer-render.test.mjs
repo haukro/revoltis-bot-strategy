@@ -17,11 +17,21 @@ const compiled = (await transformWithOxc(component + '\nexports.View = Algorithm
 const exports = {};
 new Function('React', 'normalizeOptimizerResult', 'fields', 'exports', compiled)(React, normalizeOptimizerResult, {}, exports);
 
-test('Freqtrade readiness is absent without a candidate', () => {
-  const html = renderToStaticMarkup(React.createElement(exports.Freqtrade, { candidate: false }));
-  assert.match(html, /ZABLOKOVANÉ/);
-  assert.doesNotMatch(html, /PRIPRAVENÉ|freqtrade trade/);
+test('Freqtrade stays unevaluated until the current lock has a matching result', () => {
+  const html = renderToStaticMarkup(React.createElement(exports.Freqtrade, { result: null, activeVersionId: 'lock-1' }));
+  assert.match(html, /ZABLOKOVANÉ — NEVYHODNOTENÉ/);
+  assert.match(html, /NEVYHODNOTENÉ/);
+  assert.doesNotMatch(html, /PRIPRAVENÉ|NEPREŠIEL/);
   assert.match(html, /backtesting --export trades/);
+});
+
+test('Freqtrade ignores a result from a different lock version', () => {
+  const html = renderToStaticMarkup(React.createElement(exports.Freqtrade, {
+    result: { version_id: 'old-lock', qualified: false },
+    activeVersionId: 'current-lock',
+  }));
+  assert.match(html, /ZABLOKOVANÉ — NEVYHODNOTENÉ/);
+  assert.doesNotMatch(html, /NEPREŠIEL/);
 });
 
 test('actual old NEAR markup has no winner, n/a and a disabled copy button', () => {
@@ -91,11 +101,11 @@ test('requested legacy trade tapes stay visibly unavailable without launching re
   assert.match(html, /<button disabled="">Kopírovať algoritmus/);
 });
 
-test('missing original report displays replay_unavailable even without optimizer results', () => {
+test('missing original report is labeled as historical diagnostics, not current verdict', () => {
   const html = renderToStaticMarkup(React.createElement(exports.ReplayNotice, { availability: { status: 'replay_unavailable' } }));
-  assert.match(html, /replay_unavailable/);
-  assert.match(html, /Replay sa nespustil/);
-  assert.doesNotMatch(html, /<button|<table/);
+  assert.match(html, /Historická diagnostika UNI\/ZEC nedostupná/);
+  assert.match(html, /nie je verdiktom aktuálneho locku/);
+  assert.doesNotMatch(html, /Verdikt ostáva NEPREŠIEL|<button|<table/);
 });
 
 test('recorded tape renders all 44 validation trades and no train or holdout trades', () => {
