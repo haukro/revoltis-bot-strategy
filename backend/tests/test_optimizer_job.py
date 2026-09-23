@@ -41,6 +41,7 @@ def test_job_passes_the_server_lock_snapshot_to_optimizer_and_persists_null_winn
     result = {"winner": None, "qualified": False, "job_verdict": "ŽIADNY PLATNÝ VARIANT"}
     with patch("app.main.supabase_get", new=AsyncMock(return_value=versions)), \
          patch("app.main.supabase_upsert", new=AsyncMock()) as save, \
+         patch("app.main.load_pair_cost_model", new=AsyncMock(return_value={"fee_rate": .001})), \
          patch("app.main.load_okx_candles", new=AsyncMock(side_effect=fetch)) as load, \
          patch("app.main.optimize", return_value=result) as optimize:
         asyncio.run(run_optimizer_job("test-locked", request))

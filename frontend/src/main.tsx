@@ -75,6 +75,7 @@ function App() {
   const [historicalHours, setHistoricalHours] = useState<1 | 6 | 24 | 168 | 336 | 720>(24);
   const [chartRange, setChartRange] = useState<'hour' | 'day' | 'week'>('day');
   const [optimizer, setOptimizer] = useState<any>(null);
+  const [replayAvailability, setReplayAvailability] = useState<any>(null);
   const [optimizerDays, setOptimizerDays] = useState<1 | 7 | 14 | 30>(7);
   const [optimizerTrials, setOptimizerTrials] = useState(3);
   const [optimizerRunning, setOptimizerRunning] = useState(false);
@@ -89,6 +90,15 @@ function App() {
     const data = await overview.json(); setDashboard(data); setConfig(data.strategy); setActiveUniverse(data.active_universe || null); setMarketPair(current => data.strategy.selected_pairs.includes(current) ? current : data.strategy.selected_pairs[0] || ''); setLastRun(data.last_simulation); if (data.last_simulation) { setSimulation({ metrics: data.last_simulation.summary, equity_curve: data.last_simulation.progress?.equity_curve || [], per_pair_metrics: data.last_simulation.progress?.per_pair_metrics || {}, per_pair_equity_curves: data.last_simulation.progress?.per_pair_equity_curves || {}, data_coverage: data.last_simulation.progress?.data_coverage || {} }); } setVersions(savedVersions.ok ? await savedVersions.json() : []); const tests = savedBacktests.ok ? await savedBacktests.json() : []; setBacktests(tests); if (tests.length > 1) { setLeft(tests[1].id); setRight(tests[0].id); } if (latestOptimizer.ok) { const saved = await latestOptimizer.json(); if (saved) setOptimizer(saved); }
   };
   useEffect(() => { load().catch(() => setMessage('Aplikáciu sa nepodarilo načítať. Skontroluj, či beží API.')); }, []);
+  useEffect(() => {
+    let active = true;
+    fetch('/api/optimizer/validation-replay').then(async response => {
+      if (!response.ok) throw new Error('replay_preflight_failed');
+      const result = await response.json();
+      if (active) setReplayAvailability(result);
+    }).catch(() => { if (active) setReplayAvailability({ status: 'replay_unavailable', reason: 'api_unavailable' }); });
+    return () => { active = false; };
+  }, []);
   const scanOkx = async () => {
     setScannerLoading(true); setScannerError('');
     try {
@@ -136,7 +146,7 @@ function App() {
     try {
     const pairs = universeProposal.picks.map((item: any) => item.pair);
     const nextConfig = { ...config, selected_pairs: pairs };
-    const universe = { proposal_id: universeProposal.proposal_id, source: universeProposal.source, accepted_at: new Date().toISOString(), lock: universeProposal.lock, pairs, method: universeProposal.method };
+    const universe = { proposal_id: universeProposal.proposal_id, source: universeProposal.source, accepted_at: new Date().toISOString(), lock: universeProposal.lock, pairs, method: universeProposal.method, fee_schedule: 'okx_global_regular', cost_profiles: Object.fromEntries(universeProposal.picks.map((item: any) => [item.pair, item.cost_components])) };
     const versionResponse = await fetch('/api/strategy-versions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: `OKX universe ${new Date().toLocaleDateString('sk-SK')}`, note: `Automatický návrh ${universeProposal.proposal_id}; uzamknutý na ${universeProposal.lock.hours} h.`, settings: nextConfig, universe }) });
     if (!versionResponse.ok) { setMessage('Návrh sa nepodarilo uložiť ako novú verziu stratégie.'); return; }
     const saved = await versionResponse.json();
@@ -147,9 +157,10 @@ function App() {
     finally { setUniverseSaving(false); }
   };
   const compare = async () => { if (!left || !right || left === right) { setMessage('Vyber dve rozdielne verzie backtestu.'); return; } const response = await fetch(`/api/backtests/compare?left=${encodeURIComponent(left)}&right=${encodeURIComponent(right)}`); if (response.ok) setComparison(await response.json()); else setMessage('Backtesty sa nepodarilo porovnať.'); };
-  const exportConfig = async () => { const response = await fetch('/api/export/freqtrade', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config) }); const blob = new Blob([JSON.stringify(await response.json(), null, 2)], { type: 'application/json' }); const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = 'revoltis-dry-run-config.json'; link.click(); URL.revokeObjectURL(link.href); };
+  const exportConfig = async () => { if (!optimizer?.result || !normalizeOptimizerResult(optimizer.result).qualified) return; const response = await fetch('/api/export/freqtrade', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config) }); if (!response.ok) { setMessage('Freqtrade export nie je dostupný bez overeného kandidáta.'); return; } const blob = new Blob([JSON.stringify(await response.json(), null, 2)], { type: 'application/json' }); const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = 'revoltis-dry-run-config.json'; link.click(); URL.revokeObjectURL(link.href); };
   const startOptimizer = async () => {
     if (!config || optimizerRunning || universeSaving) return;
+    if (dashboard?.persistence?.production_ready === false) { setMessage('persistence_unavailable: Najprv pripoj trvalé úložisko Supabase.'); return; }
     setOptimizerRunning(true); setOptimizer({ status: 'running', progress: 0, message: 'Pripravujem optimalizáciu…' });
     try {
       const contextResponse = await fetch('/api/strategy-context', { cache: 'no-store' });
@@ -159,6 +170,7 @@ function App() {
       if (!lock?.version_id || !lock.pairs?.length) throw new Error('Chýba aktívny zamknutý zoznam coinov. Klikni na „Navrhnúť z OKX“ a potom „Použiť návrh“.');
       // Freeze one server version for the whole multi-request run. The backend
       // rejects a changed version rather than mixing different universes.
+      if ([...(config.selected_pairs as string[])].sort().join(',') !== [...lock.pairs].sort().join(',')) throw new Error('Karty nie sú locknutý universe. Obnov stránku.');
       const optimizationPairs: string[] = [...lock.pairs];
       const optimizationConfig = { ...config, selected_pairs: optimizationPairs };
       setActiveUniverse(lock); setConfig(optimizationConfig);
@@ -172,7 +184,7 @@ function App() {
       const completed: any[] = [];
       for (let index = 0; index < optimizationPairs.length; index += 1) {
         const pair = optimizationPairs[index];
-        setOptimizer({ status: 'running', progress: Math.round(index / optimizationPairs.length * 100), message: `Testujem ${pair} (${index + 1}/${optimizationPairs.length})` });
+        setOptimizer({ version_id: lock.version_id, locked_pairs: optimizationPairs, status: 'running', progress: Math.round(index / optimizationPairs.length * 100), message: `Testujem ${pair} (${index + 1}/${optimizationPairs.length})` });
         const response = await fetch('/api/optimizer/run', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -350,7 +362,7 @@ function App() {
   const currentEquityCurve = simulation?.per_pair_equity_curves?.[currentPair] || calculatePairCurve(currentTrades, currentInitialCapital);
   const currentCoverage = simulation?.data_coverage?.[currentPair];
   return <main>
-    <header className="topbar"><div className="brand"><div className="brand-mark">R</div><div><h1>Revoltis <b>Bot Strategy</b></h1><p>Navrhuj · testuj · porovnávaj</p></div></div><div className="top-actions"><span className="mode"><i />SIMULÁCIA</span><button className="install-app" onClick={installApp}>⇩ Inštalovať aplikáciu</button><button className="ghost" onClick={exportConfig}>Export dry-run</button><button onClick={save}>Uložiť</button></div></header>
+    <header className="topbar"><div className="brand"><div className="brand-mark">R</div><div><h1>Revoltis <b>Bot Strategy</b></h1><p>Navrhuj · testuj · porovnávaj</p></div></div><div className="top-actions"><span className="mode"><i />SIMULÁCIA</span><button className="install-app" onClick={installApp}>⇩ Inštalovať aplikáciu</button><button className="ghost" onClick={exportConfig} disabled={!optimizer?.result || !normalizeOptimizerResult(optimizer.result).qualified}>Export pre backtest</button><button onClick={save}>Uložiť</button></div></header>
     <section className="hero"><div><span className="eyebrow">AKTÍVNY PRACOVNÝ PRIESTOR</span><h2>Stratégia pre pohyb trhu,<br /><em>nie pre domnienky.</em></h2><p>Každá úprava parametrov ostáva v bezpečnom dry-run režime. Pred ďalším krokom ju porovnaj s historickým výsledkom.</p></div><div className="hero-status"><span>Stav synchronizácie</span><strong>{dashboard.last_sync ? 'Dáta prijaté' : 'Čaká na údaje'}</strong><small>{dashboard.last_sync?.received_at ? new Date(dashboard.last_sync.received_at).toLocaleString('sk-SK') : 'Zatiaľ bez simulovaných obchodov'}</small></div></section>
     <BotControlCenter scanner={scanner} error={scannerError} loading={scannerLoading} running={paperBotRunning} onRefresh={scanOkx} onToggle={togglePaperBot} onChoose={testScannerPair} dailyLoss={Math.min(5, Number(config.stop_loss_percent || 4))} stake={Number(config.stake_amount || 0)} />
     <section className={`simulation-control status-${runStatus}`}>
@@ -364,14 +376,18 @@ function App() {
     <section className="metric-grid"><Metric label={`Simulačný kapitál · ${currentPair}`} value={`${metrics.initial_capital} USDT`} hint="počiatočný stav" /><Metric label={`Realizovaný výsledok · ${currentPair}`} value={`${metrics.realized_profit >= 0 ? '+' : ''}${metrics.realized_profit} USDT`} hint="po uzatvorených obchodoch" positive={metrics.realized_profit >= 0} /><Metric label={`Úspešnosť · ${currentPair}`} value={`${metrics.win_rate} %`} hint={`${metrics.closed_trades} uzatvorených obchodov`} /><Metric label={`Max. drawdown · ${currentPair}`} value={`${metrics.max_drawdown_percent ?? 0} %`} hint="pokles od maxima" /></section>
     <section className="preset-section"><div className="preset-heading"><div><span className="eyebrow">RÝCHLE NASTAVENIE</span><h3>Vyber profil stratégie</h3></div><p>Profil automaticky prenastaví obchodné hranice. Coiny a počiatočný kapitál ostanú zachované.</p></div><div className="preset-grid">{Object.entries(presets).map(([key, preset]) => <button key={key} className={`preset ${key} ${activePreset === key ? 'selected' : ''}`} onClick={() => applyPreset(key)}><span>{key === 'conservative' ? '◒' : key === 'growing' ? '↗' : '⚡'}</span><div><b>{preset.title}</b><small>{preset.description}</small></div><i>{activePreset === key ? 'Aktívna' : 'Použiť'}</i></button>)}</div></section>
     <section className="optimizer-panel">
-      <div className="optimizer-head"><div><span className="eyebrow">AI OPTIMALIZAČNÝ AGENT</span><h3>Hľadanie najlepšej stratégie</h3><p>Agent otestuje uzamknutý zoznam coinov na hlavných intervaloch 5m a 15m. Tri walk-forward okná a záverečný holdout chránia pred prispôsobením minulosti.</p></div><button onClick={startOptimizer} disabled={optimizerRunning || universeSaving}>{optimizerRunning ? 'Agent pracuje…' : '✦ Spustiť AI optimalizáciu'}</button></div>
+      <div className="optimizer-head"><div><span className="eyebrow">AI OPTIMALIZAČNÝ AGENT</span><h3>Hľadanie najlepšej stratégie</h3><p>Agent otestuje uzamknutý zoznam coinov na hlavných intervaloch 5m a 15m. Tri walk-forward okná a záverečný holdout chránia pred prispôsobením minulosti.</p></div><button onClick={startOptimizer} disabled={optimizerRunning || universeSaving || dashboard?.persistence?.production_ready === false}>{optimizerRunning ? 'Agent pracuje…' : '✦ Spustiť AI optimalizáciu'}</button></div>
       <div className="optimizer-options"><label>História<select value={optimizerDays} onChange={event => setOptimizerDays(Number(event.target.value) as 1 | 7 | 14 | 30)} disabled={optimizerRunning}><option value={1}>1 deň</option><option value={7}>7 dní</option><option value={14}>14 dní</option><option value={30}>30 dní</option></select></label><label>Varianty na trh<select value={optimizerTrials} onChange={event => setOptimizerTrials(Number(event.target.value))} disabled={optimizerRunning}><option value={2}>2 · rýchle</option><option value={3}>3 · odporúčané</option><option value={5}>5 · dôkladné</option></select></label><span>Výpočet hodnotí zisk, drawdown, počet obchodov, stabilitu a odhadované náklady.</span></div>
+      <p className="universe-lock">Verzia: {optimizer?.version_id || optimizer?.result?.version_id || activeUniverse?.version_id || '—'} · Lock: {(optimizer?.locked_pairs || optimizer?.result?.locked_pairs || activeUniverse?.pairs || []).join(', ') || 'nedostupný'}</p>
+      {dashboard?.persistence?.durable === false && <p className="diagnostics-missing" role="status">persistence_unavailable · Režim demo. Lock nemá trvalé uloženie v Supabase a po cold starte sa môže stratiť. Uloženie nového locku a nový job sú v produkcii pozastavené.</p>}
+      <p className="optimizer-note">Náklady pre nové výpočty: okx_global_regular · taker 0,10 % (maker 0,08 %) + half-spread + impact podľa páru. Sadzobník je výskumný predpoklad, nie overenie poplatkov tvojho účtu.</p>
       {optimizer?.status === 'running' && <div className="optimizer-progress"><div><span style={{ width: `${optimizer.progress || 0}%` }} /></div><p>{optimizer.message} · {optimizer.progress || 0} %</p></div>}
       {optimizer?.status === 'failed' && <div className="optimizer-error">Optimalizácia zlyhala: {optimizer.message}</div>}
       {optimizer?.result && <AlgorithmResult result={optimizer.result} onCopy={copyAlgorithm} />}
+      <ReplayAvailabilityNotice availability={replayAvailability} />
       <p className="optimizer-note">Optimalizácia negarantuje budúci zisk. Pred použitím reálnych peňazí musí výsledok prejsť novým backtestom, kontrolou skreslenia a dlhším dry-run testom.</p>
     </section>
-    <FreqtradeVisual />
+    <FreqtradeVisual candidate={!!optimizer?.result && normalizeOptimizerResult(optimizer.result).qualified} />
     <section className="panel market-panel"><div className="section-title"><span>LIVE</span><div><h3>Aktuálne sviečky z burzy</h3><p>Verejné spot dáta OKX · bez API kľúča · {config.timeframe}</p></div><select className="market-pair" value={marketPair} onChange={event => setMarketPair(event.target.value)}>{selected.map(pair => <option key={pair}>{pair}</option>)}</select></div><MarketChart market={market} error={marketError} />{simulation && <div className="simulation-result"><b>Výsledok poslednej simulácie · {currentPair}</b><span>Hodnota portfólia: {metrics.portfolio_value} USDT</span><span>Zisk/strata: {metrics.realized_profit >= 0 ? '+' : ''}{metrics.realized_profit} USDT</span><span>Obchody: {metrics.closed_trades}</span><span>Drawdown: {metrics.max_drawdown_percent} %</span>{currentCoverage && <span className={currentCoverage.complete ? 'positive' : 'negative'}>Dáta: {currentCoverage.candles}/{currentCoverage.expected_candles} sviečok {currentCoverage.complete ? '✓' : '⚠'}</span>}</div>}</section>
     <section className="workspace"><aside className="settings panel"><div className="section-title"><span>01</span><div><h3>Konfigurátor stratégie</h3><p>Vyber coiny a hranice simulácie.</p></div></div><div className="universe-actions"><button className="ghost" onClick={proposeUniverse} disabled={universeLoading || universeSaving || optimizerRunning || isRunning}>{universeLoading ? 'Vyhodnocujem OKX…' : 'Navrhnúť z OKX'}</button>{universeProposal?.status === 'ok' && <button onClick={acceptUniverse} disabled={universeSaving || optimizerRunning || isRunning}>{universeSaving ? 'Ukladám…' : 'Použiť návrh'}</button>}</div>{universeProposal && <div className={`universe-proposal ${universeProposal.status}`}><b>{universeProposal.status === 'ok' ? 'Návrh – zatiaľ nepoužitý' : 'Návrh nevytvorený'}</b><p>{universeProposal.message}</p>{universeProposal.picks?.map((item: any) => <span key={item.pair}>{item.pair} <strong>{item.score}/100</strong><small>spread {(item.spread_ratio * 100).toFixed(3)} % · ATR {(item.atr_ratio * 100).toFixed(2)} %</small></span>)}{universeProposal.data_quality?.incomplete_pairs?.length > 0 && <small>Neúplné dáta: {universeProposal.data_quality.incomplete_pairs.join(', ')}</small>}</div>}<p className="universe-lock" role="status">{universeLocked ? `Uložené a zamknuté: ${activeUniverse.pairs.join(', ')}. Návrh sa ukladá automaticky.` : 'Pre optimalizáciu použi a ulož návrh z OKX tlačidlom „Použiť návrh“.'}</p><h4>Vybrané coiny <small>{selected.length}</small></h4><div className="coin-grid">{availableCoins.map(coin => <label className={selected.includes(coin) ? 'coin active' : 'coin'} key={coin}><input type="checkbox" disabled={universeLocked || optimizerRunning || universeSaving} checked={selected.includes(coin)} onChange={event => update('selected_pairs', event.target.checked ? [...selected, coin] : selected.filter(item => item !== coin))} /><span>{coin.replace('/USDT', '')}</span><small>USDT</small></label>)}</div>{groups.map(([title, keys]) => <details key={title} open={title !== 'Rozšírené indikátory'}><summary>{title}<span>⌄</span></summary><div className="field-grid">{keys.map(key => <label key={key}>{fields[key]}{key === 'timeframe' ? <select value={String(config[key])} onChange={event => update(key, event.target.value)}>{['1m', '3m', '5m', '15m'].map(value => <option key={value}>{value}</option>)}</select> : <div className="number"><input type="number" value={Number(config[key])} step="0.01" onChange={event => update(key, Number(event.target.value))} /><span>{key.includes('percent') || key.includes('ratio') || key.includes('stop') || key.includes('trailing') || key.includes('rebound') ? '%' : key.includes('capital') || key.includes('amount') || key.includes('volume') ? 'USDT' : ''}</span></div>}</label>)}</div></details>)}</aside>
       <div className="results"><section className="panel chart-panel"><div className="section-title"><span>02</span><div><h3>Výsledok simulácie · {currentPair}</h3><p>Kapitál vybraného coinu po uzatvorených obchodoch.</p></div><span className="saved-progress">Priebeh uložený</span></div><div className="chart-controls"><span>Časový raster:</span><button className={chartRange === 'hour' ? 'active' : 'ghost'} onClick={() => setChartRange('hour')}>Hodiny</button><button className={chartRange === 'day' ? 'active' : 'ghost'} onClick={() => setChartRange('day')}>Dni / 24 h</button><button className={chartRange === 'week' ? 'active' : 'ghost'} onClick={() => setChartRange('week')}>Týždne</button></div><EquityChart points={currentEquityCurve} range={chartRange} /></section><section className="two-col"><div className="panel"><h3>Dôvody nevstúpenia</h3><Rejections reasons={simulation?.rejections || dashboard.analytics?.rejections || {}} /></div><div className="panel"><h3>Simulované obchody · {currentPair}</h3><TradeList trades={currentTrades} /></div></section><section className="panel"><div className="section-title"><span>03</span><div><h3>Verzie a backtesty</h3><p>Ulož parametre pred každým backtestom.</p></div><button className="ghost push" onClick={saveVersion}>Nová verzia</button></div><VersionList versions={versions} /><div className="compare"><h4>Porovnanie backtestov</h4><select value={left} onChange={event => setLeft(event.target.value)}><option value="">Prvý backtest</option>{backtests.map(item => <option key={item.id} value={item.id}>{item.id.slice(0, 8)} · {item.timerange}</option>)}</select><span>vs</span><select value={right} onChange={event => setRight(event.target.value)}><option value="">Druhý backtest</option>{backtests.map(item => <option key={item.id} value={item.id}>{item.id.slice(0, 8)} · {item.timerange}</option>)}</select><button onClick={compare}>Porovnať</button></div>{comparison && <Comparison data={comparison} />}</section></div>
@@ -394,7 +410,11 @@ function BotControlCenter({ scanner, error, loading, running, onRefresh, onToggl
     <footer><span>{scanner ? `${scanner.scanned} obchodovateľných párov skontrolovaných` : 'Načítavam verejné OKX trhy…'}</span><span>{scanner?.method || 'Likvidita · spread · volatilita'}</span><span>Výbery cez API: <b>ZAKÁZANÉ</b></span></footer>
   </section>;
 }
-function FreqtradeVisual() { return <section className="freqtrade-visual"><div className="ft-brand"><div className="ft-logo">F</div><div><span>CIEĽOVÁ OBCHODNÁ PLATFORMA</span><h3>Freqtrade</h3><p>Bezplatný Python bot · vlastný server · úplná kontrola stratégie</p></div><i>PRIPRAVENÉ</i></div><div className="ft-flow"><article><b>R</b><span>Revoltis</span><small>simulácia a AI optimalizácia</small></article><em>→</em><article><b>PY</b><span>Algoritmus</span><small>RevoltisAIOptimized_v1.py</small></article><em>→</em><article className="highlight"><b>F</b><span>Freqtrade</span><small>backtest a bezpečný dry-run</small></article><em>→</em><article><b>O</b><span>OKX Europe Spot</span><small>verejné dáta a neskôr príkazy</small></article></div><div className="ft-bottom"><div><span>EXPORTNÝ BALÍK</span><ul><li><b>01</b> Stratégia Python</li><li><b>02</b> Dry-run konfigurácia</li><li><b>03</b> Zoznam coinov</li><li><b>04</b> Optimalizačný report</li></ul></div><div className="ft-safety"><span>BEZPEČNOSTNÁ CESTA</span><p><b>Backtest</b><i>→</i><b>Dry-run</b><i>→</i><b>Kontrola výsledkov</b><i>→</i><b>Voliteľný live režim</b></p><small>Žiadne API kľúče ani reálne obchodovanie nie sú súčasťou exportu zo simulácie.</small></div></div></section>; }
+function FreqtradeVisual({ candidate = false }: { candidate?: boolean }) {
+  return <section className="freqtrade-visual"><div className="ft-brand"><div className="ft-logo">F</div><div><span>OVERENIE STRATÉGIE</span><h3>Freqtrade</h3><p>OKX spot · historické dáta a backtest s exportom obchodov</p></div><i className={candidate ? '' : 'ft-blocked'}>{candidate ? 'PRIPRAVENÉ' : 'ZABLOKOVANÉ — CHÝBA KANDIDÁT'}</i></div>
+    <div className="ft-bottom"><div><span>DIAGNOSTICKÝ ROZSAH</span><p>UNI/USDT · ZEC/USDT · 5m · exchange okx · spot</p><p>download-data · backtesting --export trades</p></div><div className="ft-safety"><span>STAV EXPORTU</span><p>{candidate ? 'Kandidát umožňuje export na samostatné overenie.' : 'NEPREŠIEL. Export stratégie aj dry-run sú vypnuté.'}</p><small>Fee 0.001 = taker 0,10 % za stranu. Spread a impact v tomto Freqtrade poplatku nie sú zahrnuté. Žiadny príkaz sa tu automaticky nespúšťa.</small></div></div>
+  </section>;
+}
 function AlgorithmResult({ result, onCopy }: { result: any, onCopy: () => void }) {
   const view = normalizeOptimizerResult(result);
   const m = view.holdout_metrics;
@@ -416,7 +436,9 @@ function AlgorithmResult({ result, onCopy }: { result: any, onCopy: () => void }
       <div><span>Hold rovnakého coinu a obdobia</span><b>{view.buy_hold_percent ?? '—'} %</b></div>
     </div>
     {view.holdout_visible && <p className="validation-counts">Holdout po nákladoch: priemerná výhra {m.avg_win ?? 'n/a'} USDT · priemerná strata {m.avg_loss ?? 'n/a'} USDT · payoff {m.closed_trades >= 10 ? m.payoff ?? 'n/a' : 'n/a'} · expectancy {m.expectancy ?? 'n/a'} USDT/obchod.</p>}
+    {!!Object.keys(view.cost_profiles || {}).length && <details><summary>Náklady podľa páru · {view.fee_schedule}<span>⌄</span></summary><ul className="list">{Object.entries(view.cost_profiles).map(([pair, value]) => { const c = value as any; const pct = (n: number) => `${(n * 100).toFixed(4)} %`; return <li key={pair}><span>{pair} · {c.role}<small>fee {pct(c.fee_rate)} · half-spread {pct(c.half_spread)} · impact nákup {pct(c.buy_impact)} / predaj {pct(c.sell_impact)}</small><small>Aktuálny snapshot knihy {c.book_ts}; nejde o historické L2. {c.thin_L1 ? 'thin_L1' : ''}</small></span></li>; })}</ul></details>}
     <VariantTable view={view} />
+    <TradeTapePanel view={view} />
     {!!view.per_coin_results?.length && <details><summary>Vyhodnotenie po coinoch <span>⌄</span></summary><ul className="list">
       {view.per_coin_results.map((row: any) => <li key={row.pair}><span>{row.pair} · {row.timeframe}<small>Validácia: {row.walk_forward_metrics?.closed_trades ?? 0}/20 · Holdout: {row.validation_passed && row.holdout_metrics ? `${row.holdout_metrics.closed_trades}/10` : '—'}</small></span><b>{row.verdict}</b></li>)}
     </ul></details>}
@@ -454,6 +476,39 @@ function VariantTable({ view }: { view: any }) {
         </tr>)}</tbody>
       </table>
     </div>}
+  </section>;
+}
+function ReplayAvailabilityNotice({ availability }: { availability: any }) {
+  if (availability?.status !== 'replay_unavailable') return null;
+  return <p className="diagnostics-missing" role="status"><strong>replay_unavailable</strong> · Historická páska UNI/ZEC 5m v2: pôvodný report, parametre, okná a snapshot sviečok sa nepodarilo overiť. Replay sa nespustil. Verdikt ostáva NEPREŠIEL.</p>;
+}
+function TradeTapePanel({ view }: { view: any }) {
+  const rows = (view.variant_results || []).filter((row: any) => ['UNI/USDT', 'ZEC/USDT'].includes(row.pair) && row.timeframe === '5m' && row.variant === 2 && Number(row.walk_forward_metrics?.closed_trades) >= 20);
+  const number = (value: any, digits = 4) => value != null && Number.isFinite(Number(value)) ? Number(value).toLocaleString('sk-SK', { maximumFractionDigits: digits }) : '—';
+  if (!rows.length) return null;
+  return <section className="trade-tape-panel" aria-label="Páska validačných obchodov UNI a ZEC">
+    <h4>Páska obchodov · UNI a ZEC · 5m · v2</h4>
+    <p>Len validation WF1–WF3. Rozbor nemení verdikt ani neodomyká export.</p>
+    <p>MAE je najnižšia a MFE najvyššia zmena ceny od vstupu v %. Sú pred nákladmi; PnL je po nákladoch uložených v danom reporte; historický UNI/ZEC replay zachováva 0,15 % na každej strane. Vstupná sviečka sa do extrémov nepočíta, pretože vstup je na jej close.</p>
+    <p>SL sa spúšťa podľa close, nie samotného wicku. „SL pred trailingom“ znamená, že na rovnakom close platili obe výstupné podmienky a prednosť dostal SL. Poradie high/low v sviečke nepoznáme.</p>
+    {rows.map((row: any) => {
+      const trades = (row.trades || []).filter((trade: any) => ['wf1', 'wf2', 'wf3'].includes(trade.window));
+      const complete = row.trade_tape_version === 1 && trades.length === row.walk_forward_metrics.closed_trades;
+      const wins = trades.filter((t: any) => t.pnl_net > 0), losses = trades.filter((t: any) => t.pnl_net < 0);
+      const avg = (items: any[], key: string) => items.length && items.every(t => t[key] != null) ? items.reduce((sum, t) => sum + Number(t[key]), 0) / items.length : null;
+      return <details key={row.variant_id} open><summary>{row.pair} · WF1–WF3 · {complete ? trades.length : '—'}/{row.walk_forward_metrics.closed_trades} obchodov <span>⌄</span></summary>
+        {!complete ? <p className="diagnostics-missing"><strong>replay_unavailable</strong> · Páska sa v pôvodnom behu neuložila. Detaily sa nedajú odvodiť zo súhrnu. Bez pôvodného snapshotu a zhody všetkých WF súhrnov sa replay nevykoná.</p> : <>
+          <p>Obchody {trades.length} · výhry {wins.length} · straty {losses.length} · nulové {trades.length - wins.length - losses.length}. Priemerná čistá výhra {number(avg(wins, 'pnl_net'))} USDT · strata {number(losses.length ? -avg(losses, 'pnl_net')! : null)} USDT.</p>
+          <p>Priemerné MFE pri stratách {number(avg(losses, 'mfe'))} % · straty s MFE ≥ trailing start: {losses.filter((t: any) => t.mfe_reached_trailing_start === true).length}/{losses.length}.</p>
+          <p>{['stop_loss', 'trailing', 'window_end', 'other'].map(reason => { const n = trades.filter((t: any) => t.exit_reason === reason).length; return `${reason}: ${n} (${number(n / trades.length * 100, 1)} %)`; }).join(' · ')}</p>
+          <div className="trade-tape-scroll" tabIndex={0} role="region" aria-label={`Obchody ${row.pair}, posúvaj vodorovne`}><table className="trade-tape">
+            <caption>{row.pair} · 5m · v2. Časy vstupu a výstupu sú UTC.</caption>
+            <thead><tr>{['Okno', 'Vstup UTC', 'Výstup UTC', 'Trvanie min', 'Cena vstupu', 'Cena výstupu', 'Čisté PnL USDT', 'MAE %', 'MFE %', 'Dôvod', 'SL pred trailingom', 'MFE ≥ trailing start', 'Trailing aktívny pred výstupnou sviečkou'].map(label => <th key={label} scope="col">{label}</th>)}</tr></thead>
+            <tbody>{trades.map((t: any, index: number) => <tr key={`${t.window}:${t.entry_ts}:${index}`}><th scope="row">{t.window}</th><td>{t.entry_ts}</td><td>{t.exit_ts}</td><td>{number(t.duration_min, 2)}</td><td>{number(t.entry_px, 8)}</td><td>{number(t.exit_px, 8)}</td><td>{number(t.pnl_net, 6)}</td><td>{number(t.mae)}</td><td>{number(t.mfe)}</td><td>{t.exit_reason}</td><td>{t.sl_before_trail ? 'áno' : 'nie'}</td><td>{t.mfe_reached_trailing_start == null ? '—' : t.mfe_reached_trailing_start ? 'áno' : 'nie'}</td><td>{t.trail_active_before_exit_candle == null ? '—' : t.trail_active_before_exit_candle ? 'áno' : 'nie'}</td></tr>)}</tbody>
+          </table></div>
+        </>}
+      </details>;
+    })}
   </section>;
 }
 function Metric({ label, value, hint, positive }: { label: string, value: string, hint: string, positive?: boolean }) { return <article className="metric"><span>{label}</span><strong className={positive ? 'positive' : ''}>{value}</strong><small>{hint}</small></article>; }

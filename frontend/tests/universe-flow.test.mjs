@@ -41,10 +41,10 @@ test('apply proposal saves and activates in one request without reloading stale 
   assert.equal(state.saving, false);
 });
 
-async function optimizerHarness(context) {
+async function optimizerHarness(context, selected = defaults) {
   const calls = []; const state = {};
   const start = await handler('startOptimizer', 'copyAlgorithm', {
-    config: { selected_pairs: defaults, stake_amount: 40 }, universeSaving: false, optimizerRunning: false,
+    config: { selected_pairs: selected, stake_amount: 40 }, dashboard: { persistence: { production_ready: true } }, universeSaving: false, optimizerRunning: false,
     optimizerDays: 30, optimizerTrials: 2,
     setOptimizerRunning: value => { state.running = value; }, setOptimizer: value => { state.optimizer = value; },
     setActiveUniverse: value => { state.lock = value; }, setConfig: value => { state.config = value; },
@@ -59,8 +59,8 @@ async function optimizerHarness(context) {
   return { calls, state };
 }
 
-test('stale BONK configuration runs only the five server-locked coins with one version id', async () => {
-  const { calls, state } = await optimizerHarness({ active_universe: lock });
+test('matching cards run only the five server-locked coins with one version id', async () => {
+  const { calls, state } = await optimizerHarness({ active_universe: lock }, pairs);
   assert.equal(calls[0].url, '/api/strategy-context');
   assert.deepEqual(calls.slice(1).flatMap(call => call.body.pairs), pairs);
   for (const call of calls.slice(1)) {
@@ -71,7 +71,13 @@ test('stale BONK configuration runs only the five server-locked coins with one v
   }
   assert.equal(state.pair, 'UNI/USDT');
   assert.equal(state.optimizer.result.winner, null);
-  assert.match(state.message, /obnovený zo zamknutej verzie/);
+});
+
+test('stale cards stop with a specific universe mismatch before any job', async () => {
+  const { calls, state } = await optimizerHarness({ active_universe: lock });
+  assert.equal(calls.length, 1);
+  assert.equal(state.optimizer.status, 'failed');
+  assert.match(state.optimizer.message, /Karty nie sú locknutý universe/);
 });
 
 test('missing server lock stops before requesting any optimizer job', async () => {

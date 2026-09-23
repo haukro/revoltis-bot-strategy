@@ -1,5 +1,6 @@
 // Recheck stored/legacy results too: an old `qualified` flag is not approval.
 export function normalizeOptimizerResult(raw: any): any {
+  raw = diagnosticResult(raw);
   const validationTrades = raw.walk_forward_metrics?.closed_trades ??
     (Array.isArray(raw.validation_windows) ? raw.validation_windows.reduce((n: number, w: any) => n + Number(w.closed_trades || 0), 0) : 0);
   const recordedHoldout = raw.holdout_metrics || (raw.selection_policy_version < 2 ? raw.validation_metrics : null) || {};
@@ -47,6 +48,21 @@ export function normalizeOptimizerResult(raw: any): any {
   };
 }
 
+function diagnosticResult(raw: any): any {
+  const rows = raw.variant_results || [];
+  if (raw.qualified || !rows.length || rows.some((r: any) => r.validation_passed)) return raw;
+  const usable = rows.filter((r: any) => r.validation_windows?.length === 3 && r.walk_forward_metrics);
+  if (!usable.length) return raw;
+  const distance = (r: any) => {
+    const m = r.walk_forward_metrics;
+    return [Number(!(Number(m.realized_profit) > 0)) + Number(Number(m.max_drawdown_percent) > 15) + Number(r.validation_windows.filter((w: any) => Number(w.realized_profit) > 0).length < 2),
+      Math.max(0, 20 - Number(m.closed_trades)), -Number(m.realized_profit), Number(m.max_drawdown_percent)];
+  };
+  const selected = [...usable].sort((a, b) => { const x = distance(a), y = distance(b); return x[0] - y[0] || x[1] - y[1] || x[2] - y[2] || x[3] - y[3] || String(a.variant_id).localeCompare(String(b.variant_id)); })[0];
+  return { ...raw, ...selected, qualified: false, winner: null, strategy_code: null,
+    validation_rejection_reasons: selected.rejection_reasons || [], diagnostic_only: true };
+}
+
 export function variantDiagnostics(raw: any): any {
   // Legacy reports saved only top_results (at most five) and the selected
   // variant's windows. Preserve that evidence; never invent missing windows.
@@ -64,6 +80,8 @@ export function variantDiagnostics(raw: any): any {
     const eligible = row.validation_passed === true;
     const showHoldout = eligible && row.is_finalist === true && row.holdout_evaluated === true;
     return { ...row,
+      trades: Array.isArray(row.trades) ? row.trades.filter((trade: any) =>
+        ['wf1', 'wf2', 'wf3'].includes(trade.window) || (showHoldout && trade.window === 'holdout')) : undefined,
       holdout_evaluated: showHoldout,
       holdout_metrics: showHoldout ? row.holdout_metrics : null,
       holdout_profit_percent: showHoldout ? row.holdout_profit_percent : null,
@@ -99,6 +117,9 @@ export function combineOptimizerResults(results: any[]): any {
     pairs_ready: [...new Set(rows.flatMap(row => row.pairs_ready || []))],
     pairs_dropped: rows.flatMap(row => row.pairs_dropped || []),
     variant_results: rows.flatMap(row => row.variant_results || []),
+    replay_snapshots: Object.assign({}, ...rows.map(row => row.replay_snapshots || {})),
+    source_job_ids: [...new Set(rows.flatMap(row => row.source_job_ids || (row.source_job_id ? [row.source_job_id] : [])))],
+    cost_profiles: Object.assign({}, ...rows.map(row => row.cost_profiles || {})),
   };
-  return { ...combined, ...variantDiagnostics(combined) };
+  return normalizeOptimizerResult(combined);
 }

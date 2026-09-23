@@ -5,6 +5,8 @@ connects an account and never creates an exchange order.
 """
 from __future__ import annotations
 
+from .costs import net_return
+
 from collections import defaultdict
 from datetime import UTC, datetime
 from math import sqrt
@@ -72,6 +74,7 @@ def simulate(
     fee: float = 0.001,
     force_close_at_end: bool = False,
     trading_start_time: int | None = None,
+    cost_models: dict[str, dict] | None = None,
 ) -> dict[str, Any]:
     """Run the mean-reversion strategy on public historical candles."""
     bb_period = int(settings["bb_period"])
@@ -101,12 +104,50 @@ def simulate(
     pair_drawdowns = {pair: 0.0 for pair in candles_by_pair}
     sample_every = max(1, len(events) // 1000)
 
+    if cost_models is not None and any(pair not in cost_models for pair in candles_by_pair):
+        raise ValueError("missing_pair_cost_model")
+
+    def position_return(position: dict, price: float, *, legacy_sides: int = 2) -> float:
+        ratio = price / position["entry_rate"]
+        if cost_models is not None:
+            return net_return(ratio, cost_models[position["pair"]])
+        return ratio - 1 - legacy_sides * fee
+
+    def cost_log(position: dict, price: float) -> dict:
+        if cost_models is None:
+            return {}
+        profile = cost_models[position["pair"]]
+        entry_value = position["stake"] / (1 + profile["entry_cost_rate"])
+        exit_value = entry_value * price / position["entry_rate"]
+        return {"cost_components": profile,
+                "entry_fee_usdt": round(entry_value * profile["fee_rate"], 6),
+                "exit_fee_usdt": round(exit_value * profile["fee_rate"], 6),
+                "spread_impact_usdt": round(entry_value * (profile["half_spread"] + profile["buy_impact"]) + exit_value * (profile["half_spread"] + profile["sell_impact"]), 6),
+                "net_return_percent": round(position_return(position, price) * 100, 6)}
+
     def marked_equity() -> float:
         value = cash
         for position in positions:
             price = latest_prices.get(position["pair"], position["entry_rate"])
-            value += position["stake"] * (price / position["entry_rate"] - fee)
+            value += position["stake"] * (1 + position_return(position, price, legacy_sides=1))
         return value
+
+    def excursion_log(position: dict[str, Any], close_time: int, *, sl_before_trail: bool = False,
+                      prior_high: float | None = None) -> dict[str, Any]:
+        # Entries/exits execute at candle close. Entry-candle wicks precede the
+        # position and must not be counted; subsequent full candles are observed.
+        entry = position["entry_rate"]
+        mfe = max(0.0, (position["high_watermark"] / entry - 1) * 100)
+        return {
+            "mae": round(min(0.0, (position["low_watermark"] / entry - 1) * 100), 8),
+            "mfe": round(mfe, 8),
+            "excursion_unit": "gross_price_percent",
+            "duration_min": (close_time - position["entry_ts_ms"]) / 60_000,
+            "trailing_start_percent": float(settings["trailing_start_percent"]),
+            "sl_before_trail": sl_before_trail,
+            "trailing_start_reached": position["high_watermark"] >= entry * (1 + float(settings["trailing_start_percent"]) / 100),
+            "trail_active_before_exit_candle": (prior_high if prior_high is not None else entry) >= entry * (1 + float(settings["trailing_start_percent"]) / 100),
+        }
 
     for event_number, (close_time, pair, index) in enumerate(events):
         candles = candles_by_pair[pair]
@@ -115,24 +156,31 @@ def simulate(
         latest_prices[pair] = close
         current_positions = [position for position in positions if position["pair"] == pair]
         for position in current_positions:
+            prior_high = position["high_watermark"]
             position["high_watermark"] = max(position["high_watermark"], float(candle["high"]))
+            position["low_watermark"] = min(position["low_watermark"], float(candle["low"]))
+            position["prior_high"] = prior_high
+            trailing_triggered = position["high_watermark"] >= position["entry_rate"] * (1 + float(settings["trailing_start_percent"]) / 100) and close <= position["high_watermark"] * (1 - float(settings["trailing_distance_percent"]) / 100)
             exit_reason = None
             if close <= position["entry_rate"] * (1 - float(settings["stop_loss_percent"]) / 100):
                 exit_reason = "stop_loss"
-            elif position["high_watermark"] >= position["entry_rate"] * (1 + float(settings["trailing_start_percent"]) / 100) and close <= position["high_watermark"] * (1 - float(settings["trailing_distance_percent"]) / 100):
+            elif trailing_triggered:
                 exit_reason = "trailing_profit"
             if exit_reason:
                 gross_return = close / position["entry_rate"] - 1
-                profit = position["stake"] * (gross_return - 2 * fee)
+                profit = position["stake"] * position_return(position, close)
                 cash += position["stake"] + profit
                 positions.remove(position)
                 trades.append({"id": f"simulation-{pair}-{close_time}-{len(trades)}", "pair": pair, "status": "closed", "opened_at": position["opened_at"], "closed_at": _iso(close_time), "entry_rate": position["entry_rate"], "exit_rate": close, "stake_amount": position["stake"], "profit_usdt": round(profit, 6), "exit_reason": exit_reason, "raw": {"source": "okx_public_candles", "entry_fee_usdt": round(position["stake"] * fee, 6), "exit_fee_usdt": round(position["stake"] * fee, 6), "gross_return_percent": round(gross_return * 100, 6), "net_return_percent": round((gross_return - 2 * fee) * 100, 6), "holding_candles": index - position["entry_index"]}})
+                trades[-1]["raw"].update(excursion_log(position, close_time,
+                    sl_before_trail=exit_reason == "stop_loss" and trailing_triggered, prior_high=prior_high))
+                trades[-1]["raw"].update(cost_log(position, close))
 
         equity = marked_equity()
         peak = max(peak, equity)
         drawdown = max(drawdown, (peak - equity) / peak * 100 if peak else 0)
         pair_value = initial_capital + sum(float(trade["profit_usdt"]) for trade in trades if trade["pair"] == pair)
-        pair_value += sum(position["stake"] * (close / position["entry_rate"] - 1 - fee) for position in positions if position["pair"] == pair)
+        pair_value += sum(position["stake"] * position_return(position, close, legacy_sides=1) for position in positions if position["pair"] == pair)
         pair_peaks[pair] = max(pair_peaks[pair], pair_value)
         pair_drawdowns[pair] = max(pair_drawdowns[pair], (pair_peaks[pair] - pair_value) / pair_peaks[pair] * 100 if pair_peaks[pair] else 0)
         if event_number % sample_every == 0:
@@ -175,7 +223,7 @@ def simulate(
             continue
         cash -= stake
         daily_entries[day] += 1
-        positions.append({"pair": pair, "entry_rate": close, "stake": stake, "opened_at": _iso(close_time), "high_watermark": close, "entry_index": index})
+        positions.append({"pair": pair, "entry_rate": close, "stake": stake, "opened_at": _iso(close_time), "high_watermark": close, "low_watermark": close, "entry_ts_ms": close_time, "entry_index": index})
 
     if force_close_at_end:
         for position in list(positions):
@@ -183,10 +231,12 @@ def simulate(
             close = last_close = float(candles_by_pair[pair][-1]["close"])
             close_time = int(candles_by_pair[pair][-1]["close_time"])
             gross_return = close / position["entry_rate"] - 1
-            profit = position["stake"] * (gross_return - 2 * fee)
+            profit = position["stake"] * position_return(position, close)
             cash += position["stake"] + profit
             positions.remove(position)
             trades.append({"id": f"simulation-{pair}-{close_time}-{len(trades)}", "pair": pair, "status": "closed", "opened_at": position["opened_at"], "closed_at": _iso(close_time), "entry_rate": position["entry_rate"], "exit_rate": last_close, "stake_amount": position["stake"], "profit_usdt": round(profit, 6), "exit_reason": "end_of_test", "raw": {"source": "okx_public_candles", "entry_fee_usdt": round(position["stake"] * fee, 6), "exit_fee_usdt": round(position["stake"] * fee, 6), "gross_return_percent": round(gross_return * 100, 6), "net_return_percent": round((gross_return - 2 * fee) * 100, 6), "holding_candles": len(candles_by_pair[pair]) - 1 - position["entry_index"]}})
+            trades[-1]["raw"].update(excursion_log(position, close_time, prior_high=position.get("prior_high")))
+            trades[-1]["raw"].update(cost_log(position, close))
         final_time = max((int(candles[-1]["close_time"]) for candles in candles_by_pair.values() if candles), default=0)
         if final_time:
             equity_curve.append({"time": _iso(final_time), "value": round(cash, 4)})
@@ -194,7 +244,7 @@ def simulate(
             drawdown = max(drawdown, (peak - cash) / peak * 100 if peak else 0)
 
     last_prices = {pair: float(candles[-1]["close"]) for pair, candles in candles_by_pair.items() if candles}
-    unrealized = sum(position["stake"] * (last_prices[position["pair"]] / position["entry_rate"] - 1 - fee) for position in positions)
+    unrealized = sum(position["stake"] * position_return(position, last_prices[position["pair"]], legacy_sides=1) for position in positions)
     portfolio_value = cash + sum(position["stake"] for position in positions) + unrealized
     wins = sum(1 for trade in trades if trade["profit_usdt"] > 0)
     per_pair_metrics: dict[str, dict[str, float | int]] = {}
@@ -202,7 +252,7 @@ def simulate(
     for pair in candles_by_pair:
         pair_trades = sorted((trade for trade in trades if trade["pair"] == pair), key=lambda trade: trade.get("closed_at") or "")
         pair_realized = sum(float(trade["profit_usdt"]) for trade in pair_trades)
-        pair_unrealized = sum(position["stake"] * (last_prices[pair] / position["entry_rate"] - 1 - fee) for position in positions if position["pair"] == pair and pair in last_prices)
+        pair_unrealized = sum(position["stake"] * position_return(position, last_prices[pair], legacy_sides=1) for position in positions if position["pair"] == pair and pair in last_prices)
         pair_wins = sum(1 for trade in pair_trades if float(trade["profit_usdt"]) > 0)
         pair_equity = initial_capital
         pair_peak, pair_drawdown = initial_capital, pair_drawdowns[pair]

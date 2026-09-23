@@ -2,7 +2,7 @@
 
 Webové rozhranie pre **simulačný** Freqtrade bot. Umožňuje vybrať coiny a meniť všetky parametre stratégie: sviečky, vstup po poklese, RSI, Bollinger Bands, ATR, volume filter, potvrdenie otočenia, stop-loss, trailing profit, kapitál a denné limity. Neobsahuje prístup k burze ani live trading.
 
-Aplikácia funguje samostatne: načítava verejné spotové OHLCV sviečky z Binance a vlastné FastAPI jadro nad nimi spúšťa simuláciu. Freqtrade už nie je potrebný na načítanie dát ani na spustenie simulácie.
+Aplikácia funguje samostatne: načítava verejné spotové OHLCV sviečky z OKX a vlastné FastAPI jadro nad nimi spúšťa simuláciu. Freqtrade už nie je potrebný na načítanie dát ani na spustenie simulácie.
 
 Každá dokončená simulácia uloží priebeh hodnoty portfólia, testované časové okno a výsledné metriky. V grafe možno priebeh zobraziť po hodinách, dňoch alebo týždňoch.
 
@@ -16,7 +16,7 @@ Bez `.env` API funguje v lokálnom demo režime: nastavenia, verzie a importovan
 
 ## Prepojenie s Freqtrade
 
-Táto aplikácia je ovládací a hodnotiaci panel. Freqtrade ostáva samostatný **dry-run** proces. Ďalší krok je pridať synchronizáciu jeho databázy `revoltis-v5-dryrun.sqlite` do tabuľky `simulated_trades`; aplikácia je na túto tabuľku pripravená. Žiadne API kľúče Binance sa sem nevkladajú.
+Táto aplikácia je ovládací a hodnotiaci panel. Freqtrade je samostatný nástroj na `download-data` a `backtesting --export trades`. Export a dry-run sú povolené až po stave KANDIDÁT; aplikácia nespúšťa live obchodovanie. Ďalší krok je pridať synchronizáciu jeho databázy `revoltis-v5-dryrun.sqlite` do tabuľky `simulated_trades`; aplikácia je na túto tabuľku pripravená. Žiadne API kľúče burzy sa sem nevkladajú.
 
 Synchronizácia je už pripravená v `scripts/sync_freqtrade.py`. Po spustení API ju spustíš napríklad takto:
 

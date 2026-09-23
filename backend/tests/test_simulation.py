@@ -6,7 +6,7 @@ import unittest
 
 
 MODULE_PATH = Path(__file__).parents[1] / "app" / "simulation.py"
-SPEC = importlib.util.spec_from_file_location("revoltis_simulation", MODULE_PATH)
+SPEC = importlib.util.spec_from_file_location("app.simulation", MODULE_PATH)
 simulation = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader
 SPEC.loader.exec_module(simulation)

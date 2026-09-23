@@ -108,3 +108,27 @@ test('accepted coins rank on validation expectancy, not holdout profit or payoff
   }, holdout_metrics: { ...accepted().holdout_metrics, realized_profit: 1000 } };
   assert.equal(combineOptimizerResults([b, a]).winner.pair, 'NEAR/USDT');
 });
+
+test('trade tape keeps validation only until the actual finalist receives holdout', () => {
+  const row = { validation_passed: false, is_finalist: true, holdout_evaluated: true,
+    trades: [{ window: 'train', pnl_net: 999 }, { window: 'wf1', pnl_net: 1 }, { window: 'wf2', pnl_net: -2 }, { window: 'wf3', pnl_net: .5 }, { window: 'holdout', pnl_net: 888 }] };
+  const raw = { variant_results: [row] };
+  assert.deepEqual(variantDiagnostics(raw).variant_results[0].trades.map(t => t.window), ['wf1', 'wf2', 'wf3']);
+  row.validation_passed = true;
+  assert.deepEqual(variantDiagnostics(raw).variant_results[0].trades.map(t => t.window), ['wf1', 'wf2', 'wf3', 'holdout']);
+});
+
+test('diagnostic uses UNI 17 positive trades rather than XRP 5 or losing 21 without creating a candidate', () => {
+  const variant_results = [['XRP/USDT', 5, 1], ['UNI/USDT', 17, 4.146], ['ZEC/USDT', 23, -.6865]].map(([pair, n, pnl]) => ({
+    pair, timeframe: '15m', variant: 2, variant_id: pair, validation_passed: false,
+    walk_forward_metrics: { closed_trades: n, realized_profit: pnl, max_drawdown_percent: 4 },
+    validation_windows: [{ realized_profit: 2 }, { realized_profit: -.1 }, { realized_profit: 2 }],
+    rejection_reasons: n < 20 ? ['malo_obchodov'] : ['zaporny_pnl'],
+  }));
+  const result = normalizeOptimizerResult({ pair: 'XRP/USDT', selection_policy_version: 3, variant_results });
+  assert.equal(result.pair, 'UNI/USDT');
+  assert.equal(result.validation_trade_count, 17);
+  assert.equal(result.winner, null);
+  assert.equal(result.qualified, false);
+  assert.equal(result.holdout_visible, false);
+});

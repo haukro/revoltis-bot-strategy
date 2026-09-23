@@ -15,7 +15,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from .local_store import LocalStore
 from .simulation import simulate
-from .optimizer import optimize, present_optimizer_record
+from .optimizer import optimize, present_optimizer_record, assess_candidate
+from .trade_audit import matches_target, prepare_replay, replay_validation
+from .costs import book_costs, FEE_SCHEDULE, FEE_TAKER, FEE_MAKER
 
 
 class StrategySettings(BaseModel):
@@ -121,6 +123,12 @@ class OptimizerRequest(BaseModel):
     trials_per_market: int = Field(default=3, ge=1, le=8)
 
 
+class ValidationReplayRequest(BaseModel):
+    # Deliberately no settings, dates, pair, timeframe or grid parameters.
+    source_job_ids: list[str] = Field(min_length=1, max_length=2)
+    model_config = {"extra": "forbid"}
+
+
 DEFAULT = StrategySettings()
 local_store = LocalStore()
 app = FastAPI(title="Revoltis Bot Strategy API", version="1.0.0")
@@ -135,6 +143,8 @@ OKX_HISTORY_CANDLES_URL = f"{OKX_BASE_URL}/api/v5/market/history-candles"
 ALLOWED_TIMEFRAMES = {"1m", "3m", "5m", "15m", "30m", "1h", "4h", "1d"}
 TIMEFRAME_MILLISECONDS = {"1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000, "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000}
 optimizer_jobs: dict[str, dict[str, Any]] = {}
+validation_replay_lock = asyncio.Lock()
+validation_replay_attempts: dict[tuple[str, ...], dict] = {}
 okx_history_semaphore = asyncio.Semaphore(1)
 okx_history_rate_lock = asyncio.Lock()
 okx_history_last_request = 0.0
@@ -146,6 +156,17 @@ OKX_CANDLE_CACHE_SECONDS = 15 * 60
 def supabase_headers() -> dict[str, str]:
     key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
     return {"apikey": key, "Authorization": f"Bearer {key}", "Content-Type": "application/json", "Prefer": "return=representation"}
+
+
+def persistence_status() -> dict:
+    durable = bool(os.getenv("SUPABASE_URL") and os.getenv("SUPABASE_SERVICE_ROLE_KEY"))
+    return {"mode": "supabase" if durable else "demo", "durable": durable,
+            "production_ready": durable or not bool(os.getenv("VERCEL"))}
+
+
+def require_durable_production_store() -> None:
+    if not persistence_status()["production_ready"]:
+        raise HTTPException(503, "persistence_unavailable: Supabase nie je nakonfigurovaný. Lock sa v produkcii nedá trvalo uložiť.")
 
 
 async def supabase_get(table: str, query: str = "") -> list[dict]:
@@ -194,7 +215,39 @@ async def supabase_upsert_many(table: str, records: list[dict]) -> list[dict]:
 @app.get("/api/health")
 async def health():
     configured = bool(os.getenv("SUPABASE_URL") and os.getenv("SUPABASE_SERVICE_ROLE_KEY"))
-    return {"status": "ok", "mode": "supabase" if configured else "demo", "live_trading": False}
+    return {"status": "ok", "mode": "supabase" if configured else "demo", "live_trading": False,
+            "persistence": persistence_status(), "fee_schedule": FEE_SCHEDULE,
+            "fee_taker": FEE_TAKER, "fee_maker": FEE_MAKER, "default_role": "taker"}
+
+
+async def load_pair_cost_model(pair: str, notional: float) -> dict:
+    async with httpx.AsyncClient(timeout=15, trust_env=False) as client:
+        response = await client.get(OKX_BOOKS_URL, params={"instId": pair.replace("/", "-"), "sz": 400})
+        response.raise_for_status()
+        payload = response.json()
+    if payload.get("code") != "0" or not payload.get("data"):
+        raise ValueError("incomplete_order_book")
+    book = payload["data"][0]
+    age = int(datetime.now(UTC).timestamp() * 1000) - int(book.get("ts", 0))
+    if not -5000 <= age <= 30_000:
+        raise ValueError("stale_order_book")
+    return {"pair": pair, **book_costs(book, notional)}
+
+
+@app.get("/api/market/cost-model")
+async def inspect_cost_model(pairs: str = "UNI/USDT,ZEC/USDT", notional: float = 50):
+    """Read current books only. No job, candles, strategy update or orders."""
+    names = list(dict.fromkeys(pairs.split(",")))
+    if not 1 <= len(names) <= 8 or not 5 <= notional <= 10000 or any(not re.fullmatch(r"[A-Z0-9]+/USDT", p) for p in names):
+        raise HTTPException(422, "Neplatný pár alebo objem.")
+    profiles, errors = {}, []
+    for pair in names:
+        try:
+            profiles[pair] = await load_pair_cost_model(pair, notional)
+        except (httpx.HTTPError, ValueError, KeyError) as error:
+            errors.append({"pair": pair, "reason": str(error)[:160]})
+    return {"status": "degraded_no_pick" if errors else "ok", "source": "okx", "fee_schedule": FEE_SCHEDULE,
+            "profiles": profiles, "errors": errors, "historical_l2": False}
 
 
 @app.get("/api/market/scan")
@@ -396,8 +449,19 @@ def candle_metrics(candles: list[dict[str, Any]], request: UniversePickRequest) 
         previous_side = side
     volumes = [float(item.get("quote_volume") or float(item["volume"]) * float(item["close"])) for item in candles]
     volume_stability = min(1.0, median(volumes) / (sum(volumes) / len(volumes))) if volumes and sum(volumes) else 0.0
-    returns = [math.log(closes[index] / closes[index - 1]) for index in range(1, len(closes)) if closes[index - 1] > 0 and closes[index] > 0]
-    return {"atr_ratio": atr_ratio, "trend_strength": trend_strength, "bb_mid_crosses": crosses, "volume_stability": volume_stability, "returns": returns}
+    cutoff = int(candles[-1]["open_time"]) - request.correlation_lookback_hours * 3_600_000
+    step = TIMEFRAME_MILLISECONDS[request.timeframe]
+    returns_by_time = {str(candles[index]["open_time"]): math.log(closes[index] / closes[index - 1]) for index in range(1, len(closes))
+                       if int(candles[index]["open_time"]) >= cutoff and int(candles[index]["open_time"]) - int(candles[index - 1]["open_time"]) == step
+                       and closes[index - 1] > 0 and closes[index] > 0}
+    return {"atr_ratio": atr_ratio, "trend_strength": trend_strength, "bb_mid_crosses": crosses, "volume_stability": volume_stability, "returns_by_time": returns_by_time}
+
+
+def return_correlation(left: dict, right: dict) -> float:
+    common = sorted(set(left) & set(right))
+    if len(common) < 20:
+        raise ValueError("insufficient_aligned_returns")
+    return abs(pearson([left[t] for t in common], [right[t] for t in common]))
 
 
 @app.post("/api/market/universe/pick")
@@ -462,24 +526,18 @@ async def pick_market_universe(request: UniversePickRequest):
 
     async def enrich(row: dict[str, Any]) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=15, trust_env=False) as client:
-            book_response = await client.get(OKX_BOOKS_URL, params={"instId": row["instrument_id"], "sz": 5})
+            book_response = await client.get(OKX_BOOKS_URL, params={"instId": row["instrument_id"], "sz": 400})
             book_response.raise_for_status()
             book_payload = book_response.json()
         candles = await load_okx_candles(row["pair"], request.timeframe, candle_count, start_time, end_time)
         if book_payload.get("code") != "0" or not book_payload.get("data") or len(candles) < candle_count * .9:
             raise ValueError("incomplete_candidate_data")
-        asks = book_payload["data"][0].get("asks", [])
-        remaining, worst, best = request.trade_notional_usdt, 0.0, float(asks[0][0]) if asks else 0.0
-        for level in asks:
-            price, size = float(level[0]), float(level[1])
-            consumed = min(remaining, price * size)
-            remaining -= consumed; worst = price
-            if remaining <= .000001: break
-        if remaining > .000001 or best <= 0:
-            impact = 1.0
-        else:
-            impact = (worst - best) / best
-        return {**row, "book_impact_ratio": impact, **candle_metrics(candles, request)}
+        book_age = int(datetime.now(UTC).timestamp() * 1000) - int(book_payload["data"][0].get("ts", 0))
+        if not -5000 <= book_age <= request.max_data_age_seconds * 1000:
+            raise ValueError("stale_order_book")
+        cost = book_costs(book_payload["data"][0], request.trade_notional_usdt)
+        return {**row, "book_impact_ratio": cost["book_impact_ratio"], "thin_L1": cost["thin_L1"],
+                "cost_components": cost, **candle_metrics(candles, request)}
 
     async def enrich_with_retry(row: dict[str, Any]) -> dict[str, Any]:
         last_error: Exception | None = None
@@ -508,7 +566,7 @@ async def pick_market_universe(request: UniversePickRequest):
     proposal_id = str(uuid4())
     base_response = {"proposal_id": proposal_id, "generated_at": now.isoformat(), "source": "OKX public spot API", "status": "ok", "picks": [], "rejected": rejected, "data_quality": {"candidate_pool": len(candidate_pool), "complete_candidates": len(detailed), "incomplete_pairs": data_errors}, "lock": {"hours": request.lock_hours, "expires_at": (now + timedelta(hours=request.lock_hours)).isoformat()}, "method": {"weights": {"volume": .30, "spread": .25, "range": .20, "atr_fit": .15, "bb_crosses": .10}, "max_correlation": request.max_pairwise_correlation}}
     if data_errors or len(detailed) < request.max_picks:
-        return {**base_response, "status": "no_pick", "message": "Návrh sa nevytvoril, pretože údaje kandidátov nie sú úplné." if data_errors else "Tvrdé filtre prešlo príliš málo trhov."}
+        return {**base_response, "status": "degraded_no_pick" if data_errors else "no_pick", "message": "Návrh sa nevytvoril, pretože údaje kandidátov nie sú úplné." if data_errors else "Tvrdé filtre prešlo príliš málo trhov."}
 
     volumes = [item["volume_24h"] for item in detailed]; spreads = [item["spread_ratio"] for item in detailed]
     crosses = [item["bb_mid_crosses"] for item in detailed]; ranges = [1 - item["trend_strength"] for item in detailed]
@@ -519,14 +577,26 @@ async def pick_market_universe(request: UniversePickRequest):
         item["score"] = round(raw * 100, 1)
     detailed.sort(key=lambda item: item["score"], reverse=True)
     picks: list[dict[str, Any]] = []
-    for item in detailed:
-        correlations = [abs(pearson(item["returns"], picked["returns"])) for picked in picks]
-        if correlations and max(correlations) > request.max_pairwise_correlation:
-            rejected.append({"pair": item["pair"], "reasons": ["correlation"], "max_correlation": round(max(correlations), 3)})
-            continue
-        picks.append(item)
-        if len(picks) >= request.max_picks: break
-    public_picks = [{key: value for key, value in item.items() if key != "returns"} for item in picks]
+    remaining = list(detailed)
+    while remaining and len(picks) < request.max_picks:
+        scored = []
+        for item in remaining:
+            try:
+                correlation = max((return_correlation(item["returns_by_time"], picked["returns_by_time"]) for picked in picks), default=0.)
+            except ValueError:
+                return {**base_response, "status": "degraded_no_pick", "message": "Korelácie nemajú dostatok časovo zhodných dát.", "picks": []}
+            if correlation > request.max_pairwise_correlation:
+                rejected.append({"pair": item["pair"], "reasons": ["correlation"], "max_correlation": round(correlation, 3)})
+                continue
+            scored.append({**item, "correlation_penalty": round(10 * correlation, 4),
+                           "adjusted_score": item["score"] - 10 * correlation})
+        if not scored:
+            break
+        chosen = max(scored, key=lambda item: item["adjusted_score"])
+        picks.append(chosen)
+        remaining = [item for item in scored if item["pair"] != chosen["pair"]]
+    base_response["method"]["correlation_penalty_points"] = 10
+    public_picks = [{key: value for key, value in item.items() if key != "returns_by_time"} for item in picks]
     return {**base_response, "status": "ok" if len(public_picks) >= 3 else "no_pick", "message": "Návrh je pripravený na potvrdenie." if len(public_picks) >= 3 else "Po korelačnom filtri ostali menej než tri trhy.", "picks": public_picks}
 
 
@@ -604,7 +674,7 @@ async def strategy_context() -> dict:
             strategy = {**snapshot, "selected_pairs": list(pairs)}
         if lock:
             strategy = {**strategy, "selected_pairs": list(pairs)}
-    return {"strategy": StrategySettings(**strategy).model_dump(), "active_universe": lock}
+    return {"strategy": StrategySettings(**strategy).model_dump(), "active_universe": lock, "persistence": persistence_status()}
 
 
 @app.get("/api/strategy-context")
@@ -624,7 +694,16 @@ async def run_optimizer_job(job_id: str, request: OptimizerRequest) -> None:
             raise ValueError("Zamknutá verzia sa zmenila. Obnov stránku pred ďalšou optimalizáciou.")
         locked_pairs = lock["pairs"]
         if any(pair not in locked_pairs for pair in job_pairs):
-            raise ValueError("Požadovaný pár nie je súčasťou zamknutého universe.")
+            raise ValueError("Karty nie sú locknutý universe. Požadovaný pár nie je súčasťou zamknutej verzie.")
+        require_durable_production_store()
+        job.update({"version_id": lock["version_id"], "locked_pairs": list(locked_pairs), "pairs": job_pairs,
+                    "fee_schedule": FEE_SCHEDULE})
+        cost_models, cost_errors = {}, []
+        for pair in job_pairs:
+            try:
+                cost_models[pair] = await load_pair_cost_model(pair, float(request.settings.stake_amount))
+            except (httpx.HTTPError, ValueError, KeyError) as error:
+                cost_errors.append({"pair": pair, "timeframe": "book", "reason": f"cost_model_unavailable: {error}"})
         job_timeframes = ["15m", "5m"]
         # Stable candle boundary makes an immediate repeat use the same cache key.
         smallest_step = min(TIMEFRAME_MILLISECONDS[item] for item in job_timeframes)
@@ -632,8 +711,8 @@ async def run_optimizer_job(job_id: str, request: OptimizerRequest) -> None:
         start_time = end_time - request.history_days * 86_400_000
         candle_sets: dict[tuple[str, str], list[dict[str, Any]]] = {}
         timeframe_order = {"15m": 0, "5m": 1, "3m": 2, "1m": 3}
-        markets = sorted(((pair, timeframe) for pair in job_pairs for timeframe in job_timeframes), key=lambda item: (timeframe_order.get(item[1], 9), item[0]))
-        download_errors: list[dict[str, str]] = []
+        markets = sorted(((pair, timeframe) for pair in job_pairs if pair in cost_models for timeframe in job_timeframes), key=lambda item: (timeframe_order.get(item[1], 9), item[0]))
+        download_errors: list[dict[str, str]] = list(cost_errors)
         coverage_by_pair: dict[str, dict[str, Any]] = {}
         for number, (pair, timeframe) in enumerate(markets, 1):
             count = min(45000, max(100, request.history_days * 86_400_000 // TIMEFRAME_MILLISECONDS[timeframe]))
@@ -667,8 +746,8 @@ async def run_optimizer_job(job_id: str, request: OptimizerRequest) -> None:
         loop = asyncio.get_running_loop()
         def update_progress(done: int, total: int, market: str) -> None:
             loop.call_soon_threadsafe(job.update, {"phase": "testing", "message": f"Testujem {market}", "progress": 30 + round(done / total * 68), "tested": done, "total": total})
-        result = await asyncio.to_thread(optimize, candle_sets, request.settings.model_dump(), request.trials_per_market, update_progress, locked_pairs=locked_pairs)
-        result.update({"source": "okx", "version_id": lock["version_id"], "pairs_ready": [pair.replace("/", "-") for pair in pairs_ready], "pairs_dropped": pairs_dropped, "candle_coverage": coverage_by_pair, "data_errors": download_errors})
+        result = await asyncio.to_thread(optimize, candle_sets, request.settings.model_dump(), request.trials_per_market, update_progress, locked_pairs=locked_pairs, cost_models=cost_models)
+        result.update({"source": "okx", "source_job_id": job_id, "version_id": lock["version_id"], "pairs_ready": [pair.replace("/", "-") for pair in pairs_ready], "pairs_dropped": pairs_dropped, "candle_coverage": coverage_by_pair, "data_errors": download_errors})
         now = datetime.now(UTC).isoformat()
         record = {"id": job_id, "status": "completed", "created_at": job["created_at"], "finished_at": now, "request": request.model_dump(), "result": result}
         await supabase_upsert("optimizer_runs", record)
@@ -689,6 +768,54 @@ async def start_optimizer(request: OptimizerRequest):
     else:
         asyncio.create_task(run_optimizer_job(job_id, request))
     return optimizer_jobs[job_id]
+
+
+@app.get("/api/optimizer/validation-replay")
+async def validation_replay_availability():
+    """Read-only preflight for the user's two historical rows, never starts a job."""
+    records = await supabase_get("optimizer_runs", "order=finished_at.desc&limit=100")
+    originals = [r for r in records if any(matches_target(row) for row in r.get("result", {}).get("variant_results", []))]
+    try:
+        prepared = prepare_replay(originals)
+    except (ValueError, KeyError, TypeError) as error:
+        return {"status": "replay_unavailable", "reason": str(error), "source_job_ids": [r["id"] for r in originals],
+                "qualified": False, "verdict": "NEPREŠIEL"}
+    return {"status": "ready", "source_job_ids": sorted({r["id"] for r, _, _ in prepared}),
+            "qualified": False, "verdict": "NEPREŠIEL"}
+
+
+@app.post("/api/optimizer/validation-replay")
+async def replay_original_validation(request: ValidationReplayRequest):
+    """Use archived snapshots only. Preserve original lock, parameters and verdict."""
+    key = tuple(sorted(set(request.source_job_ids)))
+    async with validation_replay_lock:
+        if key in validation_replay_attempts:
+            return validation_replay_attempts[key]
+        records = []
+        for job_id in key:
+            stored = await supabase_get("optimizer_runs", f"id=eq.{job_id}&limit=100")
+            # LocalStore query support is limited, so enforce exact identity here.
+            record = next((row for row in stored if row.get("id") == job_id), None)
+            if record is None:
+                raise HTTPException(404, "Pôvodný záznam behu nie je dostupný. Replay sa nespustil.")
+            records.append(record)
+        for record in records:
+            previous = record.get("result", {}).get("validation_replay")
+            if previous and tuple(previous.get("source_job_ids", [])) == key:
+                return previous
+        try:
+            prepare_replay(records)
+        except (ValueError, KeyError, TypeError) as error:
+            return {"status": "replay_unavailable", "reason": str(error), "trades": [], "qualified": False, "verdict": "NEPREŠIEL"}
+        # Mark the attempt before computation. A failed/mismatched attempt is not
+        # automatically repeated. This endpoint never calls load_okx_candles.
+        validation_replay_attempts[key] = {"status": "attempt_failed", "trades": [], "qualified": False, "verdict": "NEPREŠIEL"}
+        outcome = await asyncio.to_thread(replay_validation, records)
+        outcome["source_job_ids"] = list(key)
+        validation_replay_attempts[key] = outcome
+        original = records[0]
+        await supabase_upsert("optimizer_runs", {**original, "result": {**original["result"], "validation_replay": outcome}})
+        return outcome
 
 
 @app.get("/api/optimizer/{job_id}")
@@ -740,6 +867,7 @@ async def dashboard():
 
 @app.put("/api/strategy")
 async def save_strategy(settings: StrategySettings):
+    require_durable_production_store()
     versions = await supabase_get("strategy_versions", "order=created_at.desc&limit=50")
     lock = active_universe(universe_version(versions))
     if lock and set(settings.selected_pairs) != set(lock["pairs"]):
@@ -762,6 +890,7 @@ async def list_strategy_versions():
 
 @app.post("/api/strategy-versions")
 async def create_strategy_version(version: StrategyVersionCreate):
+    require_durable_production_store()
     record = {
         "id": str(uuid4()), "name": version.name, "note": version.note,
         "settings": version.settings.model_dump() | ({"_universe": version.universe} if version.universe else {}), "created_at": datetime.now(UTC).isoformat(),
@@ -828,15 +957,29 @@ async def compare_backtests(left: str, right: str):
 
 @app.post("/api/export/freqtrade")
 async def export_freqtrade(settings: StrategySettings):
-    """Export dry-run-only settings for the existing Revoltis strategy."""
+    """Export a research configuration only from a verified stored candidate."""
+    records = await supabase_get("optimizer_runs", "order=finished_at.desc&limit=100")
+    context = await strategy_context()
+    lock = context["active_universe"]
+    candidate = None
+    for record in records:
+        row = (present_optimizer_record(record) or {}).get("result") or {}
+        if lock and row.get("version_id") == lock["version_id"] and row.get("selection_policy_version") == 3 and row.get("qualified") and row.get("winner") and row.get("holdout_evaluated") and assess_candidate(row, row.get("locked_pairs", []))["qualified"]:
+            candidate = row
+            break
+    if candidate is None:
+        raise HTTPException(409, "Freqtrade export je vypnutý: žiadny KANDIDÁT. Tento lock ostáva NEPREŠIEL.")
+    settings = StrategySettings(**candidate["settings"])
     return {
-        "strategy": "RevoltisVolatility_vNext", "timeframe": settings.timeframe,
+        "strategy": "RevoltisAIOptimized_v1", "timeframe": settings.timeframe,
         "dry_run": True, "dry_run_wallet": settings.initial_capital,
+        "initial_state": "stopped", "trading_mode": "spot", "fee": FEE_TAKER,
         "stake_currency": "USDT", "stake_amount": settings.stake_amount,
         "max_open_trades": settings.max_open_trades,
         "exchange": {"name": "okx", "pair_whitelist": settings.selected_pairs, "pair_blacklist": []},
         "revoltis_parameters": settings.model_dump(exclude={"selected_pairs", "timeframe", "initial_capital", "stake_amount", "max_open_trades"}),
-        "safety": {"live_trading": False, "requires_backtest_before_dry_run": True},
+        "safety": {"live_trading": False, "requires_backtest_before_dry_run": True, "purpose": "download-data_and_backtesting_export_trades",
+                   "fee_note": "fee 0.001 je taker 0,10 % za stranu. Spread a impact nie sú zahrnuté vo Freqtrade fee."},
     }
 
 
