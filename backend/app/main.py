@@ -15,8 +15,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from .local_store import LocalStore
 from .simulation import simulate
-from .optimizer import optimize, present_optimizer_record, assess_candidate
-from .trade_audit import matches_target, prepare_replay, replay_validation
+from .optimizer import optimize, present_optimizer_record, assess_candidate, aggregate_metrics
+from .trade_audit import matches_target, prepare_replay, replay_validation, unpack_snapshot, trade_tape, tape_summary
 from .costs import book_costs, FEE_SCHEDULE, FEE_TAKER, FEE_MAKER
 
 
@@ -824,6 +824,118 @@ async def replay_original_validation(request: ValidationReplayRequest):
         original = records[0]
         await supabase_upsert("optimizer_runs", {**original, "result": {**original["result"], "validation_replay": outcome}})
         return outcome
+
+
+def _same_numeric_metrics(expected: dict[str, Any], actual: dict[str, Any], tolerance: float = 1e-7) -> bool:
+    for key, value in expected.items():
+        if key not in actual:
+            return False
+        if value is None:
+            if actual[key] is not None:
+                return False
+        elif isinstance(value, (int, float)) and isinstance(actual[key], (int, float)):
+            if not math.isfinite(float(value)) or not math.isfinite(float(actual[key])) or abs(float(actual[key]) - float(value)) >= tolerance:
+                return False
+    return True
+
+
+@app.get("/api/optimizer/{job_id}/reaudit")
+async def reaudit_optimizer_run(job_id: str):
+    """Read-only deterministic audit of one stored optimizer run; never starts a grid."""
+    stored = await supabase_get("optimizer_runs", f"id=eq.{job_id}&limit=1")
+    if not stored or stored[0].get("id") != job_id:
+        raise HTTPException(404, "Optimizer run nebol nájdený.")
+    record = stored[0]
+    if record.get("status") != "completed":
+        raise HTTPException(422, "Re-audit vyžaduje dokončený optimizer run.")
+    result = record.get("result") or {}
+    variants = result.get("variant_results") or []
+    selected_variant_id = result.get("variant_id")
+    row = next((item for item in variants if item.get("variant_id") == selected_variant_id), None)
+    if row is None:
+        raise HTTPException(422, "Uložený run nemá auditovateľný vybraný variant.")
+    snapshot = (result.get("replay_snapshots") or {}).get(row.get("snapshot_id"))
+    if not snapshot:
+        raise HTTPException(422, "Uložený run nemá validačný snapshot.")
+
+    data = unpack_snapshot(snapshot)
+    settings = row["settings"]
+    pair = row["pair"]
+    timeframe = row["timeframe"]
+    fee = float(row["cost_per_side"])
+    cost_options = {"cost_models": {pair: row["cost_components"]}} if row.get("cost_components") else {}
+
+    validation_windows, validation_tape = [], []
+    for boundary in row.get("validation_boundaries") or []:
+        run = simulate(
+            {pair: data[boundary["warmup_start_index"]:boundary["stop_index"]]},
+            settings,
+            fee=fee,
+            force_close_at_end=True,
+            trading_start_time=boundary["trading_start_ms"],
+            **cost_options,
+        )
+        validation_windows.append(run["metrics"])
+        validation_tape.extend(trade_tape(run, pair, timeframe, row["variant_id"], boundary["window"], fee))
+
+    validation_metrics = aggregate_metrics(validation_windows, float(settings["initial_capital"]))
+    validation_matched = (
+        _same_numeric_metrics(row.get("walk_forward_metrics") or {}, validation_metrics)
+        and len(validation_windows) == len(row.get("validation_windows") or [])
+        and all(
+            _same_numeric_metrics(old, new)
+            for old, new in zip(row.get("validation_windows") or [], validation_windows)
+        )
+        and len(validation_tape) == int(validation_metrics.get("closed_trades") or 0)
+    )
+
+    holdout_metrics = None
+    holdout_tape: list[dict[str, Any]] = []
+    holdout_matched = not bool(row.get("holdout_evaluated"))
+    if row.get("holdout_evaluated"):
+        holdout_from = result.get("holdout_from_ms")
+        holdout_to = result.get("holdout_to_ms")
+        if holdout_from is None or holdout_to is None:
+            raise HTTPException(422, "Uložený finalist nemá presné hranice holdoutu.")
+        step = TIMEFRAME_MILLISECONDS[timeframe]
+        count = min(45000, max(100, math.ceil((int(holdout_to) - int(holdout_from) + 1) / step)))
+        fetched = await load_okx_candles(pair, timeframe, count, int(holdout_from), int(holdout_to))
+        warmup = max(40, int(settings["bb_period"]) + 2, int(settings["rsi_period"]) + 2, int(settings["atr_period"]) + 2)
+        holdout_data = data[-warmup:] + fetched
+        holdout_run = simulate(
+            {pair: holdout_data},
+            settings,
+            fee=fee,
+            force_close_at_end=True,
+            trading_start_time=int(holdout_from),
+            **cost_options,
+        )
+        holdout_metrics = holdout_run["metrics"]
+        holdout_tape = trade_tape(holdout_run, pair, timeframe, row["variant_id"], "holdout", fee)
+        holdout_matched = (
+            _same_numeric_metrics(row.get("holdout_metrics") or {}, holdout_metrics)
+            and len(holdout_tape) == int(holdout_metrics.get("closed_trades") or 0)
+        )
+
+    all_tape = validation_tape + holdout_tape
+    matched = validation_matched and holdout_matched
+    return {
+        "status": "matched" if matched else "mismatch",
+        "source_job_id": job_id,
+        "pair": pair,
+        "timeframe": timeframe,
+        "variant_id": row["variant_id"],
+        "validation_matched": validation_matched,
+        "holdout_matched": holdout_matched,
+        "validation_metrics": validation_metrics,
+        "holdout_metrics": holdout_metrics,
+        "validation_summary": tape_summary(validation_tape),
+        "holdout_summary": tape_summary(holdout_tape) if holdout_tape else None,
+        "summary": tape_summary(all_tape),
+        "trades": all_tape if matched else [],
+        "read_only": True,
+        "grid_started": False,
+    }
 
 
 @app.get("/api/optimizer/{job_id}")
