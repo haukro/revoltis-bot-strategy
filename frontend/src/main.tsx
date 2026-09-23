@@ -182,6 +182,7 @@ function App() {
       // markets in one request exceeds the function limit, so process one coin
       // at a time and keep the best independently validated result.
       const completed: any[] = [];
+      const completedJobIds: string[] = [];
       for (let index = 0; index < optimizationPairs.length; index += 1) {
         const pair = optimizationPairs[index];
         setOptimizer({ version_id: lock.version_id, locked_pairs: optimizationPairs, status: 'running', progress: Math.round(index / optimizationPairs.length * 100), message: `Testujem ${pair} (${index + 1}/${optimizationPairs.length})` });
@@ -202,10 +203,29 @@ function App() {
           job = await status.json();
         }
         if (job.status === 'failed') throw new Error(job.message || `Test ${pair} zlyhal.`);
-        if (job.result) completed.push(job.result);
+        if (job.result) {
+          completed.push(job.result);
+          completedJobIds.push(job.id);
+        }
       }
-      const result = combineOptimizerResults(completed);
-      setOptimizer({ status: 'completed', progress: 100, message: result.job_verdict, result });
+
+      const finalizeResponse = await fetch('/api/optimizer/finalize', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          version_id: lock.version_id,
+          source_job_ids: completedJobIds,
+        }),
+      });
+      if (!finalizeResponse.ok) {
+        const detail = await finalizeResponse.text();
+        throw new Error(detail || `Finalize HTTP ${finalizeResponse.status}`);
+      }
+      const finalized = await finalizeResponse.json();
+      const result = finalized?.result || combineOptimizerResults(completed);
+      setOptimizer(finalized?.result
+        ? finalized
+        : { status: 'completed', progress: 100, message: result.job_verdict, result });
     } catch (error) {
       const raw = error instanceof Error ? error.message : String(error);
       setOptimizer({ status: 'failed', message: `Výpočet sa prerušil. ${raw.slice(0, 300)}` });
