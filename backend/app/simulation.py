@@ -80,6 +80,8 @@ def simulate(
     bb_period = int(settings["bb_period"])
     rsi_period = int(settings["rsi_period"])
     atr_period = int(settings["atr_period"])
+    max_no_trail_hours = float(settings.get("max_no_trail_hours") or 0)
+    max_no_trail_ms = max_no_trail_hours * 3_600_000 if max_no_trail_hours > 0 else None
     warmup = max(bb_period, rsi_period, atr_period, 20) + 2
     events: list[tuple[int, str, int]] = []
     for pair, candles in candles_by_pair.items():
@@ -158,6 +160,7 @@ def simulate(
             "sl_before_trail": sl_before_trail,
             "trailing_start_reached": position["high_watermark"] >= entry * (1 + float(settings["trailing_start_percent"]) / 100),
             "trail_active_before_exit_candle": (prior_high if prior_high is not None else entry) >= entry * (1 + float(settings["trailing_start_percent"]) / 100),
+            "max_no_trail_hours": max_no_trail_hours or None,
         }
 
     for event_number, (close_time, pair, index) in enumerate(events):
@@ -171,12 +174,15 @@ def simulate(
             position["high_watermark"] = max(position["high_watermark"], float(candle["high"]))
             position["low_watermark"] = min(position["low_watermark"], float(candle["low"]))
             position["prior_high"] = prior_high
-            trailing_triggered = position["high_watermark"] >= position["entry_rate"] * (1 + float(settings["trailing_start_percent"]) / 100) and close <= position["high_watermark"] * (1 - float(settings["trailing_distance_percent"]) / 100)
+            trail_activated = position["high_watermark"] >= position["entry_rate"] * (1 + float(settings["trailing_start_percent"]) / 100)
+            trailing_triggered = trail_activated and close <= position["high_watermark"] * (1 - float(settings["trailing_distance_percent"]) / 100)
             exit_reason = None
             if close <= position["entry_rate"] * (1 - float(settings["stop_loss_percent"]) / 100):
                 exit_reason = "stop_loss"
             elif trailing_triggered:
                 exit_reason = "trailing_profit"
+            elif max_no_trail_ms is not None and close_time - position["entry_ts_ms"] >= max_no_trail_ms and not trail_activated:
+                exit_reason = "max_no_trail_hours"
             if exit_reason:
                 gross_return = close / position["entry_rate"] - 1
                 profit = position["stake"] * position_return(position, close)
