@@ -2,7 +2,7 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
-from app.main import OptimizerRequest, StrategySettings, optimizer_jobs, run_optimizer_job
+from app.main import OptimizerRequest, StrategySettings, combine_optimizer_lock_results, optimizer_jobs, run_optimizer_job
 
 
 def test_job_rejects_missing_lock_before_fetching_any_candles():
@@ -49,3 +49,59 @@ def test_job_passes_the_server_lock_snapshot_to_optimizer_and_persists_null_winn
     assert [call.args[1] for call in load.call_args_list] == ["15m", "5m"]
     assert optimizer_jobs["test-locked"]["result"]["winner"] is None
     assert save.call_args.args[1]["result"]["winner"] is None
+
+
+def test_combine_optimizer_lock_results_keeps_current_lock_and_all_coin_rows():
+    results = [
+        {
+            "pair": "UNI/USDT",
+            "timeframe": "5m",
+            "qualified": False,
+            "validation_passed": False,
+            "walk_forward_metrics": {"closed_trades": 12, "realized_profit": -1.0, "max_drawdown_percent": 2.0},
+            "tested_combinations": 6,
+            "max_validation_trades": 12,
+            "variant_results": [{"variant_id": "uni-v1", "rejection_reasons": ["malo_obchodov"]}],
+            "per_coin_results": [{"pair": "UNI/USDT", "verdict": "NEDOSTATOK OBCHODOV"}],
+            "pairs_ready": ["UNI-USDT"],
+            "pairs_dropped": [],
+            "replay_snapshots": {"uni": {"count": 1}},
+            "cost_profiles": {"UNI/USDT": {"fee_rate": .001}},
+            "source_job_id": "job-uni",
+        },
+        {
+            "pair": "XRP/USDT",
+            "timeframe": "15m",
+            "qualified": False,
+            "validation_passed": True,
+            "walk_forward_metrics": {"closed_trades": 25, "realized_profit": 1.5, "expectancy": .06, "max_drawdown_percent": 1.0},
+            "tested_combinations": 6,
+            "max_validation_trades": 25,
+            "variant_results": [{"variant_id": "xrp-v1", "rejection_reasons": ["non_positive_holdout_pnl"]}],
+            "per_coin_results": [{"pair": "XRP/USDT", "verdict": "NEPREŠIEL"}],
+            "pairs_ready": ["XRP-USDT"],
+            "pairs_dropped": [],
+            "replay_snapshots": {"xrp": {"count": 1}},
+            "cost_profiles": {"XRP/USDT": {"fee_rate": .001}},
+            "source_job_id": "job-xrp",
+        },
+    ]
+
+    combined = combine_optimizer_lock_results(
+        results,
+        ["UNI/USDT", "XRP/USDT"],
+        "version-123",
+    )
+
+    assert combined["version_id"] == "version-123"
+    assert combined["locked_pairs"] == ["UNI/USDT", "XRP/USDT"]
+    assert combined["tested_combinations"] == 12
+    assert combined["max_validation_trades"] == 25
+    assert combined["source_job_ids"] == ["job-xrp", "job-uni"]
+    assert {row["pair"] for row in combined["per_coin_results"]} == {"UNI/USDT", "XRP/USDT"}
+    assert {row["variant_id"] for row in combined["variant_results"]} == {"uni-v1", "xrp-v1"}
+    assert combined["aggregate_lock_result"] is True
+    assert combined["qualified"] is False
+    assert combined["winner"] is None
+    assert combined["strategy_code"] is None
+    assert combined["job_verdict"] == "ŽIADNY PLATNÝ VARIANT"
