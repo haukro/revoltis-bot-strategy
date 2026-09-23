@@ -135,6 +135,13 @@ class ValidationReplayRequest(BaseModel):
     model_config = {"extra": "forbid"}
 
 
+class TimeoutStudyRequest(BaseModel):
+    source_job_id: str
+    version_id: str
+    max_no_trail_hours: Literal[4, 8, 12, 24]
+    model_config = {"extra": "forbid"}
+
+
 DEFAULT = StrategySettings()
 local_store = LocalStore()
 app = FastAPI(title="Revoltis Bot Strategy API", version="1.0.0")
@@ -936,6 +943,109 @@ async def reaudit_optimizer_run(job_id: str):
         "read_only": True,
         "grid_started": False,
     }
+
+
+@app.post("/api/optimizer/timeout-study")
+async def run_timeout_study(request: TimeoutStudyRequest):
+    """Run exactly one fixed-window timeout variant from an archived source run."""
+    require_durable_production_store()
+
+    source_rows = await supabase_get("optimizer_runs", f"id=eq.{request.source_job_id}&limit=1")
+    source = next((row for row in source_rows if row.get("id") == request.source_job_id), None)
+    if source is None or source.get("status") != "completed":
+        raise HTTPException(404, "Zdrojový completed optimizer run nebol nájdený.")
+
+    versions = await supabase_get("strategy_versions", f"id=eq.{request.version_id}&limit=10")
+    version = next((row for row in versions if row.get("id") == request.version_id), None)
+    if version is None:
+        raise HTTPException(404, "Strategy version pre timeout study nebola nájdená.")
+
+    source_result = source.get("result") or {}
+    variants = source_result.get("variant_results") or []
+    selected_variant_id = source_result.get("variant_id")
+    source_variant = next((item for item in variants if item.get("variant_id") == selected_variant_id), None)
+    if source_variant is None:
+        raise HTTPException(422, "Zdrojový run nemá auditovateľný vybraný variant.")
+
+    pair = source_variant.get("pair")
+    timeframe = source_variant.get("timeframe")
+    if pair != "ZEC/USDT" or timeframe != "5m":
+        raise HTTPException(422, "Timeout study je uzamknutý na ZEC/USDT · 5m.")
+
+    source_settings = dict(source_variant.get("settings") or {})
+    version_settings = dict(version.get("settings") or {})
+    version_settings.pop("_universe", None)
+    expected_settings = {**source_settings, "max_no_trail_hours": request.max_no_trail_hours}
+    if version_settings != expected_settings:
+        raise HTTPException(409, "Strategy version sa líši od source runu aj v inom parametri než max_no_trail_hours.")
+
+    snapshot = (source_result.get("replay_snapshots") or {}).get(source_variant.get("snapshot_id"))
+    if not snapshot:
+        raise HTTPException(422, "Zdrojový run nemá validačný snapshot.")
+    development = unpack_snapshot(snapshot)
+
+    holdout_from = source_result.get("holdout_from_ms")
+    holdout_to = source_result.get("holdout_to_ms")
+    if holdout_from is None or holdout_to is None:
+        raise HTTPException(422, "Zdrojový run nemá presné hranice holdoutu.")
+
+    step = TIMEFRAME_MILLISECONDS[timeframe]
+    count = min(45000, max(100, math.ceil((int(holdout_to) - int(holdout_from) + 1) / step)))
+    holdout = await load_okx_candles(pair, timeframe, count, int(holdout_from), int(holdout_to))
+    full_data = development + holdout
+    if not full_data or len({int(item["open_time"]) for item in full_data}) != len(full_data):
+        raise HTTPException(409, "Fixed-window dataset nie je jednoznačný.")
+
+    cost_profile = source_variant.get("cost_components")
+    if not cost_profile:
+        raise HTTPException(422, "Zdrojový run nemá fixný cost snapshot.")
+
+    now = datetime.now(UTC).isoformat()
+    job_id = str(uuid4())
+    settings = StrategySettings(**version_settings).model_dump()
+    result = await asyncio.to_thread(
+        optimize,
+        {(pair, timeframe): full_data},
+        settings,
+        1,
+        None,
+        locked_pairs=[pair],
+        cost_models={pair: cost_profile},
+    )
+    result.update({
+        "source": "okx_archived_window",
+        "source_job_id": job_id,
+        "study_source_job_id": request.source_job_id,
+        "version_id": request.version_id,
+        "pairs_ready": [pair.replace("/", "-")],
+        "pairs_dropped": [],
+        "fixed_window": True,
+        "fixed_history_from_ms": int(full_data[0]["open_time"]),
+        "fixed_history_to_ms": int(full_data[-1]["close_time"]),
+        "fixed_cost_book_ts": cost_profile.get("book_ts"),
+        "timeout_study": True,
+    })
+    record = {
+        "id": job_id,
+        "status": "completed",
+        "created_at": now,
+        "finished_at": datetime.now(UTC).isoformat(),
+        "request": {
+            "kind": "timeout_study_single",
+            "source_job_id": request.source_job_id,
+            "version_id": request.version_id,
+            "pairs": [pair],
+            "timeframes": [timeframe],
+            "history_days": 90,
+            "trials_per_market": 1,
+            "max_no_trail_hours": request.max_no_trail_hours,
+            "settings": settings,
+            "fixed_window": True,
+        },
+        "result": result,
+    }
+    saved = await supabase_upsert("optimizer_runs", record)
+    return present_optimizer_record(saved)
 
 
 @app.get("/api/optimizer/{job_id}")
