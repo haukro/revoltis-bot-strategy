@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
+import { normalizeOptimizerResult, combineOptimizerResults } from './optimizer-result';
 import './styles.css';
 import './presets.css';
 import './market.css';
@@ -170,12 +171,8 @@ function App() {
         if (job.status === 'failed') throw new Error(job.message || `Test ${pair} zlyhal.`);
         if (job.result) completed.push(job.result);
       }
-      if (!completed.length) throw new Error('Optimalizácia nevrátila žiadny výsledok.');
-      completed.sort((a, b) => Number(Boolean(b.qualified)) - Number(Boolean(a.qualified)) || Number(b.score) - Number(a.score));
-      const best = completed[0];
-      best.tested_combinations = completed.reduce((sum, item) => sum + Number(item.tested_combinations || 0), 0);
-      best.top_results = completed.slice(0, 5).map(item => ({ pair: item.pair, timeframe: item.timeframe, variant: item.variant, score: item.score, validation_metrics: item.validation_metrics }));
-      setOptimizer({ status: 'completed', progress: 100, message: 'Optimalizácia dokončená', result: best });
+      const result = combineOptimizerResults(completed);
+      setOptimizer({ status: 'completed', progress: 100, message: result.job_verdict, result });
     } catch (error) {
       const raw = error instanceof Error ? error.message : String(error);
       setOptimizer({ status: 'failed', message: `Výpočet sa prerušil. ${raw.slice(0, 300)}` });
@@ -183,7 +180,7 @@ function App() {
       setOptimizerRunning(false);
     }
   };
-  const copyAlgorithm = async () => { const code = optimizer?.result?.strategy_code; if (!code) return; await navigator.clipboard.writeText(code); setMessage('Výsledný algoritmus bol skopírovaný.'); };
+  const copyAlgorithm = async () => { if (!optimizer?.result) return; const result = normalizeOptimizerResult(optimizer.result); if (!result.qualified || !result.strategy_code) return; await navigator.clipboard.writeText(result.strategy_code); setMessage('Výsledný algoritmus bol skopírovaný.'); };
   const installApp = async () => { if (installPrompt) { await installPrompt.prompt(); await installPrompt.userChoice; setInstallPrompt(null); return; } setMessage('iPhone/iPad: v Safari stlač Zdieľať a potom „Pridať na plochu“. Android: otvor menu prehliadača a vyber „Inštalovať aplikáciu“.'); };
   const runSimulation = async () => {
     const currentConfig = config;
@@ -376,7 +373,36 @@ function BotControlCenter({ scanner, error, loading, running, onRefresh, onToggl
   </section>;
 }
 function FreqtradeVisual() { return <section className="freqtrade-visual"><div className="ft-brand"><div className="ft-logo">F</div><div><span>CIEĽOVÁ OBCHODNÁ PLATFORMA</span><h3>Freqtrade</h3><p>Bezplatný Python bot · vlastný server · úplná kontrola stratégie</p></div><i>PRIPRAVENÉ</i></div><div className="ft-flow"><article><b>R</b><span>Revoltis</span><small>simulácia a AI optimalizácia</small></article><em>→</em><article><b>PY</b><span>Algoritmus</span><small>RevoltisAIOptimized_v1.py</small></article><em>→</em><article className="highlight"><b>F</b><span>Freqtrade</span><small>backtest a bezpečný dry-run</small></article><em>→</em><article><b>O</b><span>OKX Europe Spot</span><small>verejné dáta a neskôr príkazy</small></article></div><div className="ft-bottom"><div><span>EXPORTNÝ BALÍK</span><ul><li><b>01</b> Stratégia Python</li><li><b>02</b> Dry-run konfigurácia</li><li><b>03</b> Zoznam coinov</li><li><b>04</b> Optimalizačný report</li></ul></div><div className="ft-safety"><span>BEZPEČNOSTNÁ CESTA</span><p><b>Backtest</b><i>→</i><b>Dry-run</b><i>→</i><b>Kontrola výsledkov</b><i>→</i><b>Voliteľný live režim</b></p><small>Žiadne API kľúče ani reálne obchodovanie nie sú súčasťou exportu zo simulácie.</small></div></div></section>; }
-function AlgorithmResult({ result, onCopy }: { result: any, onCopy: () => void }) { const m = result.holdout_metrics || result.validation_metrics || {}; const parameterKeys = ['bb_period', 'bb_deviation', 'rsi_period', 'rsi_oversold', 'atr_period', 'atr_min_percent', 'atr_max_percent', 'min_volume_ratio', 'rebound_min_percent', 'rebound_max_percent', 'stop_loss_percent', 'trailing_start_percent', 'trailing_distance_percent']; return <div className="algorithm-result"><div className="result-title"><div><span>{result.qualified ? 'NAJLEPŠÍ VARIANT POTVRDENÝ HOLDOUTOM' : 'NAJLEPŠÍ NÁJDENÝ VARIANT – NEPOTVRDENÝ'}</span><h4>{result.pair} · {result.timeframe}</h4><p>{result.method} · {result.tested_combinations} otestovaných kombinácií</p><p className={result.qualified ? 'positive' : 'negative'}>{result.verdict}</p></div><button onClick={onCopy} disabled={!result.qualified}>Kopírovať algoritmus</button></div><div className="result-metrics"><div><span>Zisk/strata holdoutu</span><b className={Number(m.realized_profit) >= 0 ? 'positive' : 'negative'}>{Number(m.realized_profit || 0) >= 0 ? '+' : ''}{m.realized_profit || 0} USDT</b></div><div><span>Max. drawdown</span><b>{m.max_drawdown_percent || 0} %</b></div><div><span>Obchody</span><b>{m.closed_trades || 0}</b></div><div><span>Úspešnosť</span><b>{m.win_rate || 0} %</b></div><div><span>Hold výnos</span><b>{result.buy_hold_percent ?? '—'} %</b></div></div><details open><summary>Výsledné nastavenia <span>⌄</span></summary><div className="parameter-grid">{parameterKeys.map(key => <div key={key}><span>{fields[key]}</span><b>{String(result.settings?.[key])}</b></div>)}</div></details><details><summary>Kopírovateľný Freqtrade algoritmus <span>+</span></summary><pre>{result.strategy_code}</pre></details><small className="cost-model">Model nákladov: {result.cost_model}</small></div>; }
+function AlgorithmResult({ result, onCopy }: { result: any, onCopy: () => void }) {
+  const view = normalizeOptimizerResult(result);
+  const m = view.holdout_metrics;
+  const parameterKeys = ['bb_period', 'bb_deviation', 'rsi_period', 'rsi_oversold', 'atr_period', 'atr_min_percent', 'atr_max_percent', 'min_volume_ratio', 'rebound_min_percent', 'rebound_max_percent', 'stop_loss_percent', 'trailing_start_percent', 'trailing_distance_percent'];
+  return <div className={`algorithm-result ${view.qualified ? '' : 'algorithm-rejected'}`}>
+    <div className="result-title"><div>
+      <span>{view.job_verdict}</span>
+      <h4>{view.qualified ? `${view.pair} · ${view.timeframe}` : view.verdict}</h4>
+      {!view.qualified && <p>Víťaz: žiadny. Diagnostika finalistu: {view.pair} · {view.timeframe}</p>}
+      <p>{view.method} · {view.tested_combinations} otestovaných kombinácií</p>
+      <p>{view.qualified ? view.verdict : 'Parametre sa vyberajú vo validácii. Neúspešný holdout nespustí hľadanie náhradníka.'}</p>
+    </div><button onClick={onCopy} disabled={!view.qualified || !view.strategy_code}>Kopírovať algoritmus</button></div>
+    <p className="validation-counts">Validačné obchody: {view.validation_trade_count}/20 · Holdout: {m.closed_trades || 0}/10 · Maximum validačných obchodov zo skúšaných variantov: {view.max_validation_trades ?? 'nezaznamenané'}</p>
+    <div className="result-metrics">
+      <div><span>Čistý zisk/strata holdoutu</span><b>{m.realized_profit ?? '—'} USDT</b><small>{view.holdout_profit_percent ?? '—'} % kapitálu</small></div>
+      <div><span>Max. drawdown / limit 15 %</span><b>{m.max_drawdown_percent ?? '—'} %</b></div>
+      <div><span>Obchody holdoutu / minimum 10</span><b>{m.closed_trades || 0}</b></div>
+      <div><span>Úspešnosť (od 20 obchodov)</span><b>{view.displayed_win_rate}</b></div>
+      <div><span>Hold rovnakého coinu a obdobia</span><b>{view.buy_hold_percent ?? '—'} %</b></div>
+    </div>
+    {!!view.per_coin_results?.length && <details><summary>Vyhodnotenie po coinoch</summary><ul className="list">
+      {view.per_coin_results.map((row: any) => <li key={row.pair}><span>{row.pair} · {row.timeframe}<small>Validácia: {row.walk_forward_metrics?.closed_trades ?? 0}/20 · Holdout: {row.holdout_metrics?.closed_trades ?? 0}/10</small></span><b>{row.verdict}</b></li>)}
+    </ul></details>}
+    <details><summary>{view.qualified ? 'Výsledné nastavenia' : 'Diagnostické nastavenia — nepoužiť'} <span>⌄</span></summary>
+      <div className="parameter-grid">{parameterKeys.map(key => <div key={key}><span>{fields[key]}</span><b>{String(view.settings?.[key] ?? '—')}</b></div>)}</div>
+    </details>
+    {view.qualified && <details><summary>Kopírovateľný Freqtrade algoritmus <span>+</span></summary><pre>{view.strategy_code}</pre></details>}
+    <small className="cost-model">Model nákladov: {view.cost_model}</small>
+  </div>;
+}
 function Metric({ label, value, hint, positive }: { label: string, value: string, hint: string, positive?: boolean }) { return <article className="metric"><span>{label}</span><strong className={positive ? 'positive' : ''}>{value}</strong><small>{hint}</small></article>; }
 function MarketChart({ market, error }: { market: any, error: string }) { if (error) return <div className="empty-chart"><span>!</span><p>{error}</p></div>; if (!market?.candles?.length) return <div className="empty-chart"><span>⌁</span><p>Načítavam sviečky z burzy…</p></div>; const candles = market.candles; const min = Math.min(...candles.map((c: any) => c.low)); const max = Math.max(...candles.map((c: any) => c.high)); const range = max - min || 1; const scale = (value: number) => 92 - ((value - min) / range * 84); const last = candles[candles.length - 1]; const first = candles[0]; const change = (last.close / first.open - 1) * 100; const format = (value: number) => value.toFixed(value < 1 ? 8 : 4); const candleWidth = Math.max(.04, 62 / candles.length); const wickWidth = Math.max(.025, candleWidth * .35); return <div className="market-chart"><div className="market-price"><b>{format(last.close)} USDT</b><span className={change >= 0 ? 'positive' : 'negative'}>{change >= 0 ? '+' : ''}{change.toFixed(2)} %</span></div><div className="chart-layout"><div className="y-axis"><span>{format(max)}</span><span>{format((max + min) / 2)}</span><span>{format(min)}</span></div><svg viewBox="0 0 100 100" preserveAspectRatio="none">{candles.map((c: any, index: number) => { const x = index / candles.length * 100; const color = c.close >= c.open ? '#82edb6' : '#ff8798'; const top = scale(Math.max(c.open, c.close)); const body = Math.max(.7, Math.abs(scale(c.open) - scale(c.close))); return <g key={c.open_time}><line x1={x + candleWidth / 2} x2={x + candleWidth / 2} y1={scale(c.high)} y2={scale(c.low)} stroke={color} strokeWidth={wickWidth}/><rect x={x} y={top} width={candleWidth} height={body} fill={color}/></g>; })}</svg></div><div className="x-axis"><span>{new Date(first.open_time).toLocaleString('sk-SK')}</span><b>Posledných 24 hodín · {market.timeframe}</b><span>{new Date(last.close_time).toLocaleString('sk-SK')}</span></div><div className="market-footer"><span>{market.pair}</span><span>{market.source}</span></div></div>; }
 function EquityChart({ points, range: chartRange }: { points: { time: string, value: number }[], range: 'hour' | 'day' | 'week' }) { if (points.length < 2) return <div className="empty-chart"><span>⌁</span><p>Krivka sa zobrazí po prvom uzatvorenom obchode.</p></div>; const bucket = (time: string) => { const date = new Date(time); if (Number.isNaN(date.getTime())) return time; if (chartRange === 'hour') return date.toISOString().slice(0, 13); if (chartRange === 'day') return date.toISOString().slice(0, 10); const monday = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate() - ((date.getUTCDay() + 6) % 7))); return monday.toISOString().slice(0, 10); }; const aggregated = new Map<string, { time: string, value: number }>(); points.forEach(point => aggregated.set(bucket(point.time), point)); const displayed = [...aggregated.values()]; const values = displayed.map(point => point.value); const min = Math.min(...values); const max = Math.max(...values); const valueRange = max - min || 1; const path = displayed.map((point, index) => `${index ? 'L' : 'M'} ${index / (displayed.length - 1) * 100} ${88 - ((point.value - min) / valueRange * 72)}`).join(' '); const first = displayed[0]; const last = displayed[displayed.length - 1]; const label = (time: string) => { const date = new Date(time); if (Number.isNaN(date.getTime())) return 'Štart'; return chartRange === 'hour' ? date.toLocaleString('sk-SK') : date.toLocaleDateString('sk-SK'); }; const rasterLabel = chartRange === 'hour' ? 'Hodiny' : chartRange === 'day' ? 'Dni / 24 h' : 'Týždne'; return <div className={`chart chart-${chartRange}`}><div className="chart-layout"><div className="y-axis"><span>{max.toFixed(2)} USDT</span><span>{((max + min) / 2).toFixed(2)}</span><span>{min.toFixed(2)}</span></div><svg viewBox="0 0 100 100" preserveAspectRatio="none"><path d={path} /></svg></div><div className="x-axis"><span>{label(first.time)}</span><b>{rasterLabel}</b><span>{label(last.time)}</span></div></div>; }

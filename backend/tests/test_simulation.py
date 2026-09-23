@@ -42,6 +42,14 @@ def settings(**overrides):
 
 
 class SimulationAuditTests(unittest.TestCase):
+    def test_warmup_prefix_cannot_open_validation_or_holdout_trades(self):
+        data = candles([100.0] * 25 + [90.0, 91.0, 91.0, 91.0] + [100.0] * 30)
+        baseline = simulation.simulate({"TEST/USDT": data}, settings(), force_close_at_end=True)
+        self.assertGreater(baseline["metrics"]["closed_trades"], 0)
+        result = simulation.simulate({"TEST/USDT": data}, settings(), force_close_at_end=True,
+                                     trading_start_time=data[40]["open_time"])
+        self.assertEqual(result["metrics"]["closed_trades"], 0)
+
     def test_force_close_leaves_no_hidden_open_position(self):
         prices = [100.0] * 25 + [90.0, 91.0, 91.0, 91.0]
         result = simulation.simulate({"TEST/USDT": candles(prices)}, settings(), force_close_at_end=True)

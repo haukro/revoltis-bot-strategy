@@ -51,6 +51,7 @@ def simulate(
     settings: dict[str, Any],
     fee: float = 0.001,
     force_close_at_end: bool = False,
+    trading_start_time: int | None = None,
 ) -> dict[str, Any]:
     """Run the mean-reversion strategy on public historical candles."""
     bb_period = int(settings["bb_period"])
@@ -60,6 +61,10 @@ def simulate(
     events: list[tuple[int, str, int]] = []
     for pair, candles in candles_by_pair.items():
         for index in range(warmup, len(candles)):
+            # Earlier candles warm indicators only; never count their trades
+            # in a validation window or in the untouched holdout.
+            if trading_start_time is not None and int(candles[index]["open_time"]) < trading_start_time:
+                continue
             events.append((int(candles[index]["close_time"]), pair, index))
     events.sort()
 

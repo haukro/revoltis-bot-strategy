@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from .local_store import LocalStore
 from .simulation import simulate
-from .optimizer import optimize
+from .optimizer import optimize, present_optimizer_record
 
 
 class StrategySettings(BaseModel):
@@ -586,10 +586,10 @@ async def run_optimizer_job(job_id: str, request: OptimizerRequest) -> None:
             if lock_active and universe.get("pairs"):
                 locked_pairs = list(universe["pairs"])
                 break
-        if locked_pairs:
-            job_pairs = [pair for pair in request.pairs if pair in locked_pairs]
-            if not job_pairs:
-                raise ValueError("Požadovaný pár nie je súčasťou zamknutého universe.")
+        if not locked_pairs:
+            raise ValueError("Chýba aktívny zamknutý zoznam coinov. Najprv použi návrh z OKX.")
+        if any(pair not in locked_pairs for pair in job_pairs):
+            raise ValueError("Požadovaný pár nie je súčasťou zamknutého universe.")
         job_timeframes = ["15m", "5m"]
         # Stable candle boundary makes an immediate repeat use the same cache key.
         smallest_step = min(TIMEFRAME_MILLISECONDS[item] for item in job_timeframes)
@@ -632,12 +632,12 @@ async def run_optimizer_job(job_id: str, request: OptimizerRequest) -> None:
         loop = asyncio.get_running_loop()
         def update_progress(done: int, total: int, market: str) -> None:
             loop.call_soon_threadsafe(job.update, {"phase": "testing", "message": f"Testujem {market}", "progress": 30 + round(done / total * 68), "tested": done, "total": total})
-        result = await asyncio.to_thread(optimize, candle_sets, request.settings.model_dump(), request.trials_per_market, update_progress)
+        result = await asyncio.to_thread(optimize, candle_sets, request.settings.model_dump(), request.trials_per_market, update_progress, locked_pairs=locked_pairs)
         result.update({"source": "okx", "pairs_ready": [pair.replace("/", "-") for pair in pairs_ready], "pairs_dropped": pairs_dropped, "candle_coverage": coverage_by_pair, "data_errors": download_errors})
         now = datetime.now(UTC).isoformat()
         record = {"id": job_id, "status": "completed", "created_at": job["created_at"], "finished_at": now, "request": request.model_dump(), "result": result}
         await supabase_upsert("optimizer_runs", record)
-        job.update({"status": "completed", "phase": "completed", "progress": 100, "message": "Optimalizácia dokončená", "result": result, "finished_at": now})
+        job.update({"status": "completed", "phase": "completed", "progress": 100, "message": result["job_verdict"], "result": result, "finished_at": now})
     except Exception as error:
         job.update({"status": "failed", "phase": "failed", "message": str(error), "finished_at": datetime.now(UTC).isoformat()})
 
@@ -659,17 +659,17 @@ async def start_optimizer(request: OptimizerRequest):
 @app.get("/api/optimizer/{job_id}")
 async def optimizer_status(job_id: str):
     if job_id in optimizer_jobs:
-        return optimizer_jobs[job_id]
+        return present_optimizer_record(optimizer_jobs[job_id])
     stored = await supabase_get("optimizer_runs", f"id=eq.{job_id}&limit=1")
     if not stored:
         raise HTTPException(404, "Optimalizácia nebola nájdená.")
-    return stored[0]
+    return present_optimizer_record(stored[0])
 
 
 @app.get("/api/optimizer-latest")
 async def optimizer_latest():
     stored = await supabase_get("optimizer_runs", "order=finished_at.desc&limit=1")
-    return stored[0] if stored else None
+    return present_optimizer_record(stored[0]) if stored else None
 
 
 @app.get("/api/dashboard")
