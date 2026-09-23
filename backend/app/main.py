@@ -114,6 +114,7 @@ class SimulationRequest(BaseModel):
 
 class OptimizerRequest(BaseModel):
     settings: StrategySettings
+    version_id: str | None = None
     pairs: list[str] = Field(default_factory=list, min_length=1, max_length=20)
     timeframes: list[Literal["1m", "3m", "5m", "15m"]] = Field(default_factory=lambda: ["1m", "3m", "5m", "15m"])
     history_days: Literal[1, 7, 14, 30] = 7
@@ -569,25 +570,59 @@ async def run_standalone_simulation(request: SimulationRequest):
     return {"source": "OKX public spot API", "timeframe": settings["timeframe"], "mode": "simulation", "live_trading": False, "data_coverage": data_coverage, "run": record, **result}
 
 
+def universe_version(versions: list[dict]) -> dict | None:
+    # A newer universe supersedes an older one, even after its lock expires.
+    return next((version for version in versions if (version.get("settings") or {}).get("_universe", {}).get("pairs")), None)
+
+
+def active_universe(version: dict | None) -> dict | None:
+    metadata = ((version or {}).get("settings") or {}).get("_universe") or {}
+    expires_at = (metadata.get("lock") or {}).get("expires_at")
+    try:
+        active = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00")) > datetime.now(UTC)
+    except (TypeError, ValueError):
+        active = False
+    if not active or not metadata.get("pairs"):
+        return None
+    return {"version_id": version.get("id"), "pairs": list(metadata["pairs"]), "expires_at": expires_at}
+
+
+async def strategy_context() -> dict:
+    versions = await supabase_get("strategy_versions", "order=created_at.desc&limit=50")
+    settings = await supabase_get("strategy_settings", "order=updated_at.desc&limit=1")
+    version = universe_version(versions)
+    saved = settings[0] if settings else {}
+    strategy = saved.get("settings") or DEFAULT.model_dump()
+    lock = active_universe(version)
+    if version:
+        snapshot = version["settings"]
+        pairs = snapshot["_universe"]["pairs"]
+        # The version is the authoritative activation record. A stale settings
+        # row must never overwrite it; newer parameter edits may still apply.
+        if (not saved or saved.get("updated_at", "") < version.get("created_at", "")
+                or (lock and set(strategy.get("selected_pairs", [])) != set(pairs))):
+            strategy = {**snapshot, "selected_pairs": list(pairs)}
+        if lock:
+            strategy = {**strategy, "selected_pairs": list(pairs)}
+    return {"strategy": StrategySettings(**strategy).model_dump(), "active_universe": lock}
+
+
+@app.get("/api/strategy-context")
+async def get_strategy_context():
+    return await strategy_context()
+
+
 async def run_optimizer_job(job_id: str, request: OptimizerRequest) -> None:
     job = optimizer_jobs[job_id]
     try:
         job_pairs = list(request.pairs)
-        versions = await supabase_get("strategy_versions", "order=created_at.desc&limit=20")
-        now_utc = datetime.now(UTC)
-        locked_pairs: list[str] = []
-        for version in versions:
-            universe = (version.get("settings") or {}).get("_universe") or {}
-            expires_at = (universe.get("lock") or {}).get("expires_at")
-            try:
-                lock_active = bool(expires_at and datetime.fromisoformat(str(expires_at).replace("Z", "+00:00")) > now_utc)
-            except (TypeError, ValueError):
-                lock_active = False
-            if lock_active and universe.get("pairs"):
-                locked_pairs = list(universe["pairs"])
-                break
-        if not locked_pairs:
+        versions = await supabase_get("strategy_versions", "order=created_at.desc&limit=50")
+        lock = active_universe(universe_version(versions))
+        if not lock:
             raise ValueError("Chýba aktívny zamknutý zoznam coinov. Najprv použi návrh z OKX.")
+        if request.version_id is not None and request.version_id != lock["version_id"]:
+            raise ValueError("Zamknutá verzia sa zmenila. Obnov stránku pred ďalšou optimalizáciou.")
+        locked_pairs = lock["pairs"]
         if any(pair not in locked_pairs for pair in job_pairs):
             raise ValueError("Požadovaný pár nie je súčasťou zamknutého universe.")
         job_timeframes = ["15m", "5m"]
@@ -633,7 +668,7 @@ async def run_optimizer_job(job_id: str, request: OptimizerRequest) -> None:
         def update_progress(done: int, total: int, market: str) -> None:
             loop.call_soon_threadsafe(job.update, {"phase": "testing", "message": f"Testujem {market}", "progress": 30 + round(done / total * 68), "tested": done, "total": total})
         result = await asyncio.to_thread(optimize, candle_sets, request.settings.model_dump(), request.trials_per_market, update_progress, locked_pairs=locked_pairs)
-        result.update({"source": "okx", "pairs_ready": [pair.replace("/", "-") for pair in pairs_ready], "pairs_dropped": pairs_dropped, "candle_coverage": coverage_by_pair, "data_errors": download_errors})
+        result.update({"source": "okx", "version_id": lock["version_id"], "pairs_ready": [pair.replace("/", "-") for pair in pairs_ready], "pairs_dropped": pairs_dropped, "candle_coverage": coverage_by_pair, "data_errors": download_errors})
         now = datetime.now(UTC).isoformat()
         record = {"id": job_id, "status": "completed", "created_at": job["created_at"], "finished_at": now, "request": request.model_dump(), "result": result}
         await supabase_upsert("optimizer_runs", record)
@@ -675,7 +710,7 @@ async def optimizer_latest():
 @app.get("/api/dashboard")
 async def dashboard():
     try:
-        settings = await supabase_get("strategy_settings", "order=updated_at.desc&limit=1")
+        context = await strategy_context()
         trades = await supabase_get("simulated_trades", "order=opened_at.desc&limit=30")
         sync = await supabase_get("sync_events", "order=received_at.desc&limit=1")
         diagnostics = await supabase_get("signal_diagnostics", "order=occurred_at.desc&limit=500")
@@ -685,7 +720,7 @@ async def dashboard():
     total = sum(float(t.get("profit_usdt") or 0) for t in trades if t.get("status") == "closed")
     closed = [t for t in trades if t.get("status") == "closed"]
     wins = sum(1 for t in closed if float(t.get("profit_usdt") or 0) > 0)
-    initial_capital = settings[0].get("settings", {}).get("initial_capital", 100) if settings else 100
+    initial_capital = context["strategy"]["initial_capital"]
     equity = float(initial_capital)
     peak = equity
     max_drawdown_percent = 0.0
@@ -700,27 +735,15 @@ async def dashboard():
         if diagnostic.get("decision") == "rejected":
             reason = diagnostic.get("reason", "Neznámy dôvod")
             rejections[reason] = rejections.get(reason, 0) + 1
-    return {"mode": "simulation", "strategy": settings[0].get("settings", DEFAULT.model_dump()) if settings else DEFAULT.model_dump(), "trades": trades, "last_sync": sync[0] if sync else None, "last_simulation": simulation_runs[0] if simulation_runs else None, "analytics": {"equity_curve": equity_curve, "max_drawdown_percent": round(max_drawdown_percent, 2), "rejections": rejections}, "metrics": {"initial_capital": initial_capital, "realized_profit": round(total, 4), "closed_trades": len(closed), "win_rate": round((wins / len(closed) * 100) if closed else 0, 1), "open_trades": sum(1 for t in trades if t.get("status") == "open")}}
+    return {"mode": "simulation", **context, "trades": trades, "last_sync": sync[0] if sync else None, "last_simulation": simulation_runs[0] if simulation_runs else None, "analytics": {"equity_curve": equity_curve, "max_drawdown_percent": round(max_drawdown_percent, 2), "rejections": rejections}, "metrics": {"initial_capital": initial_capital, "realized_profit": round(total, 4), "closed_trades": len(closed), "win_rate": round((wins / len(closed) * 100) if closed else 0, 1), "open_trades": sum(1 for t in trades if t.get("status") == "open")}}
 
 
 @app.put("/api/strategy")
 async def save_strategy(settings: StrategySettings):
-    versions = await supabase_get("strategy_versions", "order=created_at.desc&limit=20")
-    now = datetime.now(UTC)
-    for version in versions:
-        metadata = (version.get("settings") or {}).get("_universe") or {}
-        expires_at = (metadata.get("lock") or {}).get("expires_at")
-        if not expires_at:
-            continue
-        try:
-            active = datetime.fromisoformat(expires_at.replace("Z", "+00:00")) > now
-        except (TypeError, ValueError):
-            active = False
-        locked_pairs = metadata.get("pairs") or []
-        if active and set(settings.selected_pairs) != set(locked_pairs):
-            raise HTTPException(409, f"Zoznam coinov je uzamknutý do {expires_at}. Parametre stratégie môžeš meniť, universe zatiaľ nie.")
-        if active:
-            break
+    versions = await supabase_get("strategy_versions", "order=created_at.desc&limit=50")
+    lock = active_universe(universe_version(versions))
+    if lock and set(settings.selected_pairs) != set(lock["pairs"]):
+        raise HTTPException(409, f"Zoznam coinov je uzamknutý do {lock['expires_at']}. Parametre stratégie môžeš meniť, universe zatiaľ nie.")
     record = {"id": "default", "settings": settings.model_dump(), "updated_at": datetime.now(UTC).isoformat()}
     try:
         await supabase_upsert("strategy_settings", record)
@@ -743,11 +766,17 @@ async def create_strategy_version(version: StrategyVersionCreate):
         "id": str(uuid4()), "name": version.name, "note": version.note,
         "settings": version.settings.model_dump() | ({"_universe": version.universe} if version.universe else {}), "created_at": datetime.now(UTC).isoformat(),
     }
+    if version.universe:
+        lock = active_universe(record)
+        if not lock or set(lock["pairs"]) != set(version.settings.selected_pairs):
+            raise HTTPException(422, "Návrh nemá platný zámok alebo sa jeho coiny nezhodujú s verziou.")
     try:
         saved = await supabase_upsert("strategy_versions", record)
     except httpx.HTTPError as error:
         raise HTTPException(502, f"Verziu sa nepodarilo uložiť: {error}")
-    return {"saved": True, "version": saved}
+    # Saving this single version also activates its universe. No second write
+    # or separate HTTP request is needed to make the selection authoritative.
+    return {"saved": True, "version": saved, "strategy": version.settings.model_dump(), "active_universe": active_universe(saved)}
 
 
 @app.get("/api/backtests")
