@@ -265,19 +265,32 @@ They must not determine PASS / FAIL.
 
 ## 8. Official evaluation fold
 
-The official evaluation fold is certified unused within the project before this specification is merged.
+### 8.1 Pre-run data-availability amendment
 
-**2025-09-02 00:00:00.000 UTC → 2025-11-30 23:59:59.999 UTC**
+The initially selected unused historical fold `2025-09-02 00:00:00.000 UTC → 2025-11-30 23:59:59.999 UTC` was rejected **before any Strategy B evaluation run** because the declared execution market did not exist for almost all of that interval.
 
-This is exactly 90 days and ends before 2025-12-01.
+OKX opened ZEC/USDT spot trading on **2025-11-24 12:00 UTC**. A pre-run data-integrity request consequently returned only 1,872 of the 26,208 required 5m bars for the historical candidate fold. No Strategy B PnL, trade count, expectancy, PF, side result, BTC overlap result, or PASS / FAIL verdict was produced from that interval.
 
-Certification performed before lock:
+This is a market-availability correction, not a strategy-parameter change. N, ATR, ATR multiple, entries, exits, costs, sample threshold, and PASS / FAIL rules remain unchanged.
 
-- stored optimizer-run metadata contained no explicit `start_time`, `fixed_history_from_ms`, or `holdout_from_ms` before 2025-12-01
-- repository search found no previously used pre-December-2025 evaluation interval
-- no Strategy B result from this fold existed before this specification
+### 8.2 Locked official forward fold
 
-The fold must not be replaced after results are viewed.
+The official evaluation fold is now the originally preferred forward alternative:
+
+**2026-09-24 12:00:00.000 UTC → 2026-12-23 11:59:59.999 UTC**
+
+This is exactly 90 days.
+
+Rules:
+
+- no Strategy B PASS / FAIL calculation may be produced before the fold ends
+- no partial-fold result may be used for tuning or decision-making
+- the fold must not be replaced after forward data begin accumulating
+- the final run must use complete, contiguous 5m ZEC/USDT data for the entire fold plus the required pre-fold warmup
+- if the final 5m close or required data are invalid/incomplete, the run is invalid rather than interpolated
+- no Strategy B result existed before this forward fold was locked
+
+The failed attempt to source the unavailable historical candidate fold does **not** count as the official Strategy B run because the evaluation engine was never invoked and no strategy metric or verdict was generated.
 
 ## 9. Primary metrics
 
