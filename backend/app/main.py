@@ -942,6 +942,61 @@ async def optimizer_entry_path_audit(job_id: str):
     }
 
 
+@app.get("/api/optimizer/{job_id}/entry-path-audit")
+async def optimizer_entry_path_audit(job_id: str):
+    """Read-only entry/path audit from the stored validation snapshot and stored WF tape."""
+    stored = await supabase_get("optimizer_runs", f"id=eq.{job_id}&limit=1")
+    record = next((row for row in stored if row.get("id") == job_id), None)
+    if record is None or record.get("status") != "completed":
+        raise HTTPException(404, "Completed optimizer run nebol nájdený.")
+
+    result = record.get("result") or {}
+    variants = result.get("variant_results") or []
+    selected_variant_id = result.get("variant_id")
+    row = next((item for item in variants if item.get("variant_id") == selected_variant_id), None)
+    if row is None:
+        raise HTTPException(422, "Run nemá auditovateľný vybraný variant.")
+
+    snapshot = (result.get("replay_snapshots") or {}).get(row.get("snapshot_id"))
+    if not snapshot:
+        raise HTTPException(422, "Run nemá uložený validation snapshot.")
+    candles = unpack_snapshot(snapshot)
+
+    trades = [
+        trade for trade in (row.get("trades") or result.get("trades") or [])
+        if trade.get("window") in {"wf1", "wf2", "wf3"}
+    ]
+    expected = int((row.get("walk_forward_metrics") or {}).get("closed_trades") or 0)
+    if not trades or len(trades) != expected:
+        raise HTTPException(422, "Uložená WF trade tape nie je kompletná.")
+
+    audit = entry_path_audit(
+        candles,
+        trades,
+        float((row.get("settings") or {}).get("trailing_start_percent") or 1.6),
+    )
+    return {
+        "source_job_id": job_id,
+        "pair": row.get("pair"),
+        "timeframe": row.get("timeframe"),
+        "variant_id": row.get("variant_id"),
+        "read_only": True,
+        "optimizer_started": False,
+        "market_fetch": False,
+        "definitions": {
+            "pre_return_1h_pct": "entry close versus close 12 bars earlier",
+            "pre_return_4h_pct": "entry close versus close 48 bars earlier",
+            "rv_12_24_72_bars_pct": "population stdev of 5m log returns in percent before/through entry close",
+            "distance_from_24h_high_pct": "entry close versus rolling 288-bar high known at entry",
+            "distance_above_24h_low_pct": "entry close versus rolling 288-bar low known at entry",
+            "time_to_trail_start_min": "first post-entry candle high reaching trailing_start_percent",
+            "time_to_mae_1pct_min": "first post-entry candle low reaching -1%",
+            "time_to_mae_6pct_min": "first post-entry candle low reaching -6%",
+        },
+        **audit,
+    }
+
+
 @app.get("/api/optimizer/{job_id}/benchmark-risk")
 async def benchmark_risk(job_id: str):
     """Read-only B&H risk audit on the exact WF and holdout windows of a stored optimizer run."""
