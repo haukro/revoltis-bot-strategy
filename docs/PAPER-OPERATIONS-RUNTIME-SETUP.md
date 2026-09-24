@@ -98,3 +98,8 @@ Paper-execution infrastructure may later observe operational execution quality, 
 - it must not expose interim Strategy B PnL/PF/expectancy
 - it must not become the official PASS/FAIL calculation
 - no runtime binding is enabled by this setup document
+
+
+## Redeploy requirement
+
+After changing Production environment variables in Vercel, create a fresh Production deployment before testing the protected worker/admin endpoints. A previous deployment will continue to report the variables as not configured.
