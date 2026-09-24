@@ -18,6 +18,12 @@ from .simulation import simulate
 from .optimizer import optimize, present_optimizer_record, assess_candidate, aggregate_metrics, walk_forward_windows
 from .trade_audit import matches_target, prepare_replay, replay_validation, unpack_snapshot, trade_tape, tape_summary, entry_path_audit
 from .costs import book_costs, FEE_SCHEDULE, FEE_TAKER, FEE_MAKER, net_return
+from .tsmom_b_v1 import (
+    pack_ohlc_snapshot,
+    unpack_ohlc_snapshot,
+    simulate_b_v1,
+    smoke_cases as tsmom_b_v1_smoke_cases,
+)
 from .momentum_prescreen import pack_market_series, unpack_market_series, analyze_block, pooled_analysis
 from .rebound_experiment import (
     filter_b as rebound_filter_b,
@@ -1530,6 +1536,212 @@ async def finalize_momentum_prescreen():
             "strategy_b_defined": False,
             "pnl_computed": False,
         },
+    }
+    return await supabase_upsert("optimizer_runs", record)
+
+
+_TSMOM_B_V1_SPEC = "TEST-SPEC-002"
+_TSMOM_B_V1_SPEC_BASE_COMMIT = "cb50dcbbbad404767fffd38a343a1a9cd9e32ac8"
+_TSMOM_B_V1_EVAL_START = datetime(2025, 9, 2, 0, 0, tzinfo=UTC)
+_TSMOM_B_V1_EVAL_END = datetime(2025, 11, 30, 23, 59, 59, 999000, tzinfo=UTC)
+_TSMOM_B_V1_DATA = {
+    "ZEC": "ZEC/USDT",
+    "BTC": "BTC/USDT",
+}
+
+
+@app.get("/api/research/tsmom-b-v1/smoke")
+async def tsmom_b_v1_smoke():
+    """Synthetic-only smoke test. Never touches the official evaluation fold."""
+    checks = tsmom_b_v1_smoke_cases()
+    return {
+        "status": "passed" if all(checks.values()) else "failed",
+        "checks": checks,
+        "official_data_touched": False,
+        "test_spec": _TSMOM_B_V1_SPEC,
+        "base_spec_commit": _TSMOM_B_V1_SPEC_BASE_COMMIT,
+    }
+
+
+@app.post("/api/research/tsmom-b-v1/data/{symbol}")
+async def tsmom_b_v1_data(symbol: str):
+    """Persist one immutable official-fold OHLC snapshot for B v1."""
+    require_durable_production_store()
+    symbol = symbol.upper()
+    if symbol not in _TSMOM_B_V1_DATA:
+        raise HTTPException(422, "Symbol musí byť ZEC alebo BTC.")
+
+    snapshot_key = f"tsmom_b_v1:{_TSMOM_B_V1_SPEC}:{symbol}:20250902_20251130"
+    existing = await supabase_get("optimizer_runs", "order=created_at.desc&limit=100")
+    prior = next(
+        (
+            row for row in existing
+            if (row.get("request") or {}).get("kind") == "tsmom_b_v1_data"
+            and (row.get("request") or {}).get("snapshot_key") == snapshot_key
+        ),
+        None,
+    )
+    if prior:
+        return prior
+
+    pair = _TSMOM_B_V1_DATA[symbol]
+    eval_start_ms = int(_TSMOM_B_V1_EVAL_START.timestamp() * 1000)
+    eval_end_ms = int(_TSMOM_B_V1_EVAL_END.timestamp() * 1000)
+    warmup_ms = 24 * 60 * 60 * 1000
+    fetch_start = eval_start_ms - warmup_ms
+    step = TIMEFRAME_MILLISECONDS["5m"]
+    expected = int((eval_end_ms - fetch_start + 1) // step)
+
+    candles = await load_okx_candles(pair, "5m", expected, fetch_start, eval_end_ms)
+    if len(candles) != expected:
+        raise HTTPException(409, f"{symbol} B-v1 dataset incomplete: {len(candles)}/{expected}.")
+    if int(candles[0]["open_time"]) != fetch_start or int(candles[-1]["close_time"]) != eval_end_ms:
+        raise HTTPException(409, f"{symbol} B-v1 boundary mismatch.")
+    if any(int(b["open_time"]) - int(a["open_time"]) != step for a, b in zip(candles, candles[1:])):
+        raise HTTPException(409, f"{symbol} B-v1 candle gap.")
+    if not math.isfinite(float(candles[-1]["close"])) or float(candles[-1]["close"]) <= 0:
+        raise HTTPException(409, f"{symbol} final 5m close is invalid.")
+
+    snapshot = pack_ohlc_snapshot(candles)
+    now = datetime.now(UTC).isoformat()
+    record = {
+        "id": str(uuid4()),
+        "status": "completed",
+        "created_at": now,
+        "finished_at": now,
+        "request": {
+            "kind": "tsmom_b_v1_data",
+            "snapshot_key": snapshot_key,
+            "test_spec": _TSMOM_B_V1_SPEC,
+            "base_spec_commit": _TSMOM_B_V1_SPEC_BASE_COMMIT,
+            "symbol": symbol,
+            "pair": pair,
+            "timeframe": "5m",
+            "warmup_start": fetch_start,
+            "evaluation_start": eval_start_ms,
+            "evaluation_end": eval_end_ms,
+        },
+        "result": {
+            "snapshot": snapshot,
+            "bars": expected,
+            "source": "okx_public_spot",
+            "warmup_hours": 24,
+        },
+    }
+    return await supabase_upsert("optimizer_runs", record)
+
+
+async def _load_tsmom_b_v1_data() -> dict[str, dict[str, Any]]:
+    rows = await supabase_get("optimizer_runs", "order=created_at.desc&limit=100")
+    found: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        req = row.get("request") or {}
+        if req.get("kind") != "tsmom_b_v1_data" or req.get("test_spec") != _TSMOM_B_V1_SPEC:
+            continue
+        symbol = req.get("symbol")
+        if symbol in _TSMOM_B_V1_DATA and symbol not in found:
+            found[symbol] = row
+    missing = [symbol for symbol in ("ZEC", "BTC") if symbol not in found]
+    if missing:
+        raise HTTPException(409, f"Chýbajú B-v1 snapshoty: {', '.join(missing)}.")
+    return found
+
+
+@app.post("/api/research/tsmom-b-v1/evaluate")
+async def evaluate_tsmom_b_v1():
+    """Run the single official TEST-SPEC-002 evaluation. Idempotent."""
+    require_durable_production_store()
+    checks = tsmom_b_v1_smoke_cases()
+    if not all(checks.values()):
+        raise HTTPException(409, "B-v1 synthetic smoke test neprešiel. Official run sa nespustil.")
+
+    existing = await supabase_get("optimizer_runs", "order=created_at.desc&limit=100")
+    prior = next(
+        (
+            row for row in existing
+            if (row.get("request") or {}).get("kind") == "tsmom_b_v1_official_evaluation"
+            and (row.get("request") or {}).get("test_spec") == _TSMOM_B_V1_SPEC
+        ),
+        None,
+    )
+    if prior:
+        return prior
+
+    data = await _load_tsmom_b_v1_data()
+    zec = unpack_ohlc_snapshot(data["ZEC"]["result"]["snapshot"])
+    btc = unpack_ohlc_snapshot(data["BTC"]["result"]["snapshot"])
+
+    source_rows = await supabase_get("optimizer_runs", "id=eq.c4279991-66ae-44a2-9840-073c96bd8251&limit=1")
+    source = next((row for row in source_rows if row.get("id") == "c4279991-66ae-44a2-9840-073c96bd8251"), None)
+    if source is None:
+        raise HTTPException(404, "Strategy A source cost snapshot nebol nájdený.")
+    source_result = source.get("result") or {}
+    variants = source_result.get("variant_results") or []
+    selected_id = source_result.get("variant_id")
+    selected = next((item for item in variants if item.get("variant_id") == selected_id), None)
+    if selected is None or not selected.get("cost_components"):
+        raise HTTPException(422, "Strategy A source nemá cost snapshot.")
+    cost_profile = selected["cost_components"]
+
+    eval_start_ms = int(_TSMOM_B_V1_EVAL_START.timestamp() * 1000)
+    eval_end_ms = int(_TSMOM_B_V1_EVAL_END.timestamp() * 1000)
+    outcome = await asyncio.to_thread(
+        simulate_b_v1,
+        zec,
+        btc,
+        evaluation_start_ms=eval_start_ms,
+        evaluation_end_ms=eval_end_ms,
+        stake_amount=50.0,
+        initial_capital=100.0,
+        cost_profile=cost_profile,
+    )
+
+    eval_zec = [
+        c for c in zec
+        if int(c["open_time"]) >= eval_start_ms and int(c["close_time"]) <= eval_end_ms
+    ]
+    benchmark = buy_hold_risk_metrics(eval_zec, cost_profile, 100.0)
+
+    result = {
+        **outcome,
+        "test_spec": _TSMOM_B_V1_SPEC,
+        "base_spec_commit": _TSMOM_B_V1_SPEC_BASE_COMMIT,
+        "evaluation_window": {"start_ms": eval_start_ms, "end_ms": eval_end_ms},
+        "cost_profile": cost_profile,
+        "buy_hold": benchmark,
+        "data_snapshot_ids": {
+            "ZEC": data["ZEC"]["id"],
+            "BTC": data["BTC"]["id"],
+        },
+        "smoke_checks": checks,
+        "official_run_number": 1,
+        "grid_started": False,
+        "strategy_a_logic_reused": False,
+    }
+
+    now = datetime.now(UTC).isoformat()
+    record = {
+        "id": str(uuid4()),
+        "status": "completed",
+        "created_at": now,
+        "finished_at": now,
+        "request": {
+            "kind": "tsmom_b_v1_official_evaluation",
+            "test_spec": _TSMOM_B_V1_SPEC,
+            "base_spec_commit": _TSMOM_B_V1_SPEC_BASE_COMMIT,
+            "pair": "ZEC/USDT",
+            "execution_timeframe": "5m",
+            "signal_timeframe": "1h",
+            "evaluation_start": eval_start_ms,
+            "evaluation_end": eval_end_ms,
+            "breakout_n": 24,
+            "atr_period": 24,
+            "atr_multiple": 2.0,
+            "stake_amount": 50.0,
+            "initial_capital": 100.0,
+            "grid": False,
+        },
+        "result": result,
     }
     return await supabase_upsert("optimizer_runs", record)
 

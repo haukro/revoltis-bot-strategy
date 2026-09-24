@@ -180,6 +180,65 @@ The stop active for a 5m candle must be based only on information available befo
 
 The same stored fee + spread + impact cost model used for Strategy A is applied to both entry and exit.
 
+
+### 5.3a Intrabar ordering
+
+For every 5m candle, the active stop is fixed using only information available before that 5m candle begins:
+
+- latest fully closed 1h ATR available before the 5m open
+- position extrema observed only through the previous completed 5m candle
+
+Then evaluate the current 5m candle against that already-active stop.
+
+If the stop is not hit, the current candle high/low updates the position extrema and may tighten the chandelier stop for the **next** 5m candle.
+
+A current 5m high may therefore not create a tighter stop that is then retrospectively triggered by the same candle low, and vice versa. This removes intrabar ordering look-ahead.
+
+### 5.3b Side-aware transaction-cost accounting
+
+The stored Strategy A cost snapshot is reused without refitting.
+
+Let:
+
+- `buy_cost = entry_cost_rate` = taker fee + half-spread + buy impact
+- `sell_cost = exit_cost_rate` = taker fee + half-spread + sell impact
+- `R = exit_price / entry_price`
+
+Long net return is identical to Strategy A:
+
+```
+long_net_return = R * (1 - sell_cost) / (1 + buy_cost) - 1
+```
+
+Short uses the same buy/sell cost components in the opposite execution order:
+
+```
+short_net_return = 1 - R * (1 + buy_cost) / (1 - sell_cost)
+```
+
+PnL for either side is:
+
+```
+pnl_usdt = stake_amount * net_return
+```
+
+This is the locked backtest accounting convention for B v1. It introduces no leverage, funding, borrowing charge, maker rebate, or new fee assumption.
+
+
+### 5.4 Evaluation-boundary bookkeeping
+
+If a position remains open at `2025-11-30 23:59:59.999 UTC`:
+
+- liquidate it at the close of the final 5m candle in the evaluation fold
+- set `exit_reason = end_of_test`
+- apply the same locked fee + spread + impact model as for an ordinary exit
+- include the trade in closed-trade count, net PnL, expectancy, profit factor, side PnL, drawdown and all other evaluation metrics
+- do not update the chandelier stop or position extrema again on this bookkeeping tick; the final 5m close is used directly
+
+If the final 5m candle does not have a valid finite positive close, the position is not interpolated, estimated, or silently dropped. The official run is invalid and must not produce PASS / FAIL / INSUFFICIENT_SAMPLE.
+
+This is evaluation bookkeeping only. It does not change N, ATR, the 2× ATR stop, long/short logic, next-5m-open entry, or the rule that there is no time-based timeout. `end_of_test` is not a Strategy B exit signal during the fold.
+
 ## 6. Parameters that are not tuned
 
 This test does not tune:
