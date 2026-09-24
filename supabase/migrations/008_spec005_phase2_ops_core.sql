@@ -38,6 +38,19 @@ insert into public.ops_policy_state(account_key)
 values ('paper-default')
 on conflict (account_key) do nothing;
 
+
+insert into public.blind_test_policies(
+  blind_test_id,strategy_version_id,blind_until,allowed_categories,created_at,locked_at
+)
+values(
+  'TEST-SPEC-002-forward-2026',
+  'TEST-SPEC-002',
+  '2026-12-23T11:59:59.999Z'::timestamptz,
+  '["system_health","market_health","queue_health","worker_health","reconciliation_counts","audit_integrity","kill_switch","blind_status"]'::jsonb,
+  now(),now()
+)
+on conflict(blind_test_id) do nothing;
+
 create table if not exists public.worker_heartbeats (
   worker_name text primary key,
   last_run_id uuid,
@@ -362,6 +375,97 @@ as $func$
   select public.paper_set_kill_switch_state(
     'RUNNING','RECOVERY_VALIDATED',p_actor,p_software_commit,p_account_key
   );
+$func$;
+
+
+create or replace function public.paper_ops_health_snapshot(
+  p_account_key text default 'paper-default'
+)
+returns jsonb
+language sql
+security definer
+set search_path=public
+as $func$
+with active_policy as (
+  select p.*
+  from public.ops_policy_state s
+  join public.ops_policy_versions p on p.id=s.policy_version_id
+  where s.account_key=p_account_key
+),
+ks as (
+  select state,reason_code,updated_at
+  from public.kill_switch_state
+  where account_key=p_account_key
+),
+q as (
+  select count(*)::bigint as backlog
+  from public.execution_outbox
+  where processed_at is null
+),
+latest_recon as (
+  select status,completed_at,audit_integrity_passed
+  from public.reconciliation_runs
+  where account_key=p_account_key
+  order by completed_at desc nulls last,started_at desc
+  limit 1
+),
+issues as (
+  select check_code,severity,count(*)::bigint as count
+  from public.reconciliation_issues
+  where resolved_at is null
+  group by check_code,severity
+  order by severity,check_code
+),
+workers as (
+  select jsonb_agg(
+    jsonb_build_object(
+      'worker_name',w.worker_name,
+      'status',w.status,
+      'last_success_age_category',
+        case
+          when w.last_success_at is null then 'NEVER'
+          when p.warning_worker_lag_ms is null and p.halt_worker_lag_ms is null then 'UNCONFIGURED'
+          when p.halt_worker_lag_ms is not null
+               and extract(epoch from (clock_timestamp()-w.last_success_at))*1000 >= p.halt_worker_lag_ms then 'STALE'
+          when p.warning_worker_lag_ms is not null
+               and extract(epoch from (clock_timestamp()-w.last_success_at))*1000 >= p.warning_worker_lag_ms then 'LATE'
+          else 'FRESH'
+        end,
+      'last_error_code',w.last_error_code,
+      'software_commit',w.software_commit
+    )
+    order by w.worker_name
+  ) as rows
+  from public.worker_heartbeats w
+  left join active_policy p on true
+),
+market as (
+  select jsonb_object_agg(status,cnt) as counts
+  from (
+    select status,count(*)::bigint as cnt
+    from public.market_data_health
+    group by status
+  ) x
+),
+blind as (
+  select blind_test_id,strategy_version_id,blind_until
+  from public.blind_test_policies
+  where strategy_version_id='TEST-SPEC-002'
+  order by blind_until desc
+  limit 1
+)
+select jsonb_build_object(
+  'kill_switch',coalesce((select to_jsonb(ks) from ks),'{}'::jsonb),
+  'queue',jsonb_build_object('current_backlog',(select backlog from q)),
+  'workers',coalesce((select rows from workers),'[]'::jsonb),
+  'reconciliation',jsonb_build_object(
+    'latest',coalesce((select to_jsonb(latest_recon) from latest_recon),'{}'::jsonb),
+    'open_issue_counts',coalesce((select jsonb_agg(to_jsonb(issues)) from issues),'[]'::jsonb)
+  ),
+  'market_health_counts',coalesce((select counts from market),'{}'::jsonb),
+  'blind',coalesce((select to_jsonb(blind) from blind),'{}'::jsonb),
+  'live_trading',false
+);
 $func$;
 
 -- Single-writer enforcement: service role can read but not directly mutate KS state.
