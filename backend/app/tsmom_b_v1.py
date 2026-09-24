@@ -416,6 +416,19 @@ def simulate_b_v1(
 
     eval_minutes = (evaluation_end_ms - evaluation_start_ms + 1) / 60_000
     total_hold_minutes = sum(float(t["hold_minutes"]) for t in trades)
+    if gross_loss > 0:
+        profit_factor = round(gross_profit / gross_loss, 8)
+        profit_factor_infinite = False
+        profit_factor_defined = True
+    elif gross_profit > 0:
+        profit_factor = None
+        profit_factor_infinite = True
+        profit_factor_defined = True
+    else:
+        profit_factor = None
+        profit_factor_infinite = False
+        profit_factor_defined = False
+
     metrics = {
         "signals_1h": raw_signal_count,
         "ignored_signals_while_open": ignored_signals_while_open,
@@ -423,7 +436,9 @@ def simulate_b_v1(
         "closed_trades": len(trades),
         "net_pnl_usdt": round(net_pnl, 8),
         "net_expectancy_usdt_per_trade": round(net_pnl / len(trades), 8) if trades else None,
-        "profit_factor": round(gross_profit / gross_loss, 8) if gross_loss > 0 else None,
+        "profit_factor": profit_factor,
+        "profit_factor_infinite": profit_factor_infinite,
+        "profit_factor_defined": profit_factor_defined,
         "gross_profit_usdt": round(gross_profit, 8),
         "gross_loss_usdt": round(gross_loss, 8),
         "long": side_metrics(longs),
@@ -456,7 +471,13 @@ def simulate_b_v1(
             long_clause = metrics["long"]["net_pnl_usdt"] > 0 and metrics["short"]["net_pnl_usdt"] > 0
         conditions = {
             "expectancy_positive": metrics["net_expectancy_usdt_per_trade"] is not None and metrics["net_expectancy_usdt_per_trade"] > 0,
-            "profit_factor_at_least_1_10": metrics["profit_factor"] is not None and metrics["profit_factor"] >= 1.10,
+            "profit_factor_at_least_1_10": (
+                metrics["profit_factor_infinite"]
+                or (
+                    metrics["profit_factor"] is not None
+                    and metrics["profit_factor"] >= 1.10
+                )
+            ),
             "both_active_sides_profitable": long_clause,
             "btc_overlap_below_60_percent": metrics["btc_same_direction_overlap_percent"] is not None and metrics["btc_same_direction_overlap_percent"] < 60,
         }
