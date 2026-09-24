@@ -143,3 +143,22 @@ TEST-SPEC-003 is closed.
 Any future BTC strategy requires a new hypothesis, preregistration, and unused evaluation fold.
 
 The result must not be used to alter the still-running frozen TEST-SPEC-002 ZEC forward evaluation.
+
+
+## Final family-level follow-up after Grok review
+
+The raw N=24 / Wilder ATR(24) / 2x ATR TSMOM prescription will **not** be replicated across additional coins such as ETH or SOL after the BTC FAIL.
+
+Reason:
+
+- deciding to add more coins only after seeing BTC fail would extend the hypothesis family post hoc
+- BTC was the intended benchmark replication market and produced a sufficient 92-trade sample with both long and short sides negative
+- additional same-prescription altcoin tests would risk turning replication into coin selection
+- the still-running ZEC TEST-SPEC-002 remains the only open test of this exact prescription
+
+This does not claim that time-series momentum can never work in crypto. It closes only this exact research branch: 1h N=24 breakout with Wilder ATR(24) and 2x ATR stop/chandelier replicated coin-by-coin.
+
+Any future research must either:
+
+- wait for the frozen ZEC forward result, or
+- preregister a genuinely different economic edge family rather than another coin with the same prescription.
