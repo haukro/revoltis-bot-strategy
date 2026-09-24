@@ -24,6 +24,13 @@ from .tsmom_b_v1 import (
     simulate_b_v1,
     smoke_cases as tsmom_b_v1_smoke_cases,
 )
+from .tsmom_c_v1 import (
+    pack_ohlc_snapshot as pack_c_ohlc_snapshot,
+    unpack_ohlc_snapshot as unpack_c_ohlc_snapshot,
+    continuity_certificate as tsmom_c_v1_continuity_certificate,
+    simulate_c_v1,
+    smoke_cases as tsmom_c_v1_smoke_cases,
+)
 from .momentum_prescreen import pack_market_series, unpack_market_series, analyze_block, pooled_analysis
 from .rebound_experiment import (
     filter_b as rebound_filter_b,
@@ -1783,6 +1790,306 @@ async def evaluate_tsmom_b_v1():
             "grid": False,
         },
         "result": result,
+    }
+    return await supabase_upsert("optimizer_runs", record)
+
+
+_TSMOM_C_V1_SPEC = "TEST-SPEC-003"
+_TSMOM_C_V1_SPEC_COMMIT = "75e4ab2d90c061ae63d45b0739f132c6400cf94e"
+_TSMOM_C_V1_EVAL_START = datetime(2025, 9, 2, 0, 0, tzinfo=UTC)
+_TSMOM_C_V1_EVAL_END = datetime(2025, 11, 30, 23, 59, 59, 999000, tzinfo=UTC)
+_TSMOM_C_V1_DATA = {
+    "BTC": {"pair": "BTC/USDT", "warmup_hours": 24},
+    "ETH": {"pair": "ETH/USDT", "warmup_hours": 25},
+}
+_TSMOM_C_V1_COST_PROFILE = {
+    "fee_schedule": "okx_global_regular",
+    "fee_taker": 0.001,
+    "fee_maker": 0.0008,
+    "role": "taker",
+    "fee_rate": 0.001,
+    "source": "okx",
+    "book_ts": "1790275677755",
+    "estimate_basis": "current_book_snapshot_not_historical_l2",
+    "notional_usdt": 50.0,
+    "half_spread": 5.926681029335338e-07,
+    "buy_impact": 0.0,
+    "sell_impact": 0.0,
+    "entry_cost_rate": 0.0010005926681029335,
+    "exit_cost_rate": 0.0010005926681029335,
+    "book_impact_ratio": 0.0,
+    "thin_L1": False,
+}
+
+
+@app.get("/api/research/tsmom-c-v1/smoke")
+async def tsmom_c_v1_smoke():
+    """Synthetic-only Strategy C checks. Never touches official fold data."""
+    checks = tsmom_c_v1_smoke_cases()
+    return {
+        "status": "passed" if all(checks.values()) else "failed",
+        "checks": checks,
+        "official_data_touched": False,
+        "test_spec": _TSMOM_C_V1_SPEC,
+        "spec_commit": _TSMOM_C_V1_SPEC_COMMIT,
+        "strategy_b_modified": False,
+    }
+
+
+@app.post("/api/research/tsmom-c-v1/data/{symbol}")
+async def tsmom_c_v1_data(symbol: str):
+    """Persist immutable raw 5m snapshot for TEST-SPEC-003 without performance metrics."""
+    require_durable_production_store()
+    symbol = symbol.upper()
+    if symbol not in _TSMOM_C_V1_DATA:
+        raise HTTPException(422, "Symbol musí byť BTC alebo ETH.")
+
+    cfg = _TSMOM_C_V1_DATA[symbol]
+    snapshot_key = f"tsmom_c_v1:{_TSMOM_C_V1_SPEC}:{symbol}:20250902_20251130"
+    existing = await supabase_get("optimizer_runs", "order=created_at.desc&limit=100")
+    prior = next(
+        (
+            row for row in existing
+            if (row.get("request") or {}).get("kind") == "tsmom_c_v1_data"
+            and (row.get("request") or {}).get("snapshot_key") == snapshot_key
+        ),
+        None,
+    )
+    if prior:
+        return prior
+
+    eval_start_ms = int(_TSMOM_C_V1_EVAL_START.timestamp() * 1000)
+    eval_end_ms = int(_TSMOM_C_V1_EVAL_END.timestamp() * 1000)
+    fetch_start = eval_start_ms - int(cfg["warmup_hours"]) * 3_600_000
+    expected = int((eval_end_ms - fetch_start + 1) // TIMEFRAME_MILLISECONDS["5m"])
+    candles = await load_okx_candles(
+        str(cfg["pair"]),
+        "5m",
+        expected,
+        fetch_start,
+        eval_end_ms,
+    )
+    if not candles:
+        raise HTTPException(409, f"{symbol} TEST-SPEC-003 dataset je prázdny.")
+
+    now = datetime.now(UTC).isoformat()
+    record = {
+        "id": str(uuid4()),
+        "status": "completed",
+        "created_at": now,
+        "finished_at": now,
+        "request": {
+            "kind": "tsmom_c_v1_data",
+            "snapshot_key": snapshot_key,
+            "test_spec": _TSMOM_C_V1_SPEC,
+            "spec_commit": _TSMOM_C_V1_SPEC_COMMIT,
+            "symbol": symbol,
+            "pair": cfg["pair"],
+            "timeframe": "5m",
+            "warmup_hours": cfg["warmup_hours"],
+            "warmup_start": fetch_start,
+            "evaluation_start": eval_start_ms,
+            "evaluation_end": eval_end_ms,
+            "expected_5m_bars": expected,
+        },
+        "result": {
+            "snapshot": pack_c_ohlc_snapshot(candles),
+            "actual_5m_bars": len(candles),
+            "expected_5m_bars": expected,
+            "first_open_time": int(candles[0]["open_time"]),
+            "last_close_time": int(candles[-1]["close_time"]),
+            "source": "okx_public_spot",
+            "strategy_metrics_computed": False,
+        },
+    }
+    return await supabase_upsert("optimizer_runs", record)
+
+
+async def _load_tsmom_c_v1_data() -> dict[str, dict[str, Any]]:
+    rows = await supabase_get("optimizer_runs", "order=created_at.desc&limit=100")
+    found: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        req = row.get("request") or {}
+        if req.get("kind") != "tsmom_c_v1_data":
+            continue
+        if req.get("test_spec") != _TSMOM_C_V1_SPEC:
+            continue
+        symbol = req.get("symbol")
+        if symbol in _TSMOM_C_V1_DATA and symbol not in found:
+            found[symbol] = row
+    missing = [symbol for symbol in ("BTC", "ETH") if symbol not in found]
+    if missing:
+        raise HTTPException(409, f"Chýbajú TEST-SPEC-003 snapshoty: {', '.join(missing)}.")
+    return found
+
+
+@app.post("/api/research/tsmom-c-v1/continuity-cert")
+async def tsmom_c_v1_continuity_cert():
+    """Certify raw data/exact-entry availability only; no Strategy C performance metrics."""
+    require_durable_production_store()
+    existing = await supabase_get("optimizer_runs", "order=created_at.desc&limit=100")
+    prior = next(
+        (
+            row for row in existing
+            if (row.get("request") or {}).get("kind") == "tsmom_c_v1_continuity_certificate"
+            and (row.get("request") or {}).get("test_spec") == _TSMOM_C_V1_SPEC
+        ),
+        None,
+    )
+    if prior:
+        return prior
+
+    data = await _load_tsmom_c_v1_data()
+    btc = unpack_c_ohlc_snapshot(data["BTC"]["result"]["snapshot"])
+    eth = unpack_c_ohlc_snapshot(data["ETH"]["result"]["snapshot"])
+
+    eval_start_ms = int(_TSMOM_C_V1_EVAL_START.timestamp() * 1000)
+    eval_end_ms = int(_TSMOM_C_V1_EVAL_END.timestamp() * 1000)
+    btc_start = eval_start_ms - 24 * 3_600_000
+    eth_start = eval_start_ms - 25 * 3_600_000
+    cert = await asyncio.to_thread(
+        tsmom_c_v1_continuity_certificate,
+        btc,
+        eth,
+        evaluation_start_ms=eval_start_ms,
+        evaluation_end_ms=eval_end_ms,
+        btc_warmup_start_ms=btc_start,
+        eth_warmup_start_ms=eth_start,
+    )
+
+    now = datetime.now(UTC).isoformat()
+    record = {
+        "id": str(uuid4()),
+        "status": "completed",
+        "created_at": now,
+        "finished_at": now,
+        "request": {
+            "kind": "tsmom_c_v1_continuity_certificate",
+            "test_spec": _TSMOM_C_V1_SPEC,
+            "spec_commit": _TSMOM_C_V1_SPEC_COMMIT,
+            "data_snapshot_ids": {
+                "BTC": data["BTC"]["id"],
+                "ETH": data["ETH"]["id"],
+            },
+        },
+        "result": {
+            **cert,
+            "official_performance_metrics_computed": False,
+            "pnl_computed": False,
+            "profit_factor_computed": False,
+            "pass_fail_computed": False,
+        },
+    }
+    return await supabase_upsert("optimizer_runs", record)
+
+
+@app.post("/api/research/tsmom-c-v1/evaluate")
+async def evaluate_tsmom_c_v1():
+    """Run the single official TEST-SPEC-003 evaluation after a passed continuity cert."""
+    require_durable_production_store()
+    checks = tsmom_c_v1_smoke_cases()
+    if not all(checks.values()):
+        raise HTTPException(409, "TEST-SPEC-003 synthetic smoke neprešiel.")
+
+    rows = await supabase_get("optimizer_runs", "order=created_at.desc&limit=100")
+    prior = next(
+        (
+            row for row in rows
+            if (row.get("request") or {}).get("kind") == "tsmom_c_v1_official_evaluation"
+            and (row.get("request") or {}).get("test_spec") == _TSMOM_C_V1_SPEC
+        ),
+        None,
+    )
+    if prior:
+        return prior
+
+    cert_row = next(
+        (
+            row for row in rows
+            if (row.get("request") or {}).get("kind") == "tsmom_c_v1_continuity_certificate"
+            and (row.get("request") or {}).get("test_spec") == _TSMOM_C_V1_SPEC
+        ),
+        None,
+    )
+    if cert_row is None:
+        raise HTTPException(409, "Chýba TEST-SPEC-003 continuity cert.")
+    cert_result = cert_row.get("result") or {}
+    if cert_result.get("passed") is not True:
+        raise HTTPException(409, "TEST-SPEC-003 continuity cert neprešiel; official run je zakázaný.")
+    if cert_result.get("official_performance_metrics_computed") is not False:
+        raise HTTPException(409, "Continuity cert nie je čistý data-only cert.")
+
+    data = await _load_tsmom_c_v1_data()
+    btc = unpack_c_ohlc_snapshot(data["BTC"]["result"]["snapshot"])
+    eth = unpack_c_ohlc_snapshot(data["ETH"]["result"]["snapshot"])
+
+    eval_start_ms = int(_TSMOM_C_V1_EVAL_START.timestamp() * 1000)
+    eval_end_ms = int(_TSMOM_C_V1_EVAL_END.timestamp() * 1000)
+    outcome = await asyncio.to_thread(
+        simulate_c_v1,
+        btc,
+        eth,
+        evaluation_start_ms=eval_start_ms,
+        evaluation_end_ms=eval_end_ms,
+        stake_amount=50.0,
+        initial_capital=100.0,
+        cost_profile=dict(_TSMOM_C_V1_COST_PROFILE),
+    )
+    eval_btc = [
+        row for row in btc
+        if int(row["open_time"]) >= eval_start_ms
+        and int(row["close_time"]) <= eval_end_ms
+    ]
+    benchmark = buy_hold_risk_metrics(
+        eval_btc,
+        dict(_TSMOM_C_V1_COST_PROFILE),
+        100.0,
+    )
+
+    now = datetime.now(UTC).isoformat()
+    record = {
+        "id": str(uuid4()),
+        "status": "completed",
+        "created_at": now,
+        "finished_at": now,
+        "request": {
+            "kind": "tsmom_c_v1_official_evaluation",
+            "test_spec": _TSMOM_C_V1_SPEC,
+            "spec_commit": _TSMOM_C_V1_SPEC_COMMIT,
+            "pair": "BTC/USDT",
+            "execution_timeframe": "5m",
+            "signal_timeframe": "1h",
+            "evaluation_start": eval_start_ms,
+            "evaluation_end": eval_end_ms,
+            "breakout_n": 24,
+            "atr_period": 24,
+            "atr_multiple": 2.0,
+            "stake_amount": 50.0,
+            "initial_capital": 100.0,
+            "grid": False,
+            "continuity_certificate_id": cert_row["id"],
+            "data_snapshot_ids": {
+                "BTC": data["BTC"]["id"],
+                "ETH": data["ETH"]["id"],
+            },
+        },
+        "result": {
+            **outcome,
+            "test_spec": _TSMOM_C_V1_SPEC,
+            "spec_commit": _TSMOM_C_V1_SPEC_COMMIT,
+            "evaluation_window": {
+                "start_ms": eval_start_ms,
+                "end_ms": eval_end_ms,
+            },
+            "cost_profile": dict(_TSMOM_C_V1_COST_PROFILE),
+            "short_execution_interpretation": "research_marks_on_okx_spot_prints_not_borrow_free_spot_execution",
+            "eth_overlap_role": "diagnostic_only_not_pass_gate",
+            "buy_hold": benchmark,
+            "continuity_certificate_id": cert_row["id"],
+            "official_run_number": 1,
+            "grid_started": False,
+            "strategy_b_modified": False,
+        },
     }
     return await supabase_upsert("optimizer_runs", record)
 
