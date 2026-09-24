@@ -52,6 +52,35 @@ def _execution_decimal(value: Decimal) -> str:
     return s
 
 
+def quantize_execution_decimal(value: Any) -> str:
+    try:
+        d = Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise ValueError("invalid_execution_decimal") from exc
+    return _execution_decimal(d)
+
+
+def quote_fee_amount(quote_notional: Any, fee_rate: Any) -> str:
+    try:
+        notional = Decimal(str(quote_notional))
+        rate = Decimal(str(fee_rate))
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise ValueError("invalid_fee_input") from exc
+    if notional < 0 or rate < 0 or not notional.is_finite() or not rate.is_finite():
+        raise ValueError("invalid_fee_input")
+    return _execution_decimal(notional * rate)
+
+
+def remaining_quote_notional(intended: Any, filled: Any) -> str:
+    try:
+        remaining = Decimal(str(intended)) - Decimal(str(filled))
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise ValueError("invalid_notional_input") from exc
+    if remaining < 0:
+        remaining = Decimal("0")
+    return _execution_decimal(remaining)
+
+
 def _normalize_levels(
     levels: Iterable[Iterable[Any]],
     *,
