@@ -15,9 +15,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from .local_store import LocalStore
 from .simulation import simulate
-from .optimizer import optimize, present_optimizer_record, assess_candidate, aggregate_metrics
+from .optimizer import optimize, present_optimizer_record, assess_candidate, aggregate_metrics, walk_forward_windows
 from .trade_audit import matches_target, prepare_replay, replay_validation, unpack_snapshot, trade_tape, tape_summary, entry_path_audit
 from .costs import book_costs, FEE_SCHEDULE, FEE_TAKER, FEE_MAKER, net_return
+from .rebound_experiment import (
+    filter_b as rebound_filter_b,
+    rebound_confirmation_context,
+    enrich_trade_path,
+    paired_metrics,
+    smoke_cases as rebound_smoke_cases,
+)
 
 
 class StrategySettings(BaseModel):
@@ -887,6 +894,336 @@ def _same_numeric_metrics(expected: dict[str, Any], actual: dict[str, Any], tole
             if not math.isfinite(float(value)) or not math.isfinite(float(actual[key])) or abs(float(actual[key]) - float(value)) >= tolerance:
                 return False
     return True
+
+
+@app.get("/api/research/rebound-confirmation/smoke")
+async def rebound_confirmation_smoke():
+    """Synthetic-only preregistration smoke test. Never touches evaluation data."""
+    checks = rebound_smoke_cases()
+    return {
+        "status": "passed" if all(checks.values()) else "failed",
+        "checks": checks,
+        "evaluation_data_touched": False,
+        "preregistration_commit": "4bd956d077bbaa24bac60adc12380aa4e2609817",
+    }
+
+
+@app.post("/api/research/rebound-confirmation/evaluate")
+async def evaluate_rebound_confirmation():
+    """Run the single preregistered baseline-vs-Filter-B paired evaluation."""
+    require_durable_production_store()
+    prereg_commit = "4bd956d077bbaa24bac60adc12380aa4e2609817"
+    source_job_id = "c4279991-66ae-44a2-9840-073c96bd8251"
+
+    checks = rebound_smoke_cases()
+    if not all(checks.values()):
+        raise HTTPException(409, "Synthetic smoke test neprešiel. Evaluation sa nespustila.")
+
+    existing = await supabase_get("optimizer_runs", "order=created_at.desc&limit=100")
+    prior = next(
+        (
+            row for row in existing
+            if (row.get("request") or {}).get("kind") == "preregistered_rebound_confirmation"
+            and (row.get("request") or {}).get("preregistration_commit") == prereg_commit
+        ),
+        None,
+    )
+    if prior:
+        return prior
+
+    source_rows = await supabase_get("optimizer_runs", f"id=eq.{source_job_id}&limit=1")
+    source = next((row for row in source_rows if row.get("id") == source_job_id), None)
+    if source is None or source.get("status") != "completed":
+        raise HTTPException(404, "Zmrazený 4h research baseline run nebol nájdený.")
+    source_result = source.get("result") or {}
+    variants = source_result.get("variant_results") or []
+    selected_id = source_result.get("variant_id")
+    row = next((item for item in variants if item.get("variant_id") == selected_id), None)
+    if row is None:
+        raise HTTPException(422, "Baseline run nemá auditovateľný variant.")
+
+    settings = dict(row.get("settings") or {})
+    locked = {
+        "timeframe": settings.get("timeframe"),
+        "max_no_trail_hours": float(settings.get("max_no_trail_hours") or 0),
+        "stop_loss_percent": float(settings.get("stop_loss_percent") or 0),
+        "trailing_start_percent": float(settings.get("trailing_start_percent") or 0),
+        "trailing_distance_percent": float(settings.get("trailing_distance_percent") or 0),
+    }
+    if locked != {
+        "timeframe": "5m",
+        "max_no_trail_hours": 4.0,
+        "stop_loss_percent": 6.0,
+        "trailing_start_percent": 1.6,
+        "trailing_distance_percent": 0.3,
+    }:
+        raise HTTPException(409, f"Baseline sa nezhoduje s preregistráciou: {locked}")
+
+    cost_profile = row.get("cost_components")
+    if not cost_profile:
+        raise HTTPException(422, "Baseline nemá fixný cost snapshot.")
+
+    pair = "ZEC/USDT"
+    timeframe = "5m"
+    start_ms = int(datetime(2025, 12, 27, 17, 15, tzinfo=UTC).timestamp() * 1000)
+    end_ms = int(datetime(2026, 3, 27, 17, 15, tzinfo=UTC).timestamp() * 1000) - 1
+    step = TIMEFRAME_MILLISECONDS[timeframe]
+    expected = int((end_ms - start_ms + 1) // step)
+    candles = await load_okx_candles(pair, timeframe, expected, start_ms, end_ms)
+    if len(candles) != expected:
+        raise HTTPException(409, f"Evaluation dataset nie je kompletný: {len(candles)}/{expected}.")
+    if int(candles[0]["open_time"]) != start_ms or int(candles[-1]["close_time"]) != end_ms:
+        raise HTTPException(409, "Evaluation dataset nesedí na preregistrované hranice.")
+    if any(int(right["open_time"]) - int(left["open_time"]) != step for left, right in zip(candles, candles[1:])):
+        raise HTTPException(409, "Evaluation dataset obsahuje medzeru.")
+
+    warmup = max(40, int(settings["bb_period"]) + 2, int(settings["rsi_period"]) + 2, int(settings["atr_period"]) + 2)
+    wf, holdout = walk_forward_windows(candles, warmup)
+    boundary = max(120, int(len(candles) * .8))
+    segments: list[tuple[str, list[dict[str, Any]], int]] = []
+    for number, (train, validation) in enumerate(wf, 1):
+        segments.append((f"wf{number}", validation, int(candles[len(train)]["open_time"])))
+    segments.append(("holdout", holdout, int(candles[boundary]["open_time"])))
+
+    global_index_by_close = {int(candle["close_time"]): index for index, candle in enumerate(candles)}
+    trail_start = float(settings["trailing_start_percent"])
+    cost_options = {"cost_models": {pair: cost_profile}}
+    baseline_all: list[dict[str, Any]] = []
+    candidate_all: list[dict[str, Any]] = []
+    baseline_logs: list[dict[str, Any]] = []
+    candidate_logs: list[dict[str, Any]] = []
+    baseline_segment_metrics = []
+    candidate_segment_metrics = []
+
+    def iso_ms(value: str) -> int:
+        return int(round(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() * 1000))
+
+    def decorate(trade: dict[str, Any]) -> dict[str, Any]:
+        path = enrich_trade_path(candles, trade, trail_start)
+        return {
+            **trade,
+            "trail_hit": path["time_to_trail_min"] is not None,
+            "mae_pct": trade.get("mae"),
+            **path,
+        }
+
+    for label, segment, trading_start in segments:
+        baseline_run = simulate(
+            {pair: segment},
+            settings,
+            fee=float(row["cost_per_side"]),
+            force_close_at_end=True,
+            trading_start_time=trading_start,
+            **cost_options,
+        )
+        baseline_segment_metrics.append(baseline_run["metrics"])
+        baseline_tape = trade_tape(
+            baseline_run, pair, timeframe, "baseline", label, float(row["cost_per_side"])
+        )
+        baseline_tape = [decorate(trade) for trade in baseline_tape]
+        baseline_all.extend(baseline_tape)
+        allowed_times = {iso_ms(trade["entry_ts"]) for trade in baseline_tape}
+
+        def gate(_pair: str, _segment: list[dict[str, Any]], segment_index: int) -> bool:
+            close_time = int(_segment[segment_index]["close_time"])
+            global_index = global_index_by_close.get(close_time)
+            if global_index is None:
+                raise ValueError("candidate_signal_not_in_evaluation_feed")
+            return rebound_filter_b(candles, global_index)
+
+        candidate_run = simulate(
+            {pair: segment},
+            settings,
+            fee=float(row["cost_per_side"]),
+            force_close_at_end=True,
+            trading_start_time=trading_start,
+            allowed_entry_times=allowed_times,
+            entry_gate=gate,
+            **cost_options,
+        )
+        candidate_segment_metrics.append(candidate_run["metrics"])
+        candidate_tape = trade_tape(
+            candidate_run, pair, timeframe, "candidate_filter_b", label, float(row["cost_per_side"])
+        )
+        candidate_tape = [decorate(trade) for trade in candidate_tape]
+        candidate_all.extend(candidate_tape)
+
+        baseline_by_entry = {trade["entry_ts"]: trade for trade in baseline_tape}
+        candidate_by_entry = {trade["entry_ts"]: trade for trade in candidate_tape}
+        if not set(candidate_by_entry).issubset(set(baseline_by_entry)):
+            raise HTTPException(500, "Candidate vytvoril entry mimo baseline signal universe.")
+
+        for entry_ts, baseline_trade in baseline_by_entry.items():
+            entry_ms = iso_ms(entry_ts)
+            context = rebound_confirmation_context(
+                candles, entry_ms, float(baseline_trade["entry_px"])
+            )
+            baseline_logs.append({
+                "timestamp": entry_ts,
+                "window": label,
+                "taken": 1,
+                "skip_reason": "none",
+                "entry_price": baseline_trade["entry_px"],
+                "confirm_4h_ts": None,
+                "trail_hit": baseline_trade["trail_hit"],
+                "outcome": "win" if float(baseline_trade["pnl_net"]) > 0 else "loss",
+                "mae_pct": baseline_trade["mae_pct"],
+                "mae_before_trail_pct": baseline_trade["mae_before_trail_pct"],
+                "hit_minus_1pct": baseline_trade["hit_minus_1pct"],
+                "time_to_trail_min": baseline_trade["time_to_trail_min"],
+                "time_to_minus_1pct_min": baseline_trade["time_to_minus_1pct_min"],
+                "pre_entry_1h_ret": baseline_trade["pre_entry_1h_ret"],
+                "pre_entry_4h_ret": baseline_trade["pre_entry_4h_ret"],
+                "rv_24bars": baseline_trade["rv_24bars"],
+                "range_pos_24h": context["range_pos_24h"],
+                "pct_above_24h_low": context["pct_above_24h_low"],
+                "bars_since_24h_low": context["bars_since_24h_low"],
+            })
+            taken = candidate_by_entry.get(entry_ts)
+            if taken is not None:
+                candidate_logs.append({
+                    "timestamp": entry_ts,
+                    "window": label,
+                    "taken": 1,
+                    "skip_reason": "none",
+                    "entry_price": taken["entry_px"],
+                    "confirm_4h_ts": context["confirm_4h_ts"],
+                    "trail_hit": taken["trail_hit"],
+                    "outcome": "win" if float(taken["pnl_net"]) > 0 else "loss",
+                    "mae_pct": taken["mae_pct"],
+                    "mae_before_trail_pct": taken["mae_before_trail_pct"],
+                    "hit_minus_1pct": taken["hit_minus_1pct"],
+                    "time_to_trail_min": taken["time_to_trail_min"],
+                    "time_to_minus_1pct_min": taken["time_to_minus_1pct_min"],
+                    "pre_entry_1h_ret": taken["pre_entry_1h_ret"],
+                    "pre_entry_4h_ret": taken["pre_entry_4h_ret"],
+                    "rv_24bars": taken["rv_24bars"],
+                    "range_pos_24h": context["range_pos_24h"],
+                    "pct_above_24h_low": context["pct_above_24h_low"],
+                    "bars_since_24h_low": context["bars_since_24h_low"],
+                })
+            else:
+                candidate_logs.append({
+                    "timestamp": entry_ts,
+                    "window": label,
+                    "taken": 0,
+                    "skip_reason": "no_rebound_confirm",
+                    "entry_price": baseline_trade["entry_px"],
+                    "confirm_4h_ts": None,
+                    "trail_hit": None,
+                    "outcome": None,
+                    "mae_pct": None,
+                    "mae_before_trail_pct": None,
+                    "hit_minus_1pct": None,
+                    "time_to_trail_min": None,
+                    "time_to_minus_1pct_min": None,
+                    "pre_entry_1h_ret": baseline_trade["pre_entry_1h_ret"],
+                    "pre_entry_4h_ret": baseline_trade["pre_entry_4h_ret"],
+                    "rv_24bars": baseline_trade["rv_24bars"],
+                    "range_pos_24h": context["range_pos_24h"],
+                    "pct_above_24h_low": context["pct_above_24h_low"],
+                    "bars_since_24h_low": context["bars_since_24h_low"],
+                    "baseline_counterfactual_trail_hit": baseline_trade["trail_hit"],
+                    "baseline_counterfactual_outcome": "win" if float(baseline_trade["pnl_net"]) > 0 else "loss",
+                })
+
+    if len({item["timestamp"] for item in baseline_logs}) != len(baseline_logs):
+        raise HTTPException(500, "Baseline signal universe obsahuje duplicitný timestamp.")
+    if {item["timestamp"] for item in candidate_logs} != {item["timestamp"] for item in baseline_logs}:
+        raise HTTPException(500, "Baseline a candidate nemajú rovnaký signal universe.")
+
+    baseline_primary = paired_metrics(baseline_all)
+    candidate_primary = paired_metrics(candidate_all)
+    baseline_summary = aggregate_metrics(baseline_segment_metrics, float(settings["initial_capital"]))
+    candidate_summary = aggregate_metrics(candidate_segment_metrics, float(settings["initial_capital"]))
+
+    if baseline_primary["trail_not_reached_n"] < 20:
+        verdict = "INSUFFICIENT_SAMPLE"
+        conditions = None
+    else:
+        wr_delta = (
+            float(candidate_primary["wr_trail_not_reached"]) - float(baseline_primary["wr_trail_not_reached"])
+            if candidate_primary["wr_trail_not_reached"] is not None and baseline_primary["wr_trail_not_reached"] is not None
+            else float("-inf")
+        )
+        trail_share_delta = (
+            float(candidate_primary["trail_reached_share"]) - float(baseline_primary["trail_reached_share"])
+            if candidate_primary["trail_reached_share"] is not None and baseline_primary["trail_reached_share"] is not None
+            else float("-inf")
+        )
+        trade_reduction = 1 - (int(candidate_primary["trades"]) / int(baseline_primary["trades"]))
+        conditions = {
+            "trail_not_reached_wr_plus_15pp": wr_delta >= 15,
+            "trail_reached_share_drop_max_10pp": trail_share_delta >= -10,
+            "trail_reached_wr_at_least_90": (
+                candidate_primary["wr_trail_reached"] is not None
+                and float(candidate_primary["wr_trail_reached"]) >= 90
+            ),
+            "trade_count_drop_max_35pct": trade_reduction <= .35,
+        }
+        verdict = "PASS" if all(conditions.values()) else "FAIL"
+
+    skipped = [row for row in candidate_logs if row["taken"] == 0]
+    skipped_no_trail = sum(row.get("baseline_counterfactual_trail_hit") is False for row in skipped)
+    skipped_no_trail_share = 100 * skipped_no_trail / len(skipped) if skipped else 0.0
+    trail_delta = (
+        float(candidate_primary["trail_reached_share"]) - float(baseline_primary["trail_reached_share"])
+        if candidate_primary["trail_reached_share"] is not None and baseline_primary["trail_reached_share"] is not None
+        else None
+    )
+
+    benchmark = buy_hold_risk_metrics(candles, cost_profile, float(settings["initial_capital"]))
+    report = {
+        "preregistration_commit": prereg_commit,
+        "evaluation_window": {"start_ms": start_ms, "end_ms": end_ms},
+        "signal_universe": "baseline_opened_5m_entries_only",
+        "baseline": {
+            "primary": baseline_primary,
+            "strategy_metrics": baseline_summary,
+            "signals": baseline_logs,
+        },
+        "candidate": {
+            "primary": candidate_primary,
+            "strategy_metrics": candidate_summary,
+            "signals": candidate_logs,
+            "skip_rate": 100 * len(skipped) / len(candidate_logs) if candidate_logs else 0.0,
+        },
+        "benchmark": benchmark,
+        "conditions": conditions,
+        "verdict": verdict,
+        "interpretation": [
+            f"Filter B skipped {len(skipped)} baseline entries; {skipped_no_trail_share:.1f}% of skipped entries were baseline trail-not-reached trades.",
+            (
+                f"Trail-reached share changed by {trail_delta:+.1f} percentage points."
+                if trail_delta is not None else
+                "Trail-reached share delta is unavailable."
+            ),
+        ],
+        "smoke_checks": checks,
+        "grid_started": False,
+        "strategy_parameters_changed": False,
+    }
+
+    now = datetime.now(UTC).isoformat()
+    record = {
+        "id": str(uuid4()),
+        "status": "completed",
+        "created_at": now,
+        "finished_at": now,
+        "request": {
+            "kind": "preregistered_rebound_confirmation",
+            "preregistration_commit": prereg_commit,
+            "source_job_id": source_job_id,
+            "pair": pair,
+            "timeframe": timeframe,
+            "start_time": start_ms,
+            "end_time": end_ms,
+            "modes": ["baseline", "candidate_filter_b"],
+            "grid": False,
+        },
+        "result": report,
+    }
+    return await supabase_upsert("optimizer_runs", record)
 
 
 @app.get("/api/optimizer/{job_id}/entry-path-audit")
