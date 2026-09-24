@@ -180,6 +180,15 @@ The stop active for a 5m candle must be based only on information available befo
 
 The same stored fee + spread + impact cost model used for Strategy A is applied to both entry and exit.
 
+
+### 5.4 Evaluation-boundary bookkeeping
+
+If a position remains open at the exact end of the official evaluation fold, it is liquidated at the final 5m close and labeled `end_of_test`.
+
+The same locked transaction-cost model is applied.
+
+This is an evaluation bookkeeping close only, not an additional Strategy B exit rule.
+
 ## 6. Parameters that are not tuned
 
 This test does not tune:
