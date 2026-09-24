@@ -10,7 +10,7 @@ from .costs import net_return
 from collections import defaultdict
 from datetime import UTC, datetime
 from math import sqrt
-from typing import Any
+from typing import Any, Callable
 
 
 def _mean(values: list[float]) -> float:
@@ -75,6 +75,8 @@ def simulate(
     force_close_at_end: bool = False,
     trading_start_time: int | None = None,
     cost_models: dict[str, dict] | None = None,
+    allowed_entry_times: set[int] | None = None,
+    entry_gate: Callable[[str, list[dict[str, Any]], int], bool] | None = None,
 ) -> dict[str, Any]:
     """Run the mean-reversion strategy on public historical candles."""
     bb_period = int(settings["bb_period"])
@@ -255,6 +257,13 @@ def simulate(
             for reason, passed in conditions.items():
                 if not passed:
                     rejection_counts[reason] += 1
+            continue
+        # Research-only hooks default to disabled. They are evaluated only
+        # after the existing 5m entry signal has passed and before opening.
+        # The production strategy path is unchanged when both are None.
+        if allowed_entry_times is not None and close_time not in allowed_entry_times:
+            continue
+        if entry_gate is not None and not entry_gate(pair, candles, index):
             continue
         if len(positions) >= int(settings["max_open_trades"]):
             rejection_counts["limit otvorených pozícií"] += 1
