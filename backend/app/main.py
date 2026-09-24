@@ -1541,9 +1541,9 @@ async def finalize_momentum_prescreen():
 
 
 _TSMOM_B_V1_SPEC = "TEST-SPEC-002"
-_TSMOM_B_V1_SPEC_BASE_COMMIT = "cb50dcbbbad404767fffd38a343a1a9cd9e32ac8"
-_TSMOM_B_V1_EVAL_START = datetime(2025, 9, 2, 0, 0, tzinfo=UTC)
-_TSMOM_B_V1_EVAL_END = datetime(2025, 11, 30, 23, 59, 59, 999000, tzinfo=UTC)
+_TSMOM_B_V1_SPEC_BASE_COMMIT = "613a4b0dd48f54cfb39d32bc142ff4d545738301"
+_TSMOM_B_V1_EVAL_START = datetime(2026, 9, 24, 12, 0, tzinfo=UTC)
+_TSMOM_B_V1_EVAL_END = datetime(2026, 12, 23, 11, 59, 59, 999000, tzinfo=UTC)
 _TSMOM_B_V1_DATA = {
     "ZEC": "ZEC/USDT",
     "BTC": "BTC/USDT",
@@ -1571,7 +1571,9 @@ async def tsmom_b_v1_data(symbol: str):
     if symbol not in _TSMOM_B_V1_DATA:
         raise HTTPException(422, "Symbol musí byť ZEC alebo BTC.")
 
-    snapshot_key = f"tsmom_b_v1:{_TSMOM_B_V1_SPEC}:{symbol}:20250902_20251130"
+    if datetime.now(UTC) <= _TSMOM_B_V1_EVAL_END:
+        raise HTTPException(409, "Official TEST-SPEC-002 fold ešte neskončil; snapshot sa nesmie vytvoriť.")
+    snapshot_key = f"tsmom_b_v1:{_TSMOM_B_V1_SPEC}:{symbol}:20260924_20261223"
     existing = await supabase_get("optimizer_runs", "order=created_at.desc&limit=100")
     prior = next(
         (
@@ -1651,6 +1653,8 @@ async def _load_tsmom_b_v1_data() -> dict[str, dict[str, Any]]:
 async def evaluate_tsmom_b_v1():
     """Run the single official TEST-SPEC-002 evaluation. Idempotent."""
     require_durable_production_store()
+    if datetime.now(UTC) <= _TSMOM_B_V1_EVAL_END:
+        raise HTTPException(409, "Official TEST-SPEC-002 fold ešte neskončil; PASS/FAIL sa nesmie počítať.")
     checks = tsmom_b_v1_smoke_cases()
     if not all(checks.values()):
         raise HTTPException(409, "B-v1 synthetic smoke test neprešiel. Official run sa nespustil.")
