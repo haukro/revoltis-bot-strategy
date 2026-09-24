@@ -18,6 +18,7 @@ from .simulation import simulate
 from .optimizer import optimize, present_optimizer_record, assess_candidate, aggregate_metrics, walk_forward_windows
 from .trade_audit import matches_target, prepare_replay, replay_validation, unpack_snapshot, trade_tape, tape_summary, entry_path_audit
 from .costs import book_costs, FEE_SCHEDULE, FEE_TAKER, FEE_MAKER, net_return
+from .momentum_prescreen import pack_market_series, unpack_market_series, analyze_block, pooled_analysis
 from .rebound_experiment import (
     filter_b as rebound_filter_b,
     rebound_confirmation_context,
@@ -1374,6 +1375,160 @@ async def baseline_economic_scorecard():
             "blocks": block_results,
             "combined": combined,
             "note": "PnL and expectancy are net of the stored fee + spread + impact cost model.",
+        },
+    }
+    return await supabase_upsert("optimizer_runs", record)
+
+
+_MOMENTUM_PRESCREEN_COMMIT = "0dcd9bab922438f805053af5b54974091f86a2f7"
+_MOMENTUM_PRESCREEN_BLOCKS = {
+    "A": datetime(2025, 12, 27, 17, 15, tzinfo=UTC),
+    "B": datetime(2026, 3, 27, 17, 15, tzinfo=UTC),
+    "C": datetime(2026, 6, 25, 17, 15, tzinfo=UTC),
+}
+_MOMENTUM_PRESCREEN_SYMBOLS = {
+    "ZEC": "ZEC/USDT",
+    "BTC": "BTC/USDT",
+    "ETH": "ETH/USDT",
+}
+
+
+@app.post("/api/research/momentum-prescreen/data/{block}/{symbol}")
+async def momentum_prescreen_data(block: str, symbol: str):
+    """Persist one immutable 90d 5m market snapshot for the preregistered pre-screen."""
+    require_durable_production_store()
+    block = block.upper()
+    symbol = symbol.upper()
+    if block not in _MOMENTUM_PRESCREEN_BLOCKS:
+        raise HTTPException(422, "Block musí byť A, B alebo C.")
+    if symbol not in _MOMENTUM_PRESCREEN_SYMBOLS:
+        raise HTTPException(422, "Symbol musí byť ZEC, BTC alebo ETH.")
+
+    snapshot_key = f"momentum_prescreen:{_MOMENTUM_PRESCREEN_COMMIT}:{block}:{symbol}"
+    existing = await supabase_get("optimizer_runs", "order=created_at.desc&limit=100")
+    prior = next(
+        (
+            row for row in existing
+            if (row.get("request") or {}).get("kind") == "momentum_prescreen_data"
+            and (row.get("request") or {}).get("snapshot_key") == snapshot_key
+        ),
+        None,
+    )
+    if prior:
+        return prior
+
+    pair = _MOMENTUM_PRESCREEN_SYMBOLS[symbol]
+    start_ms = int(_MOMENTUM_PRESCREEN_BLOCKS[block].timestamp() * 1000)
+    end_ms = start_ms + 90 * 86_400_000 - 1
+    step = TIMEFRAME_MILLISECONDS["5m"]
+    expected = int((end_ms - start_ms + 1) // step)
+    candles = await load_okx_candles(pair, "5m", expected, start_ms, end_ms)
+    if len(candles) != expected:
+        raise HTTPException(409, f"{block}/{symbol} incomplete: {len(candles)}/{expected}.")
+    if int(candles[0]["open_time"]) != start_ms or int(candles[-1]["close_time"]) != end_ms:
+        raise HTTPException(409, f"{block}/{symbol} boundary mismatch.")
+    if any(int(b["open_time"]) - int(a["open_time"]) != step for a, b in zip(candles, candles[1:])):
+        raise HTTPException(409, f"{block}/{symbol} candle gap.")
+
+    snapshot = pack_market_series(candles)
+    now = datetime.now(UTC).isoformat()
+    record = {
+        "id": str(uuid4()),
+        "status": "completed",
+        "created_at": now,
+        "finished_at": now,
+        "request": {
+            "kind": "momentum_prescreen_data",
+            "snapshot_key": snapshot_key,
+            "preregistration_commit": _MOMENTUM_PRESCREEN_COMMIT,
+            "block": block,
+            "symbol": symbol,
+            "pair": pair,
+            "timeframe": "5m",
+            "start_time": start_ms,
+            "end_time": end_ms,
+        },
+        "result": {
+            "snapshot": snapshot,
+            "bars": expected,
+            "source": "okx_public_spot",
+        },
+    }
+    return await supabase_upsert("optimizer_runs", record)
+
+
+async def _load_momentum_prescreen_snapshots() -> tuple[list[dict[str, Any]], dict[tuple[str, str], dict[str, Any]]]:
+    rows = await supabase_get("optimizer_runs", "order=created_at.desc&limit=100")
+    found: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in rows:
+        req = row.get("request") or {}
+        if req.get("kind") != "momentum_prescreen_data":
+            continue
+        if req.get("preregistration_commit") != _MOMENTUM_PRESCREEN_COMMIT:
+            continue
+        key = (req.get("block"), req.get("symbol"))
+        if key[0] in _MOMENTUM_PRESCREEN_BLOCKS and key[1] in _MOMENTUM_PRESCREEN_SYMBOLS and key not in found:
+            found[key] = row
+    missing = [
+        f"{block}/{symbol}"
+        for block in ("A", "B", "C")
+        for symbol in ("ZEC", "BTC", "ETH")
+        if (block, symbol) not in found
+    ]
+    if missing:
+        raise HTTPException(409, f"Chýbajú momentum pre-screen snapshoty: {', '.join(missing)}.")
+    return rows, found
+
+
+@app.post("/api/research/momentum-prescreen/finalize")
+async def finalize_momentum_prescreen():
+    """Compute the locked pre-screen from immutable snapshots; no market fetch and no Strategy B."""
+    require_durable_production_store()
+    rows, found = await _load_momentum_prescreen_snapshots()
+    prior = next(
+        (
+            row for row in rows
+            if (row.get("request") or {}).get("kind") == "momentum_prescreen_result"
+            and (row.get("request") or {}).get("preregistration_commit") == _MOMENTUM_PRESCREEN_COMMIT
+        ),
+        None,
+    )
+    if prior:
+        return prior
+
+    blocks = []
+    snapshot_ids = []
+    for block in ("A", "B", "C"):
+        series = {}
+        for symbol in ("ZEC", "BTC", "ETH"):
+            row = found[(block, symbol)]
+            snapshot_ids.append(row["id"])
+            series[symbol] = unpack_market_series(row["result"]["snapshot"])
+        blocks.append(series)
+
+    analysis = pooled_analysis(blocks)
+    now = datetime.now(UTC).isoformat()
+    record = {
+        "id": str(uuid4()),
+        "status": "completed",
+        "created_at": now,
+        "finished_at": now,
+        "request": {
+            "kind": "momentum_prescreen_result",
+            "preregistration_commit": _MOMENTUM_PRESCREEN_COMMIT,
+            "snapshot_ids": snapshot_ids,
+            "symbols": ["ZEC/USDT", "BTC/USDT", "ETH/USDT"],
+            "timeframes": ["5m", "1h"],
+            "diagnostic_breakout_lookback": 20,
+            "grid": False,
+            "strategy_b_backtest": False,
+        },
+        "result": {
+            **analysis,
+            "preregistration_commit": _MOMENTUM_PRESCREEN_COMMIT,
+            "diagnostic_only": True,
+            "strategy_b_defined": False,
+            "pnl_computed": False,
         },
     }
     return await supabase_upsert("optimizer_runs", record)
