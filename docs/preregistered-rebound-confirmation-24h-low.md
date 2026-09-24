@@ -1,6 +1,6 @@
 # Pre-registered test: rebound confirmation vs 24h low
 
-Status: **LOCKED BEFORE EVALUATION**
+Status: **CLOSED — FAIL**
 
 This document defines the next unseen evaluation test for the ZEC strategy.
 The discovery datasets must not be used to tune any threshold or interpretation in this test.
@@ -237,3 +237,40 @@ Until this test produces its locked verdict, do not:
 
 If the candidate fails, the next step is not to tune Filter B on this fold.
 Filter B is rejected for this preregistered test, or a completely new hypothesis must be preregistered on another unseen fold.
+
+
+## 14. Final locked result
+
+Evaluation run:
+
+- run id: `8ec7642c-fbdc-4dc3-a28b-ee53fc6bb819`
+- verdict: **FAIL**
+- baseline trail-not-reached sample: **20** trades, therefore the preregistered sufficiency guard was satisfied and `INSUFFICIENT_SAMPLE` did not apply.
+
+| Condition | Locked requirement | Result |
+|---|---|---|
+| 1 | WR in trail-not-reached group improves by at least +15 p.p. | 25.0% -> 23.1%, delta **-1.9 p.p. — FAIL** |
+| 2 | Trail-reached share does not fall by more than 10 p.p. | 50.0% -> 51.9%, delta **+1.9 p.p. — PASS** |
+| 3 | WR among trail-reached trades remains >= 90% | 100% -> 100% — **PASS** |
+| 4 | Taken trade count falls by no more than 35% | 40 -> 27, delta **-32.5% — PASS** |
+
+Filter B removed 13 of 40 baseline signals; 7 of those skipped signals were baseline trail-not-reached trades and 6 were baseline trail-reached trades, so the filter did not selectively remove the failing subgroup.
+
+The trail-reached share did not deteriorate; it increased by 1.9 percentage points.
+
+The preregistered hypothesis is therefore rejected on this evaluation fold.
+
+## 15. Closure rule
+
+This branch of the research is closed.
+
+Do not modify Filter B on this evaluation set. In particular, do not add or tune:
+
+- percentage distance above the 24h low
+- range-position thresholds
+- 1h / 4h return filters
+- a new timeout
+- trail parameters
+- a trend filter
+
+Any future experiment must start from a separate preregistration with a new hypothesis and a different unseen evaluation fold.
