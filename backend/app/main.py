@@ -1541,7 +1541,11 @@ async def finalize_momentum_prescreen():
 
 
 _TSMOM_B_V1_SPEC = "TEST-SPEC-002"
-_TSMOM_B_V1_SPEC_BASE_COMMIT = "613a4b0dd48f54cfb39d32bc142ff4d545738301"
+_TSMOM_B_V1_SPEC_BASE_COMMIT = "1a178c3f1c61424e3d77b6912749c261a0a943d5"
+_TSMOM_B_V1_COST_SOURCE_RUN = "c4279991-66ae-44a2-9840-073c96bd8251"
+_TSMOM_B_V1_COST_BOOK_TS = "1790183884652"
+_TSMOM_B_V1_ENTRY_COST_RATE = 0.001086487119183424
+_TSMOM_B_V1_EXIT_COST_RATE = 0.0010838075452430937
 _TSMOM_B_V1_EVAL_START = datetime(2026, 9, 24, 12, 0, tzinfo=UTC)
 _TSMOM_B_V1_EVAL_END = datetime(2026, 12, 23, 11, 59, 59, 999000, tzinfo=UTC)
 _TSMOM_B_V1_DATA = {
@@ -1675,8 +1679,8 @@ async def evaluate_tsmom_b_v1():
     zec = unpack_ohlc_snapshot(data["ZEC"]["result"]["snapshot"])
     btc = unpack_ohlc_snapshot(data["BTC"]["result"]["snapshot"])
 
-    source_rows = await supabase_get("optimizer_runs", "id=eq.c4279991-66ae-44a2-9840-073c96bd8251&limit=1")
-    source = next((row for row in source_rows if row.get("id") == "c4279991-66ae-44a2-9840-073c96bd8251"), None)
+    source_rows = await supabase_get("optimizer_runs", f"id=eq.{_TSMOM_B_V1_COST_SOURCE_RUN}&limit=1")
+    source = next((row for row in source_rows if row.get("id") == _TSMOM_B_V1_COST_SOURCE_RUN), None)
     if source is None:
         raise HTTPException(404, "Strategy A source cost snapshot nebol nájdený.")
     source_result = source.get("result") or {}
@@ -1686,6 +1690,26 @@ async def evaluate_tsmom_b_v1():
     if selected is None or not selected.get("cost_components"):
         raise HTTPException(422, "Strategy A source nemá cost snapshot.")
     cost_profile = selected["cost_components"]
+    cost_lock_ok = (
+        str(cost_profile.get("book_ts")) == _TSMOM_B_V1_COST_BOOK_TS
+        and math.isclose(
+            float(cost_profile.get("entry_cost_rate")),
+            _TSMOM_B_V1_ENTRY_COST_RATE,
+            rel_tol=0.0,
+            abs_tol=1e-15,
+        )
+        and math.isclose(
+            float(cost_profile.get("exit_cost_rate")),
+            _TSMOM_B_V1_EXIT_COST_RATE,
+            rel_tol=0.0,
+            abs_tol=1e-15,
+        )
+    )
+    if not cost_lock_ok:
+        raise HTTPException(
+            409,
+            "TEST-SPEC-002 frozen Strategy A cost snapshot mismatch; official run is invalid.",
+        )
 
     eval_start_ms = int(_TSMOM_B_V1_EVAL_START.timestamp() * 1000)
     eval_end_ms = int(_TSMOM_B_V1_EVAL_END.timestamp() * 1000)
@@ -1712,6 +1736,15 @@ async def evaluate_tsmom_b_v1():
         "base_spec_commit": _TSMOM_B_V1_SPEC_BASE_COMMIT,
         "evaluation_window": {"start_ms": eval_start_ms, "end_ms": eval_end_ms},
         "cost_profile": cost_profile,
+        "cost_snapshot_lock": {
+            "source_run_id": _TSMOM_B_V1_COST_SOURCE_RUN,
+            "book_ts": _TSMOM_B_V1_COST_BOOK_TS,
+            "entry_cost_rate": _TSMOM_B_V1_ENTRY_COST_RATE,
+            "exit_cost_rate": _TSMOM_B_V1_EXIT_COST_RATE,
+            "validated": True,
+        },
+        "short_execution_interpretation": "research_marks_on_okx_spot_prints_not_borrow_free_spot_execution",
+        "official_replay_mode": "single_batch_replay_after_fold_end",
         "buy_hold": benchmark,
         "data_snapshot_ids": {
             "ZEC": data["ZEC"]["id"],
@@ -1743,6 +1776,9 @@ async def evaluate_tsmom_b_v1():
             "atr_multiple": 2.0,
             "stake_amount": 50.0,
             "initial_capital": 100.0,
+            "cost_source_run_id": _TSMOM_B_V1_COST_SOURCE_RUN,
+            "cost_book_ts": _TSMOM_B_V1_COST_BOOK_TS,
+            "official_replay_mode": "single_batch_replay_after_fold_end",
             "grid": False,
         },
         "result": result,
