@@ -628,7 +628,7 @@ returns jsonb
 language plpgsql
 security definer
 set search_path = public, extensions
-as $
+as $func$
 declare
   v_key text;
   v_signal_id text;
@@ -687,7 +687,7 @@ begin
 
   return jsonb_build_object('signal_id', v_row.id, 'canonical_signal_id', v_row.signal_id, 'idempotent_replay', false);
 end;
-$;
+$func$;
 
 create or replace function public.paper_create_order_from_approved_signal(
   p_signal_id uuid,
@@ -701,7 +701,7 @@ returns jsonb
 language plpgsql
 security definer
 set search_path = public, extensions
-as $
+as $func$
 declare
   v_signal public.paper_signals;
   v_decision public.risk_decisions;
@@ -788,7 +788,7 @@ begin
 
   return jsonb_build_object('order_id', v_order.id, 'status', v_order.status, 'idempotent_replay', false);
 end;
-$;
+$func$;
 
 create or replace function public.paper_bind_execution_attempt(
   p_order_id uuid,
@@ -802,7 +802,7 @@ returns jsonb
 language plpgsql
 security definer
 set search_path = public, extensions
-as $
+as $func$
 declare
   v_order public.paper_orders;
   v_signal public.paper_signals;
@@ -878,7 +878,7 @@ begin
 
   return jsonb_build_object('execution_attempt_id', v_attempt.id, 'status', v_attempt.status, 'idempotent_replay', false);
 end;
-$;
+$func$;
 
 create or replace function public.paper_reserve_risk(
   p_signal_id uuid,
@@ -1484,7 +1484,7 @@ returns jsonb
 language plpgsql
 security definer
 set search_path = public
-as $
+as $func$
 declare
   v_order public.paper_orders;
   v_signal public.paper_signals;
@@ -1557,7 +1557,7 @@ begin
 
   return jsonb_build_object('order_id', v_order.id, 'status', v_order.status, 'idempotent_replay', false);
 end;
-$;
+$func$;
 
 -- Sensitive execution tables: service-role/RPC only.
 do $$
