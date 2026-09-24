@@ -8,8 +8,9 @@ import hashlib
 import json
 import zlib
 from collections import Counter
-from math import isfinite
-from statistics import median
+from datetime import datetime
+from math import isfinite, log
+from statistics import median, pstdev
 from typing import Any
 
 from .simulation import simulate
@@ -121,6 +122,169 @@ def tape_summary(trades: list[dict]) -> dict:
             "trailing_activated_share_percent": 100 * len(trail_activated) / len(trail_known) if trail_known else None,
             "trail_never_activated": len(trail_known) - len(trail_activated),
             "trail_never_activated_share_percent": 100 * (len(trail_known) - len(trail_activated)) / len(trail_known) if trail_known else None}
+
+
+def _iso_ms(value: str) -> int:
+    return int(round(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() * 1000))
+
+
+def _mean(values: list[float]) -> float | None:
+    return sum(values) / len(values) if values else None
+
+
+def entry_path_features(candles: list[dict], trade: dict, trail_start_percent: float = 1.6) -> dict:
+    """Attach pre-entry regime and post-entry path diagnostics without changing the trade."""
+    by_close = {int(c["close_time"]): i for i, c in enumerate(candles)}
+    entry_ms, exit_ms = _iso_ms(trade["entry_ts"]), _iso_ms(trade["exit_ts"])
+    index = by_close.get(entry_ms)
+    exit_index = by_close.get(exit_ms)
+    if index is None or exit_index is None or exit_index < index:
+        raise ValueError("trade_timestamp_not_in_snapshot")
+
+    entry = float(trade["entry_px"])
+
+    def prior_return(bars: int) -> float | None:
+        if index < bars:
+            return None
+        prior = float(candles[index - bars]["close"])
+        return (entry / prior - 1) * 100 if prior else None
+
+    def realized_vol(bars: int) -> float | None:
+        if index < bars:
+            return None
+        values = []
+        for j in range(index - bars + 1, index + 1):
+            before, after = float(candles[j - 1]["close"]), float(candles[j]["close"])
+            if before <= 0 or after <= 0:
+                return None
+            values.append(log(after / before) * 100)
+        return pstdev(values) if values else None
+
+    swing_start = index - 287
+    if swing_start >= 0:
+        swing = candles[swing_start:index + 1]
+        high_24h = max(float(c["high"]) for c in swing)
+        low_24h = min(float(c["low"]) for c in swing)
+        below_high = (entry / high_24h - 1) * 100 if high_24h else None
+        above_low = (entry / low_24h - 1) * 100 if low_24h else None
+        range_position = (entry - low_24h) / (high_24h - low_24h) * 100 if high_24h > low_24h else None
+    else:
+        high_24h = low_24h = below_high = above_low = range_position = None
+
+    thresholds = {
+        "time_to_trail_start_min": entry * (1 + trail_start_percent / 100),
+        "time_to_mae_1pct_min": entry * .99,
+        "time_to_mae_6pct_min": entry * .94,
+    }
+    hit: dict[str, float | None] = {key: None for key in thresholds}
+    for candle in candles[index + 1:exit_index + 1]:
+        minutes = (int(candle["close_time"]) - entry_ms) / 60_000
+        if hit["time_to_trail_start_min"] is None and float(candle["high"]) >= thresholds["time_to_trail_start_min"]:
+            hit["time_to_trail_start_min"] = minutes
+        if hit["time_to_mae_1pct_min"] is None and float(candle["low"]) <= thresholds["time_to_mae_1pct_min"]:
+            hit["time_to_mae_1pct_min"] = minutes
+        if hit["time_to_mae_6pct_min"] is None and float(candle["low"]) <= thresholds["time_to_mae_6pct_min"]:
+            hit["time_to_mae_6pct_min"] = minutes
+
+    trail_time = hit["time_to_trail_start_min"]
+    mae1_time = hit["time_to_mae_1pct_min"]
+    if trail_time is None and mae1_time is None:
+        first_path_event = "neither"
+    elif trail_time is None:
+        first_path_event = "mae_1pct"
+    elif mae1_time is None:
+        first_path_event = "trail_start"
+    elif trail_time < mae1_time:
+        first_path_event = "trail_start"
+    elif mae1_time < trail_time:
+        first_path_event = "mae_1pct"
+    else:
+        first_path_event = "same_bar"
+
+    return {
+        **trade,
+        "pre_return_1h_pct": prior_return(12),
+        "pre_return_4h_pct": prior_return(48),
+        "rv_12_bars_pct": realized_vol(12),
+        "rv_24_bars_pct": realized_vol(24),
+        "rv_72_bars_pct": realized_vol(72),
+        "high_24h": high_24h,
+        "low_24h": low_24h,
+        "distance_from_24h_high_pct": below_high,
+        "distance_above_24h_low_pct": above_low,
+        "range_position_24h_pct": range_position,
+        "entry_hour_utc": datetime.fromisoformat(trade["entry_ts"].replace("Z", "+00:00")).hour,
+        **hit,
+        "first_path_event": first_path_event,
+    }
+
+
+def entry_path_summary(trades: list[dict]) -> dict:
+    def numeric(key: str) -> list[float]:
+        return [float(t[key]) for t in trades if t.get(key) is not None]
+
+    wins = [t for t in trades if float(t["pnl_net"]) > 0]
+    losses = [t for t in trades if float(t["pnl_net"]) < 0]
+    trail = [t for t in trades if t.get("time_to_trail_start_min") is not None]
+    no_trail = [t for t in trades if t.get("time_to_trail_start_min") is None]
+    mae1_first = [t for t in trades if t.get("first_path_event") == "mae_1pct"]
+    trail_first = [t for t in trades if t.get("first_path_event") == "trail_start"]
+
+    return {
+        "n": len(trades),
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate": 100 * len(wins) / len(trades) if trades else None,
+        "trail_reached": len(trail),
+        "trail_reached_share_percent": 100 * len(trail) / len(trades) if trades else None,
+        "trail_never_reached": len(no_trail),
+        "trail_never_reached_share_percent": 100 * len(no_trail) / len(trades) if trades else None,
+        "mae_1pct_before_trail": len(mae1_first),
+        "mae_1pct_before_trail_share_percent": 100 * len(mae1_first) / len(trades) if trades else None,
+        "trail_before_mae_1pct": len(trail_first),
+        "trail_before_mae_1pct_share_percent": 100 * len(trail_first) / len(trades) if trades else None,
+        "avg_pre_return_1h_pct": _mean(numeric("pre_return_1h_pct")),
+        "avg_pre_return_4h_pct": _mean(numeric("pre_return_4h_pct")),
+        "avg_rv_12_bars_pct": _mean(numeric("rv_12_bars_pct")),
+        "avg_rv_24_bars_pct": _mean(numeric("rv_24_bars_pct")),
+        "avg_rv_72_bars_pct": _mean(numeric("rv_72_bars_pct")),
+        "avg_distance_from_24h_high_pct": _mean(numeric("distance_from_24h_high_pct")),
+        "avg_distance_above_24h_low_pct": _mean(numeric("distance_above_24h_low_pct")),
+        "avg_range_position_24h_pct": _mean(numeric("range_position_24h_pct")),
+        "median_time_to_trail_start_min": median(numeric("time_to_trail_start_min")) if numeric("time_to_trail_start_min") else None,
+        "median_time_to_mae_1pct_min": median(numeric("time_to_mae_1pct_min")) if numeric("time_to_mae_1pct_min") else None,
+        "median_time_to_mae_6pct_min": median(numeric("time_to_mae_6pct_min")) if numeric("time_to_mae_6pct_min") else None,
+        "avg_mfe": _mean(numeric("mfe")),
+        "avg_mae": _mean(numeric("mae")),
+        "win_avg_mfe": _mean([float(t["mfe"]) for t in wins if t.get("mfe") is not None]),
+        "loss_avg_mfe": _mean([float(t["mfe"]) for t in losses if t.get("mfe") is not None]),
+        "win_avg_mae": _mean([float(t["mae"]) for t in wins if t.get("mae") is not None]),
+        "loss_avg_mae": _mean([float(t["mae"]) for t in losses if t.get("mae") is not None]),
+    }
+
+
+def entry_path_audit(candles: list[dict], trades: list[dict], trail_start_percent: float = 1.6) -> dict:
+    enriched = [entry_path_features(candles, trade, trail_start_percent) for trade in trades]
+    windows = {}
+    for name in ("wf1", "wf2", "wf3"):
+        group = [t for t in enriched if t.get("window") == name]
+        windows[name] = entry_path_summary(group)
+    trail_groups = {
+        "trail_reached": entry_path_summary([t for t in enriched if t.get("time_to_trail_start_min") is not None]),
+        "trail_never_reached": entry_path_summary([t for t in enriched if t.get("time_to_trail_start_min") is None]),
+    }
+    outcome_groups = {
+        "wins": entry_path_summary([t for t in enriched if float(t["pnl_net"]) > 0]),
+        "losses": entry_path_summary([t for t in enriched if float(t["pnl_net"]) < 0]),
+    }
+    return {
+        "summary": entry_path_summary(enriched),
+        "windows": windows,
+        "trail_groups": trail_groups,
+        "outcome_groups": outcome_groups,
+        "trades": enriched,
+    }
+
 
 def matches_target(row: dict) -> bool:
     expected = AUDIT_TARGETS.get(row.get("pair"))
