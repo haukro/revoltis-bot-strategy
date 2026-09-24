@@ -87,6 +87,7 @@ declare
   v_exit_fees numeric(30,12) := 0;
   v_remaining_entry_fees numeric(30,12) := 0;
   v_realized numeric(30,12) := 0;
+  v_lifetime_realized numeric(30,12) := 0;
   v_alloc_entry_fee numeric(30,12);
   v_gross_reduction numeric(30,12);
   v_realized_delta numeric(30,12);
@@ -122,7 +123,14 @@ begin
 
       if v_qty = 0 then
         v_side := v_expected_side;
-        v_opened_at := coalesce(v_opened_at,r.filled_at);
+        v_avg := 0;
+        v_gross := 0;
+        v_cumulative_fees := 0;
+        v_entry_fees := 0;
+        v_exit_fees := 0;
+        v_remaining_entry_fees := 0;
+        v_realized := 0;
+        v_opened_at := r.filled_at;
         v_closed_at := null;
       end if;
 
@@ -191,6 +199,7 @@ begin
       v_exit_fees := v_exit_fees+r.fee_amount;
       v_remaining_entry_fees := greatest(0,v_remaining_entry_fees-v_alloc_entry_fee);
       v_realized := v_realized+v_realized_delta;
+      v_lifetime_realized := v_lifetime_realized+v_realized_delta;
 
       if v_qty <= 0.00000001 then
         v_qty := 0;
@@ -223,6 +232,7 @@ begin
     'exit_fees',v_exit_fees,
     'remaining_entry_fees',v_remaining_entry_fees,
     'realized_pnl',v_realized,
+    'lifetime_realized_pnl',v_lifetime_realized,
     'status',v_status,
     'opened_at',v_opened_at,
     'closed_at',v_closed_at,
@@ -552,6 +562,16 @@ begin
       public.paper_reconstruct_position(p.strategy_version_id,p.pair) as r
     from public.paper_positions p
   ),
+  active_position as (
+    select *
+    from public.paper_positions
+    where status in ('OPENING','OPEN','EXIT_PENDING','CLOSING')
+  ),
+  position_realized_aggregate as (
+    select strategy_version_id,pair,coalesce(sum(realized_pnl),0)::numeric as lifetime_realized
+    from public.paper_positions
+    group by strategy_version_id,pair
+  ),
   fill_position as (
     select
       'CHK_FILL_POSITION'::text as check_code,
@@ -565,9 +585,9 @@ begin
         'stored_quantity',p.quantity,
         'reconstructed_quantity',r.r->>'quantity',
         'stored_realized_pnl',p.realized_pnl,
-        'reconstructed_realized_pnl',r.r->>'realized_pnl'
+        'reconstructed_current_realized_pnl',r.r->>'realized_pnl'
       ) as proof
-    from public.paper_positions p
+    from active_position p
     join reconstructed r
       on r.strategy_version_id=p.strategy_version_id and r.pair=p.pair
     where coalesce((r.r->>'valid')::boolean,false) is not true
@@ -579,7 +599,49 @@ begin
        or abs(coalesce((r.r->>'exit_fees')::numeric,0)-p.exit_fees)>0.00000001
        or abs(coalesce((r.r->>'remaining_entry_fees')::numeric,0)-p.remaining_entry_fees)>0.00000001
        or abs(coalesce((r.r->>'realized_pnl')::numeric,0)-p.realized_pnl)>0.00000001
-       or coalesce(r.r->>'status','') is distinct from p.status
+       or coalesce(r.r->>'status','') not in ('OPEN','OPENING','EXIT_PENDING','CLOSING')
+  ),
+  closed_without_active_mismatch as (
+    select
+      'CHK_FILL_POSITION'::text as check_code,
+      'CRITICAL'::text as severity,
+      'position_ledger'::text as entity_type,
+      null::uuid as entity_id,
+      jsonb_build_object(
+        'strategy_version_id',r.strategy_version_id,
+        'pair',r.pair,
+        'reconstructed_status',r.r->>'status',
+        'reconstructed_quantity',r.r->>'quantity'
+      ) as proof
+    from reconstructed r
+    where not exists(
+      select 1 from active_position p
+      where p.strategy_version_id=r.strategy_version_id and p.pair=r.pair
+    )
+      and (
+        coalesce((r.r->>'valid')::boolean,false) is not true
+        or coalesce((r.r->>'quantity')::numeric,0)<>0
+        or coalesce(r.r->>'status','')<>'CLOSED'
+      )
+  ),
+  lifetime_realized_mismatch as (
+    select
+      'CHK_FILL_POSITION'::text as check_code,
+      'CRITICAL'::text as severity,
+      'position_ledger'::text as entity_type,
+      null::uuid as entity_id,
+      jsonb_build_object(
+        'strategy_version_id',r.strategy_version_id,
+        'pair',r.pair,
+        'stored_lifetime_realized',coalesce(a.lifetime_realized,0),
+        'reconstructed_lifetime_realized',r.r->>'lifetime_realized_pnl'
+      ) as proof
+    from reconstructed r
+    left join position_realized_aggregate a
+      on a.strategy_version_id=r.strategy_version_id and a.pair=r.pair
+    where abs(
+      coalesce((r.r->>'lifetime_realized_pnl')::numeric,0)-coalesce(a.lifetime_realized,0)
+    )>0.00000001
   ),
   exposure_calc as (
     select
@@ -767,6 +829,8 @@ begin
     union all select * from order_companion
     union all select * from position_companion
     union all select * from fill_position
+    union all select * from closed_without_active_mismatch
+    union all select * from lifetime_realized_mismatch
     union all select * from exposure_mismatch
     union all select * from daily_mismatch
     union all select * from audit_bad
@@ -859,18 +923,6 @@ end;
 $func$;
 
 -- Phase 2 reconciliation RPCs are internal/service-role only.
-do $secure$
-declare
-  r record;
-begin
-  foreach r in array array[]::record[] loop
-    null;
-  end loop;
-exception when others then
-  null;
-end;
-$secure$;
-
 alter table public.position_effect_heads enable row level security;
 revoke all on table public.position_effect_heads from anon,authenticated;
 grant all on table public.position_effect_heads to service_role;
