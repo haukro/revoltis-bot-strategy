@@ -756,7 +756,7 @@ async def internal_paper_outbox_tick(
                     continue
 
                 risk = await supabase_rpc(
-                    "paper_reserve_risk",
+                    "paper_reserve_risk_guarded",
                     {
                         "p_signal_id": entity_id,
                         "p_policy_version_id": binding["risk_policy_version_id"],
@@ -844,7 +844,7 @@ async def internal_paper_outbox_tick(
                 )
                 attempt_seq = int((item.get("payload") or {}).get("attempt_seq") or 1)
                 bound = await supabase_rpc(
-                    "paper_bind_execution_attempt",
+                    "paper_bind_execution_attempt_guarded",
                     {
                         "p_outbox_id": outbox_id,
                         "p_lease_generation": generation,
@@ -857,7 +857,22 @@ async def internal_paper_outbox_tick(
                     },
                 )
                 if not (bound or {}).get("execution_attempt_id"):
-                    # Lease lost or event became terminal while fetching market data.
+                    reason = (bound or {}).get("reason")
+                    if reason == "ORDER_EXPIRED":
+                        await supabase_rpc(
+                            "paper_terminalize_order",
+                            {
+                                "p_order_id": entity_id,
+                                "p_terminal_state": "EXPIRED",
+                                "p_reason_code": "ORDER_AGE_EXPIRED",
+                                "p_worker_id": worker,
+                                "p_software_commit": commit,
+                                "p_account_key": "paper-default",
+                            },
+                        )
+                        await _paper_ack(outbox_id, worker, generation, None)
+                        processed += 1
+                    # STALE_LEASE / terminal race remains a no-op for this worker.
                     continue
 
                 bound_snapshot_id = bound.get("market_snapshot_id") or snapshot["id"]
@@ -922,7 +937,7 @@ async def internal_paper_outbox_tick(
                 filled_at = datetime.fromtimestamp(provider_ts_ms / 1000, UTC).isoformat()
 
                 applied = await supabase_rpc(
-                    "paper_apply_fill",
+                    "paper_apply_fill_guarded",
                     {
                         "p_outbox_id": outbox_id,
                         "p_lease_generation": generation,
@@ -944,6 +959,25 @@ async def internal_paper_outbox_tick(
                     ack = await _paper_ack(outbox_id, worker, generation, None)
                     if (ack or {}).get("acknowledged"):
                         processed += 1
+                    continue
+
+                apply_reason = (applied or {}).get("reason")
+                if apply_reason in ("ORDER_EXPIRED", "STALE_MARKET_SNAPSHOT"):
+                    await supabase_rpc(
+                        "paper_terminalize_order",
+                        {
+                            "p_order_id": entity_id,
+                            "p_terminal_state": "EXPIRED" if apply_reason == "ORDER_EXPIRED" else "FAILED",
+                            "p_reason_code": "ORDER_AGE_EXPIRED" if apply_reason == "ORDER_EXPIRED" else "STALE_MARKET_SNAPSHOT",
+                            "p_worker_id": worker,
+                            "p_software_commit": commit,
+                            "p_account_key": "paper-default",
+                        },
+                    )
+                    await _paper_ack(outbox_id, worker, generation, None)
+                    processed += 1
+                # STALE_LEASE and other fenced no-op outcomes are left for the
+                # current lease owner / next recovery pass.
                 continue
 
             # Unknown events are released for retry and surfaced as worker errors.
