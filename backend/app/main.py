@@ -38,6 +38,8 @@ from .paper_ops import (
     canonical_book_payload,
     canonical_book_hash,
     walk_canonical_quote_notional,
+    quote_fee_amount,
+    remaining_quote_notional,
     smoke_cases as paper_ops_smoke_cases,
 )
 from .rebound_experiment import (
@@ -870,22 +872,22 @@ async def internal_paper_outbox_tick(
                     asks = fetched["asks"]
                     provider_ts_ms = int(fetched["provider_ts_ms"])
 
-                remaining_notional = max(
-                    0.0,
-                    float(order["intended_notional"]) - float(order.get("filled_notional") or 0),
+                remaining_notional = remaining_quote_notional(
+                    order["intended_notional"],
+                    order.get("filled_notional") or 0,
                 )
-                if remaining_notional <= 0:
+                if remaining_notional == "0":
                     await _paper_ack(outbox_id, worker, generation, None)
                     processed += 1
                     continue
 
                 fill = walk_canonical_quote_notional(
                     side=order["side"],
-                    quote_notional=str(remaining_notional),
+                    quote_notional=remaining_notional,
                     bids=bids,
                     asks=asks,
                 )
-                if float(fill["filled_quote_notional"]) <= 0:
+                if fill["filled_quote_notional"] == "0":
                     await _paper_ack(outbox_id, worker, generation, "NO_EXECUTABLE_DEPTH")
                     errors += 1
                     continue
@@ -911,7 +913,7 @@ async def internal_paper_outbox_tick(
                     f"order_id=eq.{entity_id}&select=fill_seq&order=fill_seq.desc&limit=1",
                 )
                 fill_seq = int(prior_fills[0]["fill_seq"]) + 1 if prior_fills else 1
-                fee_amount = float(fill["filled_quote_notional"]) * float(fee_rate)
+                fee_amount = quote_fee_amount(fill["filled_quote_notional"], fee_rate)
                 filled_at = datetime.fromtimestamp(provider_ts_ms / 1000, UTC).isoformat()
 
                 applied = await supabase_rpc(
@@ -924,7 +926,7 @@ async def internal_paper_outbox_tick(
                         "p_fill_seq": fill_seq,
                         "p_fill_quantity": fill["filled_base_quantity"],
                         "p_fill_price": fill["vwap"],
-                        "p_fee_amount": str(fee_amount),
+                        "p_fee_amount": fee_amount,
                         "p_spread_bps": fill["spread_bps"],
                         "p_impact_bps": fill["impact_bps"],
                         "p_filled_at": filled_at,

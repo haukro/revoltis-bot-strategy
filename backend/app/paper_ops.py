@@ -6,11 +6,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
 from typing import Any, Iterable
 
 
 MAX_CANONICAL_FRACTIONAL_DIGITS = 18
+EXECUTION_DECIMAL_PLACES = 12
+EXECUTION_QUANTUM = Decimal("0.000000000001")
 
 
 def _canonical_decimal(value: Any) -> str:
@@ -37,6 +39,46 @@ def _canonical_decimal(value: Any) -> str:
     if s in ("-0", ""):
         s = "0"
     return s
+
+
+def _execution_decimal(value: Decimal) -> str:
+    """Canonical persisted execution value at DB NUMERIC(30,12) precision."""
+    if not value.is_finite():
+        raise ValueError("non_finite_execution_decimal")
+    quantized = value.quantize(EXECUTION_QUANTUM, rounding=ROUND_HALF_EVEN)
+    s = format(quantized, "f").rstrip("0").rstrip(".")
+    if s in ("-0", ""):
+        return "0"
+    return s
+
+
+def quantize_execution_decimal(value: Any) -> str:
+    try:
+        d = Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise ValueError("invalid_execution_decimal") from exc
+    return _execution_decimal(d)
+
+
+def quote_fee_amount(quote_notional: Any, fee_rate: Any) -> str:
+    try:
+        notional = Decimal(str(quote_notional))
+        rate = Decimal(str(fee_rate))
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise ValueError("invalid_fee_input") from exc
+    if notional < 0 or rate < 0 or not notional.is_finite() or not rate.is_finite():
+        raise ValueError("invalid_fee_input")
+    return _execution_decimal(notional * rate)
+
+
+def remaining_quote_notional(intended: Any, filled: Any) -> str:
+    try:
+        remaining = Decimal(str(intended)) - Decimal(str(filled))
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise ValueError("invalid_notional_input") from exc
+    if remaining < 0:
+        remaining = Decimal("0")
+    return _execution_decimal(remaining)
 
 
 def _normalize_levels(
@@ -174,11 +216,11 @@ def walk_canonical_quote_notional(
     if base_filled <= 0:
         return {
             "side": side,
-            "requested_quote_notional": _canonical_decimal(requested),
+            "requested_quote_notional": _execution_decimal(requested),
             "filled_quote_notional": "0",
             "filled_base_quantity": "0",
             "vwap": None,
-            "best_price": _canonical_decimal(best),
+            "best_price": _execution_decimal(best),
             "spread_bps": None,
             "impact_bps": None,
             "levels_used": 0,
@@ -196,13 +238,13 @@ def walk_canonical_quote_notional(
 
     return {
         "side": side,
-        "requested_quote_notional": _canonical_decimal(requested),
-        "filled_quote_notional": _canonical_decimal(quote_filled),
-        "filled_base_quantity": _canonical_decimal(base_filled),
-        "vwap": _canonical_decimal(vwap),
-        "best_price": _canonical_decimal(best),
-        "spread_bps": _canonical_decimal(spread_bps),
-        "impact_bps": _canonical_decimal(impact_bps),
+        "requested_quote_notional": _execution_decimal(requested),
+        "filled_quote_notional": _execution_decimal(quote_filled),
+        "filled_base_quantity": _execution_decimal(base_filled),
+        "vwap": _execution_decimal(vwap),
+        "best_price": _execution_decimal(best),
+        "spread_bps": _execution_decimal(spread_bps),
+        "impact_bps": _execution_decimal(impact_bps),
         "levels_used": levels_used,
         "complete": complete,
     }

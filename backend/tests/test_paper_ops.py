@@ -2,6 +2,8 @@ from app.paper_ops import (
     canonical_book_hash,
     canonical_book_payload,
     walk_canonical_quote_notional,
+    quote_fee_amount,
+    remaining_quote_notional,
     smoke_cases,
 )
 
@@ -91,3 +93,8 @@ def test_decimal_book_walk_partial_and_complete():
     assert full["complete"] is True
     assert full["levels_used"] == 2
     assert full["vwap"] is not None
+
+
+def test_execution_money_helpers_match_db_precision():
+    assert remaining_quote_notional("50", "20.123456789012") == "29.876543210988"
+    assert quote_fee_amount("50", "0.001") == "0.05"
