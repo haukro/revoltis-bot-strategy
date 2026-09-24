@@ -32,6 +32,7 @@ from .tsmom_c_v1 import (
     smoke_cases as tsmom_c_v1_smoke_cases,
 )
 from .momentum_prescreen import pack_market_series, unpack_market_series, analyze_block, pooled_analysis
+from .paper_execution import smoke_cases as paper_execution_smoke_cases
 from .rebound_experiment import (
     filter_b as rebound_filter_b,
     rebound_confirmation_context,
@@ -250,6 +251,71 @@ async def supabase_upsert_many(table: str, records: list[dict]) -> list[dict]:
         response = await client.post(f"{url}/rest/v1/{table}?on_conflict=id", headers=headers, json=records)
         response.raise_for_status()
         return response.json()
+
+
+async def supabase_rpc(function_name: str, payload: dict[str, Any]) -> Any:
+    """Call a Supabase RPC using the service role. No local in-memory fallback."""
+    url = os.getenv("SUPABASE_URL")
+    if not url or not os.getenv("SUPABASE_SERVICE_ROLE_KEY"):
+        raise HTTPException(503, "persistence_unavailable: RPC vyžaduje Supabase.")
+    async with httpx.AsyncClient(timeout=15) as client:
+        response = await client.post(
+            f"{url}/rest/v1/rpc/{function_name}",
+            headers=supabase_headers(),
+            json=payload,
+        )
+        response.raise_for_status()
+        try:
+            return response.json()
+        except ValueError:
+            return None
+
+
+@app.get("/api/paper/spec-004/smoke")
+async def paper_spec_004_smoke():
+    """Synthetic-only checks for the locked strategy-neutral execution primitives."""
+    checks = paper_execution_smoke_cases()
+    return {
+        "status": "passed" if all(checks.values()) else "failed",
+        "checks": checks,
+        "live_trading": False,
+        "alpha_logic_touched": False,
+        "strategy_b_modified": False,
+        "spec": "IMPLEMENTATION-SPEC-004",
+        "spec_commit": "d94f624a685941c1eba9f3e1fe166371422437ce",
+    }
+
+
+@app.get("/api/paper/system-health")
+async def paper_system_health():
+    """Blind-safe operational health only. No strategy/trade performance."""
+    require_durable_production_store()
+    rows = await supabase_get("kill_switch_state", "account_key=eq.paper-default&limit=1")
+    state = rows[0] if rows else None
+    return {
+        "status": "ok" if state else "degraded",
+        "persistence": persistence_status(),
+        "kill_switch": {
+            "state": (state or {}).get("state"),
+            "reason_code": (state or {}).get("reason_code"),
+            "updated_at": (state or {}).get("updated_at"),
+        },
+        "live_trading": False,
+        "blind_safe": True,
+    }
+
+
+@app.get("/api/paper/market-health")
+async def paper_market_health():
+    """Blind-safe feed health. Deliberately contains no fills, sides or performance."""
+    require_durable_production_store()
+    rows = await supabase_get("market_data_health", "order=updated_at.desc&limit=100")
+    return {
+        "status": "ok",
+        "rows": rows,
+        "live_trading": False,
+        "blind_safe": True,
+    }
 
 
 @app.get("/api/health")
