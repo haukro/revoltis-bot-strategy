@@ -4,6 +4,10 @@ Standalone research engine. It does not reuse Strategy A entry/exit logic.
 """
 from __future__ import annotations
 
+import base64
+import gzip
+import hashlib
+import json
 from dataclasses import dataclass
 from math import isfinite
 from statistics import median
@@ -14,6 +18,46 @@ ONE_HOUR_MS = 3_600_000
 ATR_PERIOD = 24
 BREAKOUT_N = 24
 ATR_MULTIPLE = 2.0
+
+
+def _digest(value: Any) -> str:
+    return hashlib.sha256(json.dumps(value, separators=(",", ":"), sort_keys=False).encode()).hexdigest()
+
+
+def pack_ohlc_snapshot(candles: list[dict[str, Any]]) -> dict[str, Any]:
+    rows = [
+        [
+            int(c["open_time"]), int(c["close_time"]),
+            float(c["open"]), float(c["high"]), float(c["low"]), float(c["close"]),
+        ]
+        for c in candles
+    ]
+    raw = json.dumps(rows, separators=(",", ":")).encode()
+    return {
+        "encoding": "gzip+base64",
+        "count": len(rows),
+        "sha256": _digest(rows),
+        "data": base64.b64encode(gzip.compress(raw, mtime=0)).decode(),
+    }
+
+
+def unpack_ohlc_snapshot(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+    if snapshot.get("encoding") != "gzip+base64":
+        raise ValueError("invalid_snapshot_encoding")
+    rows = json.loads(gzip.decompress(base64.b64decode(snapshot["data"])))
+    if len(rows) != int(snapshot["count"]) or _digest(rows) != snapshot["sha256"]:
+        raise ValueError("snapshot_integrity_error")
+    candles = [
+        {
+            "open_time": int(row[0]), "close_time": int(row[1]),
+            "open": float(row[2]), "high": float(row[3]),
+            "low": float(row[4]), "close": float(row[5]),
+        }
+        for row in rows
+    ]
+    if not candles or any(int(b["open_time"]) - int(a["open_time"]) != FIVE_MIN_MS for a, b in zip(candles, candles[1:])):
+        raise ValueError("non_contiguous_5m_snapshot")
+    return candles
 
 
 @dataclass(frozen=True)
@@ -226,7 +270,11 @@ def simulate_b_v1(
 
         # Signal from the immediately preceding fully closed 1h candle.
         available_hour_close = _hour_close_before(open_time)
-        signal_side = eval_signal_times.get(available_hour_close)
+        signal_side = (
+            eval_signal_times.get(available_hour_close)
+            if open_time == available_hour_close + 1
+            else None
+        )
 
         # Whether the position existed when the signal became actionable is fixed
         # before any stop/gap processing on this 5m candle.
@@ -355,6 +403,7 @@ def simulate_b_v1(
         }
 
     eval_minutes = (evaluation_end_ms - evaluation_start_ms + 1) / 60_000
+    total_hold_minutes = sum(float(t["hold_minutes"]) for t in trades)
     metrics = {
         "signals_1h": raw_signal_count,
         "ignored_signals_while_open": ignored_signals_while_open,
@@ -368,7 +417,7 @@ def simulate_b_v1(
         "long": side_metrics(longs),
         "short": side_metrics(shorts),
         "max_drawdown_percent": round(max_drawdown, 6),
-        "time_in_market_percent": round(100 * (in_market_ms / 60_000) / eval_minutes, 6) if eval_minutes else None,
+        "time_in_market_percent": round(100 * total_hold_minutes / eval_minutes, 6) if eval_minutes else None,
         "average_hold_minutes": round(sum(float(t["hold_minutes"]) for t in trades) / len(trades), 6) if trades else None,
         "btc_same_direction_overlap_count": btc_overlap,
         "btc_same_direction_overlap_percent": round(100 * btc_overlap / len(trades), 6) if trades else None,
