@@ -4,6 +4,7 @@ import os
 import re
 import asyncio
 import math
+import secrets
 from uuid import uuid4
 from datetime import UTC, datetime, timedelta
 from statistics import median
@@ -33,6 +34,7 @@ from .tsmom_c_v1 import (
 )
 from .momentum_prescreen import pack_market_series, unpack_market_series, analyze_block, pooled_analysis
 from .paper_execution import smoke_cases as paper_execution_smoke_cases
+from .paper_ops import smoke_cases as paper_ops_smoke_cases
 from .rebound_experiment import (
     filter_b as rebound_filter_b,
     rebound_confirmation_context,
@@ -40,6 +42,15 @@ from .rebound_experiment import (
     paired_metrics,
     smoke_cases as rebound_smoke_cases,
 )
+
+
+class KillSwitchRequest(BaseModel):
+    target_state: Literal["HALT_NEW_ENTRIES", "HALTED"]
+    reason_code: str = Field(min_length=1, max_length=160)
+
+
+class RecoveryRequest(BaseModel):
+    reason_code: str = Field(min_length=1, max_length=160)
 
 
 class StrategySettings(BaseModel):
@@ -271,6 +282,23 @@ async def supabase_rpc(function_name: str, payload: dict[str, Any]) -> Any:
             return None
 
 
+def _require_internal_secret(provided: str | None, env_name: str) -> None:
+    expected = os.getenv(env_name)
+    if not expected:
+        raise HTTPException(503, f"{env_name.lower()}_not_configured")
+    if not provided or not secrets.compare_digest(provided, expected):
+        raise HTTPException(401, "unauthorized")
+
+
+async def _paper_ops_snapshot() -> dict[str, Any]:
+    result = await supabase_rpc("paper_ops_health_snapshot", {"p_account_key": "paper-default"})
+    if isinstance(result, dict):
+        return result
+    if isinstance(result, list) and result and isinstance(result[0], dict):
+        return result[0]
+    raise HTTPException(503, "ops_health_unavailable")
+
+
 @app.get("/api/paper/spec-004/smoke")
 async def paper_spec_004_smoke():
     """Synthetic-only checks for the locked strategy-neutral execution primitives."""
@@ -316,6 +344,141 @@ async def paper_market_health():
         "live_trading": False,
         "blind_safe": True,
     }
+
+
+@app.get("/api/paper/spec-005/smoke")
+async def paper_spec_005_smoke():
+    checks = paper_ops_smoke_cases()
+    return {
+        "status": "passed" if all(checks.values()) else "failed",
+        "checks": checks,
+        "live_trading": False,
+        "alpha_logic_touched": False,
+        "strategy_b_modified": False,
+        "spec": "IMPLEMENTATION-SPEC-005",
+        "spec_commit": "78590fea472050021bddaa62ba199aa6fe95611d",
+    }
+
+
+@app.get("/api/paper/queue-health")
+async def paper_queue_health():
+    require_durable_production_store()
+    snapshot = await _paper_ops_snapshot()
+    return {
+        "queue": snapshot.get("queue", {}),
+        "blind_safe": True,
+        "live_trading": False,
+    }
+
+
+@app.get("/api/paper/worker-health")
+async def paper_worker_health():
+    require_durable_production_store()
+    snapshot = await _paper_ops_snapshot()
+    return {
+        "workers": snapshot.get("workers", []),
+        "blind_safe": True,
+        "live_trading": False,
+    }
+
+
+@app.get("/api/paper/reconciliation")
+async def paper_reconciliation_health():
+    require_durable_production_store()
+    snapshot = await _paper_ops_snapshot()
+    return {
+        "reconciliation": snapshot.get("reconciliation", {}),
+        "blind_safe": True,
+        "live_trading": False,
+    }
+
+
+@app.get("/api/paper/audit-health")
+async def paper_audit_health():
+    require_durable_production_store()
+    snapshot = await _paper_ops_snapshot()
+    reconciliation = snapshot.get("reconciliation", {})
+    latest = reconciliation.get("latest", {}) if isinstance(reconciliation, dict) else {}
+    return {
+        "audit_integrity_passed": latest.get("audit_integrity_passed"),
+        "blind_safe": True,
+        "live_trading": False,
+    }
+
+
+@app.get("/api/paper/kill-switch")
+async def paper_kill_switch_status():
+    require_durable_production_store()
+    snapshot = await _paper_ops_snapshot()
+    return {
+        "kill_switch": snapshot.get("kill_switch", {}),
+        "blind_safe": True,
+        "live_trading": False,
+    }
+
+
+@app.get("/api/paper/blind-status")
+async def paper_blind_status():
+    require_durable_production_store()
+    snapshot = await _paper_ops_snapshot()
+    return {
+        "blind": snapshot.get("blind", {}),
+        "blind_safe": True,
+        "live_trading": False,
+    }
+
+
+@app.post("/api/paper/kill-switch/activate")
+async def paper_kill_switch_activate(
+    request: KillSwitchRequest,
+    x_ops_admin_token: str | None = Header(default=None, alias="X-Ops-Admin-Token"),
+):
+    require_durable_production_store()
+    _require_internal_secret(x_ops_admin_token, "OPS_ADMIN_TOKEN")
+    return await supabase_rpc(
+        "paper_set_kill_switch_state",
+        {
+            "p_target_state": request.target_state,
+            "p_reason_code": request.reason_code,
+            "p_actor": "ops-api",
+            "p_software_commit": os.getenv("VERCEL_GIT_COMMIT_SHA", "unknown"),
+            "p_account_key": "paper-default",
+        },
+    )
+
+
+@app.post("/api/paper/kill-switch/request-recovery")
+async def paper_kill_switch_request_recovery(
+    request: RecoveryRequest,
+    x_ops_admin_token: str | None = Header(default=None, alias="X-Ops-Admin-Token"),
+):
+    require_durable_production_store()
+    _require_internal_secret(x_ops_admin_token, "OPS_ADMIN_TOKEN")
+    return await supabase_rpc(
+        "paper_request_recovery",
+        {
+            "p_reason_code": request.reason_code,
+            "p_actor": "ops-api",
+            "p_software_commit": os.getenv("VERCEL_GIT_COMMIT_SHA", "unknown"),
+            "p_account_key": "paper-default",
+        },
+    )
+
+
+@app.post("/api/paper/kill-switch/enable")
+async def paper_kill_switch_enable(
+    x_ops_admin_token: str | None = Header(default=None, alias="X-Ops-Admin-Token"),
+):
+    require_durable_production_store()
+    _require_internal_secret(x_ops_admin_token, "OPS_ADMIN_TOKEN")
+    return await supabase_rpc(
+        "paper_enable_after_recovery",
+        {
+            "p_actor": "ops-api",
+            "p_software_commit": os.getenv("VERCEL_GIT_COMMIT_SHA", "unknown"),
+            "p_account_key": "paper-default",
+        },
+    )
 
 
 @app.get("/api/health")
