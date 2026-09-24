@@ -481,6 +481,77 @@ async def paper_kill_switch_enable(
     )
 
 
+@app.post("/api/internal/paper/reconcile")
+async def internal_paper_reconcile(
+    x_paper_scheduler_token: str | None = Header(default=None, alias="X-Paper-Scheduler-Token"),
+):
+    """Run one bounded reconciliation pass. Server/scheduler only."""
+    require_durable_production_store()
+    _require_internal_secret(x_paper_scheduler_token, "PAPER_SCHEDULER_TOKEN")
+    run_id = str(uuid4())
+    commit = os.getenv("VERCEL_GIT_COMMIT_SHA", "unknown")
+    await supabase_rpc(
+        "paper_record_worker_heartbeat",
+        {
+            "p_worker_name": "paper-reconciliation-worker",
+            "p_run_id": run_id,
+            "p_phase": "START",
+            "p_status": "RUNNING",
+            "p_claimed_count": 0,
+            "p_processed_count": 0,
+            "p_error_code": None,
+            "p_software_commit": commit,
+        },
+    )
+    try:
+        result = await supabase_rpc(
+            "paper_run_reconciliation",
+            {
+                "p_account_key": "paper-default",
+                "p_worker_id": "paper-reconciliation-worker",
+                "p_software_commit": commit,
+            },
+        )
+    except Exception:
+        try:
+            await supabase_rpc(
+                "paper_record_worker_heartbeat",
+                {
+                    "p_worker_name": "paper-reconciliation-worker",
+                    "p_run_id": run_id,
+                    "p_phase": "COMPLETE",
+                    "p_status": "FAILED",
+                    "p_claimed_count": 0,
+                    "p_processed_count": 0,
+                    "p_error_code": "RECONCILIATION_RPC_FAILED",
+                    "p_software_commit": commit,
+                },
+            )
+        finally:
+            raise
+
+    await supabase_rpc(
+        "paper_record_worker_heartbeat",
+        {
+            "p_worker_name": "paper-reconciliation-worker",
+            "p_run_id": run_id,
+            "p_phase": "COMPLETE",
+            "p_status": "IDLE" if (result or {}).get("status") in ("PASSED", "WARNING") else "DEGRADED",
+            "p_claimed_count": 0,
+            "p_processed_count": 1 if (result or {}).get("started") else 0,
+            "p_error_code": None if (result or {}).get("status") in ("PASSED", "WARNING") else "RECONCILIATION_CRITICAL",
+            "p_software_commit": commit,
+        },
+    )
+    return {
+        "status": "ok",
+        "reconciliation": result,
+        "live_trading": False,
+        "alpha_logic_touched": False,
+        "strategy_b_modified": False,
+    }
+
+
 @app.get("/api/health")
 async def health():
     configured = bool(os.getenv("SUPABASE_URL") and os.getenv("SUPABASE_SERVICE_ROLE_KEY"))
