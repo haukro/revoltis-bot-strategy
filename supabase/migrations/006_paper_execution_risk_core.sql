@@ -1152,6 +1152,22 @@ begin
     raise exception 'invalid_fill_input';
   end if;
 
+  v_fill_key := encode(
+    extensions.digest(
+      convert_to('FILL|' || p_order_id::text || '|' || p_fill_seq::text || '|' || p_execution_attempt_id::text, 'UTF8'),
+      'sha256'
+    ),
+    'hex'
+  );
+
+  select id into v_fill_id
+  from public.paper_fills
+  where idempotency_key = v_fill_key;
+
+  if found then
+    return jsonb_build_object('fill_id', v_fill_id, 'idempotent_replay', true);
+  end if;
+
   select * into v_order from public.paper_orders where id = p_order_id for update;
   if not found then raise exception 'order_not_found'; end if;
 
@@ -1213,19 +1229,6 @@ begin
 
   select * into v_signal from public.paper_signals where id = v_order.signal_id;
   if not found then raise exception 'signal_missing'; end if;
-
-  v_fill_key := encode(
-    extensions.digest(
-      convert_to('FILL|' || p_order_id::text || '|' || p_fill_seq::text || '|' || p_execution_attempt_id::text, 'UTF8'),
-      'sha256'
-    ),
-    'hex'
-  );
-
-  select id into v_fill_id from public.paper_fills where idempotency_key = v_fill_key;
-  if found then
-    return jsonb_build_object('fill_id', v_fill_id, 'idempotent_replay', true);
-  end if;
 
   if exists (
     select 1 from public.paper_fills
