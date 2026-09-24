@@ -6,7 +6,7 @@ import pytest
 
 from app.optimizer import aggregate_metrics, optimize, walk_forward_windows
 from app.simulation import simulate
-from app.trade_audit import (AUDIT_TARGETS, digest, pack_snapshot, replay_validation,
+from app.trade_audit import (AUDIT_TARGETS, digest, entry_path_audit, pack_snapshot, replay_validation,
                              tape_summary, trade_tape, unpack_snapshot)
 from test_simulation import candles, settings
 
@@ -70,6 +70,43 @@ def test_max_no_trail_reason_is_named_from_engine_and_keeps_hold_and_trail_flags
     assert summary["exit_reasons"]["other"]["n"] == 0
     assert summary["timeout_negative"] == 1
     assert summary["trail_never_activated"] == 1
+
+
+def test_entry_path_audit_uses_only_pre_entry_state_and_excludes_entry_candle_from_path_hits():
+    data = candles([100 + i * .1 for i in range(320)])
+    entry_index = 300
+    entry = float(data[entry_index]["close"])
+    data[entry_index].update(high=entry * 1.10, low=entry * .80)  # must not count post-entry
+    data[entry_index + 1].update(high=entry * 1.005, low=entry * .985)
+    data[entry_index + 2].update(high=entry * 1.02, low=entry * .995)
+    trade = {
+        "window": "wf1",
+        "entry_ts": data[entry_index]["close_time_iso"] if "close_time_iso" in data[entry_index] else None,
+    }
+    from datetime import UTC, datetime
+    def iso(ms):
+        return datetime.fromtimestamp(ms / 1000, UTC).isoformat()
+    trade = {
+        "window": "wf1",
+        "entry_ts": iso(data[entry_index]["close_time"]),
+        "exit_ts": iso(data[entry_index + 2]["close_time"]),
+        "entry_px": entry,
+        "exit_px": float(data[entry_index + 2]["close"]),
+        "pnl_net": 1.0,
+        "mfe": 2.0,
+        "mae": -1.5,
+    }
+    result = entry_path_audit(data, [trade], 1.6)
+    row = result["trades"][0]
+    assert row["pre_return_1h_pct"] is not None
+    assert row["pre_return_4h_pct"] is not None
+    assert row["rv_12_bars_pct"] is not None
+    assert row["distance_from_24h_high_pct"] is not None
+    assert row["time_to_mae_1pct_min"] == 1
+    assert row["time_to_trail_start_min"] == 2
+    assert row["first_path_event"] == "mae_1pct"
+    assert result["summary"]["n"] == 1
+    assert result["windows"]["wf1"]["wins"] == 1
 
 
 def test_optimizer_keeps_validation_tape_but_never_training_or_rejected_holdout():
