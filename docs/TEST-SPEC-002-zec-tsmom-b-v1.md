@@ -299,6 +299,9 @@ This is exactly 90 days.
 Rules:
 
 - pre-fold bars may seed the 24-bar breakout range and Wilder ATR only
+- ZEC warmup is exactly **24 fully closed 1h bars before fold_start**; together with the first eligible signal bar this provides the first 24 TR observations for the locked Wilder ATR seed
+- BTC warmup is exactly **25 fully closed 1h bars before fold_start** so the earliest ZEC trade can evaluate the BTC `T-1h` breakout using its own preceding 24-bar range
+- the extra BTC warmup is diagnostic-data support only and does not enter the ZEC signal, ATR, entry or exit engine
 - no trade may have `entry_time < 2026-09-24 12:00:00.000 UTC`
 - a signal is eligible only if its stored `signal_1h.close_time >= fold_start` and its required next-hour-boundary 5m entry satisfies `entry_time <= fold_end`
 - `end_of_test` bookkeeping may occur only at the official fold end
@@ -355,6 +358,8 @@ If the sample is sufficient, B v1 passes only if all four conditions hold:
 
 1. net expectancy per trade > 0
 2. profit factor >= 1.10
+   - if gross loss = 0 and gross profit > 0, profit factor is treated as **+infinity** and satisfies this condition
+   - if both gross profit and gross loss are 0, profit factor is undefined and this condition does not pass
 3. if both long and short sides have at least one closed trade, then **both** long net PnL and short net PnL must be > 0; if one side has zero trades, this clause is not applied
 4. same-direction BTC-overlap share < 60%
 
@@ -452,3 +457,18 @@ Disposition:
 - B7 spot-short executability caveat: **ACCEPT**.
 
 No Strategy B parameter, fold, optimization grid, or alpha filter was changed as a result of the review.
+
+
+## 16. Additional pre-run consistency locks
+
+During implementation of the accepted Grok B3/B4 clarifications, two edge cases were identified before any official result:
+
+1. ZEC and BTC require different pre-fold history lengths for different purposes:
+   - ZEC: 24 closed 1h bars, preserving the defined first Wilder ATR(24) seed at the first eligible signal close
+   - BTC: 25 closed 1h bars, allowing a valid 24-bar BTC breakout calculation at `T-1h` for the earliest possible ZEC trade
+
+2. Profit factor zero-loss handling is mathematical bookkeeping, not a strategy rule:
+   - gross_loss = 0 and gross_profit > 0 → PF = +∞ and the PF >= 1.10 gate passes
+   - gross_loss = 0 and gross_profit = 0 → PF undefined and the PF gate fails
+
+No official fold data or Strategy B performance metric was inspected to make these clarifications.
