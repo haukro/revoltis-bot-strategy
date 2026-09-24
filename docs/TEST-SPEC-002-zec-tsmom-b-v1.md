@@ -1,6 +1,6 @@
 # TEST-SPEC-002 — ZEC TSMOM B v1
 
-Status: **LOCKED BEFORE FIRST RUN**
+Status: **LOCKED BEFORE FIRST OFFICIAL RUN — PRE-RUN GROK CLARIFICATIONS APPLIED**
 
 This specification defines Strategy B v1 before any Strategy B backtest is executed.
 
@@ -21,7 +21,7 @@ The intended edge is ZEC time-series momentum, not a BTC-proxy signal.
 | Signal timeframe | fully closed 1h UTC candles |
 | Cost model | same stored fee + spread + impact model as Strategy A |
 | Max open positions | 1 |
-| Notional | same as Strategy A: 50 USDT |
+| Notional | 50 USDT gross entry notional before transaction costs |
 | Strategy A entry | forbidden |
 | Strategy A trail 1.6/0.3 | forbidden |
 | Strategy A stop loss 6% | forbidden |
@@ -31,7 +31,7 @@ The intended edge is ZEC time-series momentum, not a BTC-proxy signal.
 
 No pyramiding.
 
-A signal that occurs while a position is already open does not open an additional position and does not reverse the existing position.
+A signal that occurs while a position is already open is ignored for entry purposes: it does not open an additional position and does not reverse or modify the existing position. When flat, the next valid signal is eligible under the entry rules below.
 
 ## 2. Signal — one configuration
 
@@ -72,12 +72,14 @@ No volume, ATR-expansion, RSI, Bollinger, rebound, BTC, ETH, or other entry filt
 
 After a valid 1h signal closes:
 
-- enter at the **open of the first 5m candle after the signal 1h close**
-- never enter inside the signal hour
+- the 1h bar is represented as the half-open UTC interval `[H, H+1h)` with stored `close_time = H+1h-1 ms`
+- the required entry bar is the 5m candle with `open_time = H+1h = signal_close_time + 1 ms`
+- therefore entry is exactly on the next UTC hour boundary, never inside the signal hour
 - do not delay entry to a later 5m candle
 - do not alter the entry price using a confirmation rule
+- if that exact 5m entry bar is missing, the official dataset/run is invalid; do not shift the fill to a later candle
 
-The 1h signal and ATR used for entry must be fully known before the first eligible 5m execution candle opens.
+The 1h signal and ATR used for entry must be fully known before the required 5m execution candle opens.
 
 ## 4. ATR definition
 
@@ -106,7 +108,9 @@ Wilder ATR:
 ATR_t = ((23 * ATR_{t-1}) + TR_t) / 24
 ```
 
-At entry, use the most recent ATR value available at the close of the signal 1h candle.
+At entry, use the ATR value available at the close of the signal 1h candle.
+
+That ATR(24) **includes the fully closed signal bar's own true range** as its newest observation. The following incomplete 1h bar is excluded.
 
 After entry, ATR may update only when another 1h candle fully closes.
 
@@ -196,7 +200,14 @@ A current 5m high may therefore not create a tighter stop that is then retrospec
 
 ### 5.3b Side-aware transaction-cost accounting
 
-The stored Strategy A cost snapshot is reused without refitting.
+The exact frozen Strategy A cost snapshot is reused without refitting:
+
+- source run id: `c4279991-66ae-44a2-9840-073c96bd8251`
+- order-book snapshot `book_ts = 1790183884652`
+- `entry_cost_rate = 0.001086487119183424`
+- `exit_cost_rate = 0.0010838075452430937`
+
+The official runner must reject execution if this source snapshot or these locked rates do not match.
 
 Let:
 
@@ -224,10 +235,14 @@ pnl_usdt = stake_amount * net_return
 
 This is the locked backtest accounting convention for B v1. It introduces no leverage, funding, borrowing charge, maker rebate, or new fee assumption.
 
+Shorts are **research marks on OKX ZEC/USDT spot prints**, not proof of directly executable borrow-free spot shorts. The test must not silently substitute perpetuals, margin borrowing, funding, or another venue. A PASS remains a research verdict until an executable short venue/cost model is separately validated.
+
+The 50 USDT stake is gross entry notional before transaction costs. Same-bar stop-out after entry at the required 5m open is allowed.
+
 
 ### 5.4 Evaluation-boundary bookkeeping
 
-If a position remains open at `2025-11-30 23:59:59.999 UTC`:
+If a position remains open at `2026-12-23 11:59:59.999 UTC`:
 
 - liquidate it at the close of the final 5m candle in the evaluation fold
 - set `exit_reason = end_of_test`
@@ -283,11 +298,17 @@ This is exactly 90 days.
 
 Rules:
 
+- pre-fold bars may seed the 24-bar breakout range and Wilder ATR only
+- no trade may have `entry_time < 2026-09-24 12:00:00.000 UTC`
+- a signal is eligible only if its stored `signal_1h.close_time >= fold_start` and its required next-hour-boundary 5m entry satisfies `entry_time <= fold_end`
+- `end_of_test` bookkeeping may occur only at the official fold end
 - no Strategy B PASS / FAIL calculation may be produced before the fold ends
 - no partial-fold result may be used for tuning or decision-making
 - the fold must not be replaced after forward data begin accumulating
 - the final run must use complete, contiguous 5m ZEC/USDT data for the entire fold plus the required pre-fold warmup
-- if the final 5m close or required data are invalid/incomplete, the run is invalid rather than interpolated
+- if the exact required entry bar, final 5m close, or other required data are invalid/incomplete, the run is invalid rather than interpolated or shifted
+- official PASS / FAIL is computed as **one batch replay at fold end** from immutable raw market snapshots using the engine matching this locked specification and these pre-run clarifications
+- mid-fold UI, paper-engine, or implementation changes do not define the official result
 - no Strategy B result existed before this forward fold was locked
 
 The failed attempt to source the unavailable historical candidate fold does **not** count as the official Strategy B run because the evaluation engine was never invoked and no strategy metric or verdict was generated.
@@ -303,22 +324,30 @@ On the official evaluation fold, after the locked transaction-cost model:
 5. net PnL short
 6. share of entries with a same-direction BTC 24×1h breakout within ±1 hour
 
-The BTC overlap is diagnostic and is not an entry filter.
+The BTC overlap is diagnostic for entries but remains a locked PASS gate.
 
-BTC breakout uses the same 24×1h breakout definition and direction as B:
+BTC overlap definition:
 
-- BTC long breakout for a ZEC long entry
-- BTC short breakout for a ZEC short entry
-
-The ±1 hour overlap window is locked before the first run.
+- market: **BTC/USDT spot on OKX**, same venue as ZEC
+- timeframe: fully closed **1h UTC**
+- breakout lookback: the same **N = 24** close-breakout rule as B
+- the BTC signal candle is excluded from its own 24-bar range
+- for a taken ZEC trade with signal-hour close timestamp `T`, overlap is true if BTC has a **same-direction** breakout on exact hourly signal timestamps `T-1h`, `T`, or `T+1h`
+- ZEC long requires BTC long; ZEC short requires BTC short
+- numerator = taken trades with at least one such same-direction BTC breakout
+- denominator = official taken trades with complete BTC 1h data for all three required timestamps
+- if any of `T-1h`, `T`, `T+1h` is missing for a trade, that trade is dropped from both overlap numerator and denominator
+- report the dropped-overlap trade count and share
+- if dropped-overlap trades exceed **10% of all official taken trades**, the official verdict is **INSUFFICIENT_SAMPLE**
 
 ## 10. Sample sufficiency
 
-If the official evaluation fold produces fewer than 20 closed trades:
+The official verdict is **INSUFFICIENT_SAMPLE** if either:
 
-**INSUFFICIENT_SAMPLE**
+- fewer than 20 closed trades are produced, or
+- BTC-overlap data are incomplete for more than 10% of official taken trades under the locked rule in section 9
 
-No PASS / FAIL conclusion is allowed.
+No PASS / FAIL conclusion is allowed in either case.
 
 ## 11. PASS / FAIL
 
@@ -352,6 +381,14 @@ Report descriptively:
 - same-direction BTC-overlap count and share
 
 These fields do not add new PASS / FAIL rules.
+
+Locked caveats that do not alter the verdict rules:
+
+- 90 days may produce fewer than 20 trades; that outcome remains INSUFFICIENT_SAMPLE and does not justify changing N
+- criterion 3 intentionally requires both active sides to be net profitable when both sides trade; a side with zero trades does not trigger that clause
+- the 60% BTC-overlap threshold may be statistically noisy at small n but remains locked
+- there is no DD or B&H PASS gate in TEST-SPEC-002
+- stop-price fills plus the frozen A cost snapshot are a research execution model, not historical L2 reconstruction
 
 ## 13. Required report
 
@@ -393,6 +430,25 @@ Do not:
 - evaluate PASS / FAIL on Dec 2025–Sep 2026
 - tune using the official fold
 - change the official fold after results are viewed
+- refresh or replace the frozen Strategy A cost snapshot
+- substitute perpetuals/margin execution for the declared spot-print short research marks
 - build an A+B router before B independently passes
 
 If B v1 fails, a new Strategy B hypothesis or configuration requires a new preregistration and a new unused evaluation fold.
+
+
+## 15. Pre-run Grok review disposition
+
+External review was received before any official TEST-SPEC-002 evaluation or official-fold strategy metric was produced.
+
+Disposition:
+
+- B1 entry-bar ambiguity: **ACCEPT intent / CLARIFY timestamp semantics**. Exact next-hour-boundary 5m bar is required; a missing bar invalidates the run rather than shifting the fill.
+- B2 ATR window: **ACCEPT**. ATR includes the fully closed signal bar TR.
+- B3 BTC overlap definition: **ACCEPT** with exact venue/time/direction/denominator/missing-data rules above.
+- B4 fold boundaries and warmup: **ACCEPT**.
+- B5 batch replay: **ACCEPT**.
+- B6 frozen cost snapshot: **ACCEPT**.
+- B7 spot-short executability caveat: **ACCEPT**.
+
+No Strategy B parameter, fold, optimization grid, or alpha filter was changed as a result of the review.
