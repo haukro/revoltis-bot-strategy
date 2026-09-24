@@ -896,6 +896,223 @@ def _same_numeric_metrics(expected: dict[str, Any], actual: dict[str, Any], tole
     return True
 
 
+def _baseline_economic_metrics(
+    tape: list[dict[str, Any]],
+    block_minutes: float,
+    capital: float,
+) -> dict[str, Any]:
+    wins = [t for t in tape if float(t["pnl_net"]) > 0]
+    losses = [t for t in tape if float(t["pnl_net"]) < 0]
+    trail_hit = [t for t in tape if t.get("trailing_activated") is True]
+    trail_never = [t for t in tape if t.get("trailing_activated") is not True]
+    winning_pnl = sum(float(t["pnl_net"]) for t in wins)
+    losing_pnl = -sum(float(t["pnl_net"]) for t in losses)
+    net_pnl = winning_pnl - losing_pnl
+    hold_minutes = sum(float(t.get("hold_minutes") or 0) for t in tape)
+    return {
+        "trades": len(tape),
+        "trades_per_30d_month": round(len(tape) / (block_minutes / (30 * 24 * 60)), 4) if block_minutes else None,
+        "net_pnl_usdt": round(net_pnl, 6),
+        "net_return_percent_on_initial_capital": round(net_pnl / capital * 100, 6) if capital else None,
+        "net_expectancy_usdt_per_trade": round(net_pnl / len(tape), 8) if tape else None,
+        "profit_factor_net": round(winning_pnl / losing_pnl, 8) if losing_pnl > 0 else None,
+        "winning_pnl_usdt": round(winning_pnl, 6),
+        "losing_pnl_usdt": round(losing_pnl, 6),
+        "trail_hit": {
+            "trades": len(trail_hit),
+            "share_percent": round(100 * len(trail_hit) / len(tape), 4) if tape else None,
+            "net_pnl_usdt": round(sum(float(t["pnl_net"]) for t in trail_hit), 6),
+            "net_expectancy_usdt_per_trade": round(
+                sum(float(t["pnl_net"]) for t in trail_hit) / len(trail_hit), 8
+            ) if trail_hit else None,
+        },
+        "trail_never_reached": {
+            "trades": len(trail_never),
+            "share_percent": round(100 * len(trail_never) / len(tape), 4) if tape else None,
+            "net_pnl_usdt": round(sum(float(t["pnl_net"]) for t in trail_never), 6),
+            "net_expectancy_usdt_per_trade": round(
+                sum(float(t["pnl_net"]) for t in trail_never) / len(trail_never), 8
+            ) if trail_never else None,
+        },
+        "time_in_market_percent": round(100 * hold_minutes / block_minutes, 4) if block_minutes else None,
+    }
+
+
+@app.post("/api/research/baseline-economic-scorecard")
+async def baseline_economic_scorecard():
+    """Continuous 3x90d economic scorecard for the frozen ZEC 5m Strategy A baseline."""
+    require_durable_production_store()
+    source_job_id = "c4279991-66ae-44a2-9840-073c96bd8251"
+    scorecard_key = "strategy_a_zec_5m_3x90d_v1"
+
+    existing = await supabase_get("optimizer_runs", "order=created_at.desc&limit=100")
+    prior = next(
+        (
+            row for row in existing
+            if (row.get("request") or {}).get("kind") == "baseline_economic_scorecard"
+            and (row.get("request") or {}).get("scorecard_key") == scorecard_key
+        ),
+        None,
+    )
+    if prior:
+        return prior
+
+    source_rows = await supabase_get("optimizer_runs", f"id=eq.{source_job_id}&limit=1")
+    source = next((row for row in source_rows if row.get("id") == source_job_id), None)
+    if source is None or source.get("status") != "completed":
+        raise HTTPException(404, "Zmrazený Strategy A baseline run nebol nájdený.")
+
+    source_result = source.get("result") or {}
+    variants = source_result.get("variant_results") or []
+    selected_id = source_result.get("variant_id")
+    row = next((item for item in variants if item.get("variant_id") == selected_id), None)
+    if row is None:
+        raise HTTPException(422, "Baseline run nemá auditovateľný variant.")
+
+    settings = dict(row.get("settings") or {})
+    locked = {
+        "pair": row.get("pair"),
+        "timeframe": settings.get("timeframe"),
+        "stop_loss_percent": float(settings.get("stop_loss_percent") or 0),
+        "trailing_start_percent": float(settings.get("trailing_start_percent") or 0),
+        "trailing_distance_percent": float(settings.get("trailing_distance_percent") or 0),
+        "max_no_trail_hours": float(settings.get("max_no_trail_hours") or 0),
+        "max_open_trades": int(settings.get("max_open_trades") or 0),
+    }
+    expected_locked = {
+        "pair": "ZEC/USDT",
+        "timeframe": "5m",
+        "stop_loss_percent": 6.0,
+        "trailing_start_percent": 1.6,
+        "trailing_distance_percent": 0.3,
+        "max_no_trail_hours": 4.0,
+        "max_open_trades": 1,
+    }
+    if locked != expected_locked:
+        raise HTTPException(409, f"Strategy A baseline lock mismatch: {locked}")
+
+    cost_profile = row.get("cost_components")
+    if not cost_profile:
+        raise HTTPException(422, "Baseline nemá uložený cost snapshot.")
+
+    pair, timeframe = "ZEC/USDT", "5m"
+    step = TIMEFRAME_MILLISECONDS[timeframe]
+    warmup = max(
+        int(settings["bb_period"]),
+        int(settings["rsi_period"]),
+        int(settings["atr_period"]),
+        20,
+    ) + 2
+    block_days = 90
+    block_ms = block_days * 86_400_000
+    block_minutes = block_days * 24 * 60
+    blocks = [
+        ("A", datetime(2025, 12, 27, 17, 15, tzinfo=UTC)),
+        ("B", datetime(2026, 3, 27, 17, 15, tzinfo=UTC)),
+        ("C", datetime(2026, 6, 25, 17, 15, tzinfo=UTC)),
+    ]
+
+    block_results = []
+    combined_tape: list[dict[str, Any]] = []
+    max_dd = 0.0
+    for label, start_dt in blocks:
+        start_ms = int(start_dt.timestamp() * 1000)
+        end_ms = start_ms + block_ms - 1
+        fetch_start = start_ms - warmup * step
+        expected_trade_bars = block_ms // step
+        expected_total = int(expected_trade_bars + warmup)
+        candles = await load_okx_candles(
+            pair, timeframe, expected_total, fetch_start, end_ms
+        )
+        if len(candles) != expected_total:
+            raise HTTPException(
+                409,
+                f"Block {label} dataset incomplete: {len(candles)}/{expected_total}.",
+            )
+        if int(candles[0]["open_time"]) != fetch_start or int(candles[-1]["close_time"]) != end_ms:
+            raise HTTPException(409, f"Block {label} does not match frozen boundaries.")
+        if any(
+            int(right["open_time"]) - int(left["open_time"]) != step
+            for left, right in zip(candles, candles[1:])
+        ):
+            raise HTTPException(409, f"Block {label} contains a candle gap.")
+
+        run = simulate(
+            {pair: candles},
+            settings,
+            fee=float(row["cost_per_side"]),
+            force_close_at_end=True,
+            trading_start_time=start_ms,
+            cost_models={pair: cost_profile},
+        )
+        tape = trade_tape(
+            run, pair, timeframe, f"strategy_a_{label}", label, float(row["cost_per_side"])
+        )
+        econ = _baseline_economic_metrics(
+            tape, float(block_minutes), float(settings["initial_capital"])
+        )
+        econ["max_drawdown_percent"] = float(run["metrics"]["max_drawdown_percent"])
+        econ["buy_hold"] = buy_hold_risk_metrics(
+            candles[warmup:], cost_profile, float(settings["initial_capital"])
+        )
+        econ["start_ms"] = start_ms
+        econ["end_ms"] = end_ms
+        econ["cost_book_ts"] = cost_profile.get("book_ts")
+        econ["cost_model_basis"] = cost_profile.get("estimate_basis")
+        block_results.append({"block": label, **econ})
+        combined_tape.extend(tape)
+        max_dd = max(max_dd, float(run["metrics"]["max_drawdown_percent"]))
+
+    combined_minutes = float(block_minutes * len(blocks))
+    combined = _baseline_economic_metrics(
+        combined_tape, combined_minutes, float(settings["initial_capital"])
+    )
+    combined["max_single_block_drawdown_percent"] = round(max_dd, 4)
+    combined["blocks_positive"] = sum(float(item["net_pnl_usdt"]) > 0 for item in block_results)
+    combined["blocks_negative"] = sum(float(item["net_pnl_usdt"]) < 0 for item in block_results)
+    combined["all_blocks_net_pnl_usdt"] = round(
+        sum(float(item["net_pnl_usdt"]) for item in block_results), 6
+    )
+    combined["economic_status"] = (
+        "positive_across_majority"
+        if combined["net_pnl_usdt"] > 0 and combined["blocks_positive"] >= 2
+        else "positive_but_concentrated"
+        if combined["net_pnl_usdt"] > 0
+        else "negative"
+    )
+
+    now = datetime.now(UTC).isoformat()
+    record = {
+        "id": str(uuid4()),
+        "status": "completed",
+        "created_at": now,
+        "finished_at": now,
+        "request": {
+            "kind": "baseline_economic_scorecard",
+            "scorecard_key": scorecard_key,
+            "source_job_id": source_job_id,
+            "pair": pair,
+            "timeframe": timeframe,
+            "blocks": [
+                {"block": item["block"], "start_ms": item["start_ms"], "end_ms": item["end_ms"]}
+                for item in block_results
+            ],
+            "grid": False,
+            "optimizer": False,
+        },
+        "result": {
+            "strategy": expected_locked,
+            "cost_profile": cost_profile,
+            "warmup_bars": warmup,
+            "continuous_block_backtests": True,
+            "blocks": block_results,
+            "combined": combined,
+            "note": "PnL and expectancy are net of the stored fee + spread + impact cost model.",
+        },
+    }
+    return await supabase_upsert("optimizer_runs", record)
+
+
 @app.get("/api/research/rebound-confirmation/smoke")
 async def rebound_confirmation_smoke():
     """Synthetic-only preregistration smoke test. Never touches evaluation data."""
