@@ -605,6 +605,281 @@ begin
 end;
 $$;
 
+
+create or replace function public.paper_ingest_signal(
+  p_strategy_id text,
+  p_strategy_version_id text,
+  p_test_spec_id text,
+  p_pair text,
+  p_side text,
+  p_signal_close_time timestamptz,
+  p_intended_entry_time timestamptz,
+  p_intended_notional numeric,
+  p_source_timeframe text,
+  p_execution_timeframe text,
+  p_reason_code text,
+  p_rule_id text,
+  p_correlation_id text,
+  p_blind_test_id text,
+  p_generated_at timestamptz,
+  p_software_commit text
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, extensions
+as $
+declare
+  v_key text;
+  v_signal_id text;
+  v_row public.paper_signals;
+  v_outbox_key text;
+begin
+  if p_side not in ('LONG','SHORT') then raise exception 'invalid_signal_side'; end if;
+  if p_intended_notional <= 0 then raise exception 'invalid_signal_notional'; end if;
+  if p_strategy_version_id is null or btrim(p_strategy_version_id) = '' then raise exception 'strategy_version_required'; end if;
+
+  v_key := encode(digest(convert_to(
+    'SIGNAL|' || p_strategy_version_id || '|' || p_pair || '|' || p_side || '|' ||
+    to_char(p_signal_close_time at time zone 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') || '|' || p_rule_id,
+    'UTF8'
+  ), 'sha256'), 'hex');
+  v_signal_id := 'sig_' || v_key;
+
+  select * into v_row from public.paper_signals where idempotency_key = v_key;
+  if found then
+    return jsonb_build_object('signal_id', v_row.id, 'canonical_signal_id', v_row.signal_id, 'idempotent_replay', true);
+  end if;
+
+  insert into public.paper_signals(
+    signal_id, strategy_id, strategy_version_id, test_spec_id, pair, side,
+    signal_close_time, intended_entry_time, intended_notional,
+    source_timeframe, execution_timeframe, reason_code, rule_id,
+    correlation_id, blind_test_id, generated_at, idempotency_key, software_commit
+  )
+  values (
+    v_signal_id, p_strategy_id, p_strategy_version_id, p_test_spec_id, p_pair, p_side,
+    p_signal_close_time, p_intended_entry_time, p_intended_notional,
+    p_source_timeframe, p_execution_timeframe, p_reason_code, p_rule_id,
+    p_correlation_id, p_blind_test_id, p_generated_at, v_key, p_software_commit
+  )
+  returning * into v_row;
+
+  v_outbox_key := encode(digest(convert_to(
+    'OUTBOX|RISK_EVALUATE|signal|' || v_row.id::text || '|PRETRADE',
+    'UTF8'
+  ), 'sha256'), 'hex');
+
+  insert into public.execution_outbox(
+    event_type, entity_type, entity_id, correlation_id, payload, idempotency_key
+  )
+  values (
+    'RISK_EVALUATE', 'signal', v_row.id, p_correlation_id,
+    jsonb_build_object('signal_id', v_row.id), v_outbox_key
+  )
+  on conflict (idempotency_key) do nothing;
+
+  perform public.paper_append_audit(
+    'SIGNAL_PERSISTED', 'signal', v_row.id, p_correlation_id,
+    p_strategy_version_id, p_signal_close_time, clock_timestamp(), clock_timestamp(),
+    null, to_jsonb(v_row), null, p_reason_code, 'signal-ingestor', p_software_commit, p_correlation_id
+  );
+
+  return jsonb_build_object('signal_id', v_row.id, 'canonical_signal_id', v_row.signal_id, 'idempotent_replay', false);
+end;
+$;
+
+create or replace function public.paper_create_order_from_approved_signal(
+  p_signal_id uuid,
+  p_side text,
+  p_intent_type text,
+  p_order_type text default 'MARKET',
+  p_worker_id text default 'order-manager',
+  p_software_commit text default 'unknown'
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, extensions
+as $
+declare
+  v_signal public.paper_signals;
+  v_decision public.risk_decisions;
+  v_ks public.kill_switch_state;
+  v_order public.paper_orders;
+  v_key text;
+  v_outbox_key text;
+  v_from text;
+begin
+  if p_side not in ('BUY','SELL') then raise exception 'invalid_order_side'; end if;
+  if p_intent_type not in ('ENTRY','EXIT','EMERGENCY_EXIT') then raise exception 'invalid_intent_type'; end if;
+  if p_order_type <> 'MARKET' then raise exception 'unsupported_order_type'; end if;
+
+  select * into v_signal from public.paper_signals where id = p_signal_id;
+  if not found then raise exception 'signal_not_found'; end if;
+
+  select * into v_decision
+  from public.risk_decisions
+  where signal_id = p_signal_id and decision_stage='PRETRADE';
+  if not found or v_decision.decision <> 'APPROVED' then
+    raise exception 'signal_not_risk_approved';
+  end if;
+
+  select * into v_ks from public.kill_switch_state where account_key='paper-default' for update;
+  if p_intent_type='ENTRY' and v_ks.state <> 'RUNNING' then
+    raise exception 'new_entry_blocked_kill_switch:%', v_ks.state;
+  end if;
+  if p_intent_type <> 'ENTRY' and v_ks.state in ('HALTED','RECOVERY_PENDING') then
+    raise exception 'new_order_blocked_kill_switch:%', v_ks.state;
+  end if;
+
+  v_key := encode(digest(convert_to(
+    'ORDER|' || p_signal_id::text || '|' || p_intent_type || '|' || p_order_type,
+    'UTF8'
+  ), 'sha256'), 'hex');
+
+  select * into v_order from public.paper_orders where idempotency_key = v_key;
+  if found then
+    return jsonb_build_object('order_id', v_order.id, 'status', v_order.status, 'idempotent_replay', true);
+  end if;
+
+  insert into public.paper_orders(
+    signal_id, strategy_version_id, pair, side, intent_type, order_type,
+    intended_notional, status, idempotency_key
+  )
+  values (
+    p_signal_id, v_signal.strategy_version_id, v_signal.pair, p_side, p_intent_type, p_order_type,
+    v_signal.intended_notional, 'CREATED', v_key
+  )
+  returning * into v_order;
+
+  insert into public.paper_order_events(order_id, from_state, to_state, reason_code)
+  values (v_order.id, null, 'CREATED', 'ORDER_CREATED');
+
+  v_from := v_order.status;
+  update public.paper_orders
+  set status='ACCEPTED', accepted_at=clock_timestamp(), state_version=state_version+1, updated_at=clock_timestamp()
+  where id=v_order.id
+  returning * into v_order;
+
+  insert into public.paper_order_events(order_id, from_state, to_state, reason_code)
+  values (v_order.id, v_from, 'ACCEPTED', 'RISK_APPROVED');
+
+  v_outbox_key := encode(digest(convert_to(
+    'OUTBOX|BIND_FILL_ATTEMPT|order|' || v_order.id::text || '|attempt:1',
+    'UTF8'
+  ), 'sha256'), 'hex');
+
+  insert into public.execution_outbox(
+    event_type, entity_type, entity_id, correlation_id, payload, idempotency_key
+  )
+  values (
+    'BIND_FILL_ATTEMPT', 'order', v_order.id, v_signal.correlation_id,
+    jsonb_build_object('order_id', v_order.id, 'attempt_seq', 1), v_outbox_key
+  )
+  on conflict (idempotency_key) do nothing;
+
+  perform public.paper_append_audit(
+    'ORDER_ACCEPTED', 'order', v_order.id, v_signal.correlation_id,
+    v_signal.strategy_version_id, v_signal.signal_close_time,
+    clock_timestamp(), clock_timestamp(), null, to_jsonb(v_order), null,
+    'RISK_APPROVED', p_worker_id, p_software_commit, v_signal.correlation_id
+  );
+
+  return jsonb_build_object('order_id', v_order.id, 'status', v_order.status, 'idempotent_replay', false);
+end;
+$;
+
+create or replace function public.paper_bind_execution_attempt(
+  p_order_id uuid,
+  p_market_snapshot_id uuid,
+  p_policy_version_id uuid,
+  p_attempt_seq integer,
+  p_worker_id text default 'execution-worker',
+  p_software_commit text default 'unknown'
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, extensions
+as $
+declare
+  v_order public.paper_orders;
+  v_signal public.paper_signals;
+  v_attempt public.paper_execution_attempts;
+  v_ks public.kill_switch_state;
+  v_key text;
+  v_from text;
+begin
+  if p_attempt_seq < 1 then raise exception 'invalid_attempt_seq'; end if;
+
+  select * into v_order from public.paper_orders where id=p_order_id for update;
+  if not found then raise exception 'order_not_found'; end if;
+  if v_order.status not in ('ACCEPTED','PENDING_FILL','PARTIALLY_FILLED') then
+    raise exception 'order_state_disallows_attempt:%', v_order.status;
+  end if;
+  if v_order.cancel_requested_at is not null then
+    raise exception 'attempt_blocked_after_cancel_request';
+  end if;
+
+  select * into v_ks from public.kill_switch_state where account_key='paper-default' for update;
+  if v_ks.state in ('HALTED','RECOVERY_PENDING') then
+    raise exception 'attempt_blocked_kill_switch:%', v_ks.state;
+  end if;
+
+  if not exists(select 1 from public.execution_market_snapshots where id=p_market_snapshot_id) then
+    raise exception 'market_snapshot_not_found';
+  end if;
+  if not exists(select 1 from public.risk_policy_versions where id=p_policy_version_id) then
+    raise exception 'policy_not_found';
+  end if;
+
+  v_key := encode(digest(convert_to(
+    'FILL_ATTEMPT|' || p_order_id::text || '|' || p_attempt_seq::text,
+    'UTF8'
+  ), 'sha256'), 'hex');
+
+  select * into v_attempt from public.paper_execution_attempts where idempotency_key=v_key;
+  if found then
+    return jsonb_build_object('execution_attempt_id', v_attempt.id, 'status', v_attempt.status, 'idempotent_replay', true);
+  end if;
+
+  insert into public.paper_execution_attempts(
+    order_id, attempt_seq, market_snapshot_id, policy_version_id,
+    status, idempotency_key
+  )
+  values (
+    p_order_id, p_attempt_seq, p_market_snapshot_id, p_policy_version_id,
+    'BOUND', v_key
+  )
+  returning * into v_attempt;
+
+  if v_order.status='ACCEPTED' then
+    v_from := v_order.status;
+    update public.paper_orders
+    set status='PENDING_FILL', pending_at=clock_timestamp(), state_version=state_version+1, updated_at=clock_timestamp()
+    where id=p_order_id
+    returning * into v_order;
+
+    insert into public.paper_order_events(order_id, from_state, to_state, reason_code, payload)
+    values (p_order_id, v_from, 'PENDING_FILL', 'EXECUTION_ATTEMPT_BOUND',
+            jsonb_build_object('execution_attempt_id', v_attempt.id));
+  end if;
+
+  select * into v_signal from public.paper_signals where id=v_order.signal_id;
+
+  perform public.paper_append_audit(
+    'EXECUTION_ATTEMPT_BOUND', 'order', p_order_id, v_signal.correlation_id,
+    v_order.strategy_version_id, v_signal.signal_close_time,
+    clock_timestamp(), clock_timestamp(), null,
+    jsonb_build_object('execution_attempt_id', v_attempt.id, 'snapshot_id', p_market_snapshot_id, 'attempt_seq', p_attempt_seq),
+    null, 'EXECUTION_ATTEMPT_BOUND', p_worker_id, p_software_commit, v_signal.correlation_id
+  );
+
+  return jsonb_build_object('execution_attempt_id', v_attempt.id, 'status', v_attempt.status, 'idempotent_replay', false);
+end;
+$;
+
 create or replace function public.paper_reserve_risk(
   p_signal_id uuid,
   p_policy_version_id uuid,
@@ -1158,6 +1433,25 @@ begin
       applied_at = clock_timestamp()
   where id = p_execution_attempt_id;
 
+  if v_new_status = 'PARTIALLY_FILLED' then
+    insert into public.execution_outbox(
+      event_type, entity_type, entity_id, correlation_id, payload, idempotency_key
+    )
+    values (
+      'BIND_FILL_ATTEMPT', 'order', p_order_id, v_signal.correlation_id,
+      jsonb_build_object(
+        'order_id', p_order_id,
+        'attempt_seq', v_attempt.attempt_seq + 1,
+        'remaining_notional', greatest(0, v_order.intended_notional - v_new_filled_notional)
+      ),
+      encode(extensions.digest(convert_to(
+        'OUTBOX|BIND_FILL_ATTEMPT|order|' || p_order_id::text || '|attempt:' || (v_attempt.attempt_seq + 1)::text,
+        'UTF8'
+      ), 'sha256'), 'hex')
+    )
+    on conflict (idempotency_key) do nothing;
+  end if;
+
   perform public.paper_append_audit(
     'FILL_APPLIED', 'order', p_order_id, v_signal.correlation_id,
     v_order.strategy_version_id, v_signal.signal_close_time,
@@ -1176,6 +1470,94 @@ begin
   );
 end;
 $$;
+
+
+create or replace function public.paper_terminalize_order(
+  p_order_id uuid,
+  p_terminal_state text,
+  p_reason_code text,
+  p_worker_id text default 'order-manager',
+  p_software_commit text default 'unknown',
+  p_account_key text default 'paper-default'
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $
+declare
+  v_order public.paper_orders;
+  v_signal public.paper_signals;
+  v_res public.risk_reservations;
+  v_state public.portfolio_risk_state;
+  v_remaining numeric(30,12);
+  v_signed numeric(30,12);
+  v_from text;
+begin
+  if p_terminal_state not in ('CANCELLED','EXPIRED','FAILED','REJECTED') then
+    raise exception 'invalid_terminal_state';
+  end if;
+
+  select * into v_order from public.paper_orders where id=p_order_id for update;
+  if not found then raise exception 'order_not_found'; end if;
+
+  if v_order.status in ('FILLED','CANCELLED','REJECTED','EXPIRED','FAILED') then
+    return jsonb_build_object('order_id', v_order.id, 'status', v_order.status, 'idempotent_replay', true);
+  end if;
+
+  if p_terminal_state='CANCELLED' then
+    v_from := v_order.status;
+    update public.paper_orders
+    set status='CANCEL_REQUESTED', cancel_requested_at=coalesce(cancel_requested_at,clock_timestamp()),
+        state_version=state_version+1, updated_at=clock_timestamp()
+    where id=p_order_id
+    returning * into v_order;
+    insert into public.paper_order_events(order_id,from_state,to_state,reason_code)
+    values(p_order_id,v_from,'CANCEL_REQUESTED',p_reason_code);
+  end if;
+
+  v_from := v_order.status;
+  update public.paper_orders
+  set status=p_terminal_state, terminal_at=clock_timestamp(),
+      rejection_reason=case when p_terminal_state in ('FAILED','REJECTED') then p_reason_code else rejection_reason end,
+      state_version=state_version+1, updated_at=clock_timestamp()
+  where id=p_order_id
+  returning * into v_order;
+
+  insert into public.paper_order_events(order_id,from_state,to_state,reason_code)
+  values(p_order_id,v_from,p_terminal_state,p_reason_code);
+
+  select * into v_res from public.risk_reservations where signal_id=v_order.signal_id for update;
+  if found and v_res.status in ('RESERVED','PARTIALLY_CONSUMED') then
+    v_remaining := greatest(0, v_res.reserved_notional - v_res.consumed_notional);
+    v_signed := case when v_res.side='LONG' then v_remaining else -v_remaining end;
+
+    select * into v_state from public.portfolio_risk_state where account_key=p_account_key for update;
+
+    update public.risk_reservations
+    set status='RELEASED', released_at=clock_timestamp(), release_reason=p_reason_code,
+        state_version=state_version+1
+    where id=v_res.id;
+
+    update public.portfolio_risk_state
+    set reserved_gross_notional=greatest(0,reserved_gross_notional-v_remaining),
+        reserved_net_notional=reserved_net_notional-v_signed,
+        state_version=state_version+1, updated_at=clock_timestamp()
+    where account_key=p_account_key;
+  end if;
+
+  select * into v_signal from public.paper_signals where id=v_order.signal_id;
+
+  perform public.paper_append_audit(
+    'ORDER_TERMINAL', 'order', p_order_id, v_signal.correlation_id,
+    v_order.strategy_version_id, v_signal.signal_close_time,
+    clock_timestamp(), clock_timestamp(), null, to_jsonb(v_order), null,
+    p_reason_code, p_worker_id, p_software_commit, v_signal.correlation_id
+  );
+
+  return jsonb_build_object('order_id', v_order.id, 'status', v_order.status, 'idempotent_replay', false);
+end;
+$;
 
 -- Sensitive execution tables: service-role/RPC only.
 do $$
@@ -1211,11 +1593,23 @@ grant execute on function public.paper_ack_outbox(uuid,text,text) to service_rol
 revoke all on function public.paper_append_audit(text,text,uuid,text,text,timestamptz,timestamptz,timestamptz,jsonb,jsonb,text,text,text,text,text) from public, anon, authenticated;
 grant execute on function public.paper_append_audit(text,text,uuid,text,text,timestamptz,timestamptz,timestamptz,jsonb,jsonb,text,text,text,text,text) to service_role;
 
+revoke all on function public.paper_ingest_signal(text,text,text,text,text,timestamptz,timestamptz,numeric,text,text,text,text,text,text,timestamptz,text) from public, anon, authenticated;
+grant execute on function public.paper_ingest_signal(text,text,text,text,text,timestamptz,timestamptz,numeric,text,text,text,text,text,text,timestamptz,text) to service_role;
+
+revoke all on function public.paper_create_order_from_approved_signal(uuid,text,text,text,text,text) from public, anon, authenticated;
+grant execute on function public.paper_create_order_from_approved_signal(uuid,text,text,text,text,text) to service_role;
+
+revoke all on function public.paper_bind_execution_attempt(uuid,uuid,uuid,integer,text,text) from public, anon, authenticated;
+grant execute on function public.paper_bind_execution_attempt(uuid,uuid,uuid,integer,text,text) to service_role;
+
 revoke all on function public.paper_reserve_risk(uuid,uuid,text,text,text) from public, anon, authenticated;
 grant execute on function public.paper_reserve_risk(uuid,uuid,text,text,text) to service_role;
 
 revoke all on function public.paper_apply_fill(uuid,uuid,integer,numeric,numeric,numeric,numeric,numeric,timestamptz,text,text,text) from public, anon, authenticated;
 grant execute on function public.paper_apply_fill(uuid,uuid,integer,numeric,numeric,numeric,numeric,numeric,timestamptz,text,text,text) to service_role;
+
+revoke all on function public.paper_terminalize_order(uuid,text,text,text,text,text) from public, anon, authenticated;
+grant execute on function public.paper_terminalize_order(uuid,text,text,text,text,text) to service_role;
 
 -- Remove sensitive tables from Supabase Realtime publication if present.
 do $$
