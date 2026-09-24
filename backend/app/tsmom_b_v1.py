@@ -199,9 +199,13 @@ def simulate_b_v1(
     signals = hourly_signals(hourly)
     btc_signals = hourly_signals(btc_hourly)
 
-    eval_signal_times = {
+    signals_in_fold = {
         ts: side for ts, side in signals.items()
         if evaluation_start_ms <= ts <= evaluation_end_ms
+    }
+    eval_signal_times = {
+        ts: side for ts, side in signals_in_fold.items()
+        if ts + 1 <= evaluation_end_ms
     }
 
     cash = float(initial_capital)
@@ -209,7 +213,7 @@ def simulate_b_v1(
     trades: list[dict[str, Any]] = []
     raw_signal_count = len(eval_signal_times)
     ignored_signals_while_open = 0
-    unexecutable_end_signals = 0
+    unexecutable_end_signals = len(signals_in_fold) - len(eval_signal_times)
     equity_peak = cash
     max_drawdown = 0.0
     in_market_ms = 0
@@ -254,6 +258,19 @@ def simulate_b_v1(
     ]
     if not eval_rows:
         raise ValueError("empty_evaluation_rows")
+
+    if int(eval_rows[0]["open_time"]) != evaluation_start_ms:
+        raise ValueError("evaluation_start_mismatch")
+    if any(
+        int(b["open_time"]) - int(a["open_time"]) != FIVE_MIN_MS
+        for a, b in zip(eval_rows, eval_rows[1:])
+    ):
+        raise ValueError("evaluation_5m_gap")
+    eval_open_times = {int(candle["open_time"]) for candle in eval_rows}
+    for signal_close_time in eval_signal_times:
+        required_entry_open = signal_close_time + 1
+        if required_entry_open not in eval_open_times:
+            raise ValueError("missing_required_entry_bar")
 
     for idx, candle in enumerate(eval_rows):
         open_time = int(candle["open_time"])
@@ -355,11 +372,6 @@ def simulate_b_v1(
     if position is not None and last_open_time is not None:
         in_market_ms += FIVE_MIN_MS
 
-    # A signal closing exactly at fold end cannot enter because the next 5m open
-    # lies outside the evaluation fold.
-    if evaluation_end_ms in eval_signal_times:
-        unexecutable_end_signals += 1
-
     # Locked end-of-test bookkeeping. No further stop/extrema update here.
     if position is not None:
         final_close = float(eval_rows[-1]["close"])
@@ -377,20 +389,20 @@ def simulate_b_v1(
     longs = [t for t in trades if t["side"] == "long"]
     shorts = [t for t in trades if t["side"] == "short"]
 
-    # BTC overlap is diagnostic only and may include +/- one 1h signal bar.
-    btc_index = {bar.close_time: i for i, bar in enumerate(btc_hourly)}
-    btc_signal_by_index = {
-        btc_index[ts]: side
-        for ts, side in btc_signals.items()
-        if ts in btc_index
-    }
+    # Locked BTC overlap diagnostic / PASS gate.
+    # For each taken ZEC trade require complete BTC 1h data at T-1h, T and T+1h.
+    btc_hour_times = {bar.close_time for bar in btc_hourly}
     btc_overlap = 0
+    btc_overlap_denominator = 0
+    btc_overlap_dropped = 0
     for trade in trades:
         ts = int(trade["signal_close_time"])
-        if ts not in btc_index:
+        required = (ts - ONE_HOUR_MS, ts, ts + ONE_HOUR_MS)
+        if any(required_ts not in btc_hour_times for required_ts in required):
+            btc_overlap_dropped += 1
             continue
-        i = btc_index[ts]
-        if any(btc_signal_by_index.get(j) == trade["side"] for j in (i - 1, i, i + 1)):
+        btc_overlap_denominator += 1
+        if any(btc_signals.get(required_ts) == trade["side"] for required_ts in required):
             btc_overlap += 1
 
     def side_metrics(items: list[dict[str, Any]]) -> dict[str, Any]:
@@ -404,6 +416,19 @@ def simulate_b_v1(
 
     eval_minutes = (evaluation_end_ms - evaluation_start_ms + 1) / 60_000
     total_hold_minutes = sum(float(t["hold_minutes"]) for t in trades)
+    if gross_loss > 0:
+        profit_factor = round(gross_profit / gross_loss, 8)
+        profit_factor_infinite = False
+        profit_factor_defined = True
+    elif gross_profit > 0:
+        profit_factor = None
+        profit_factor_infinite = True
+        profit_factor_defined = True
+    else:
+        profit_factor = None
+        profit_factor_infinite = False
+        profit_factor_defined = False
+
     metrics = {
         "signals_1h": raw_signal_count,
         "ignored_signals_while_open": ignored_signals_while_open,
@@ -411,7 +436,9 @@ def simulate_b_v1(
         "closed_trades": len(trades),
         "net_pnl_usdt": round(net_pnl, 8),
         "net_expectancy_usdt_per_trade": round(net_pnl / len(trades), 8) if trades else None,
-        "profit_factor": round(gross_profit / gross_loss, 8) if gross_loss > 0 else None,
+        "profit_factor": profit_factor,
+        "profit_factor_infinite": profit_factor_infinite,
+        "profit_factor_defined": profit_factor_defined,
         "gross_profit_usdt": round(gross_profit, 8),
         "gross_loss_usdt": round(gross_loss, 8),
         "long": side_metrics(longs),
@@ -420,11 +447,22 @@ def simulate_b_v1(
         "time_in_market_percent": round(100 * total_hold_minutes / eval_minutes, 6) if eval_minutes else None,
         "average_hold_minutes": round(sum(float(t["hold_minutes"]) for t in trades) / len(trades), 6) if trades else None,
         "btc_same_direction_overlap_count": btc_overlap,
-        "btc_same_direction_overlap_percent": round(100 * btc_overlap / len(trades), 6) if trades else None,
+        "btc_same_direction_overlap_denominator": btc_overlap_denominator,
+        "btc_overlap_dropped_trades": btc_overlap_dropped,
+        "btc_overlap_dropped_percent_of_taken": round(
+            100 * btc_overlap_dropped / len(trades), 6
+        ) if trades else 0.0,
+        "btc_same_direction_overlap_percent": round(
+            100 * btc_overlap / btc_overlap_denominator, 6
+        ) if btc_overlap_denominator else None,
         "win_rate_percent": round(100 * len(winners) / len(trades), 4) if trades else None,
     }
 
-    if len(trades) < 20:
+    overlap_missing_too_high = (
+        len(trades) > 0
+        and metrics["btc_overlap_dropped_percent_of_taken"] > 10
+    )
+    if len(trades) < 20 or overlap_missing_too_high:
         verdict = "INSUFFICIENT_SAMPLE"
         conditions = None
     else:
@@ -433,7 +471,13 @@ def simulate_b_v1(
             long_clause = metrics["long"]["net_pnl_usdt"] > 0 and metrics["short"]["net_pnl_usdt"] > 0
         conditions = {
             "expectancy_positive": metrics["net_expectancy_usdt_per_trade"] is not None and metrics["net_expectancy_usdt_per_trade"] > 0,
-            "profit_factor_at_least_1_10": metrics["profit_factor"] is not None and metrics["profit_factor"] >= 1.10,
+            "profit_factor_at_least_1_10": (
+                metrics["profit_factor_infinite"]
+                or (
+                    metrics["profit_factor"] is not None
+                    and metrics["profit_factor"] >= 1.10
+                )
+            ),
             "both_active_sides_profitable": long_clause,
             "btc_overlap_below_60_percent": metrics["btc_same_direction_overlap_percent"] is not None and metrics["btc_same_direction_overlap_percent"] < 60,
         }
@@ -483,6 +527,20 @@ def smoke_cases() -> dict[str, bool]:
     atr = wilder_atr(atr_bars)
     first_atr_time = 25 * ONE_HOUR_MS - 1
     wilder_ready = len(atr) == 1 and abs(atr[first_atr_time] - 2.0) < 1e-12
+
+    # ATR at signal close includes the fully closed signal bar TR.
+    atr_signal_bars = [
+        HourBar(i * ONE_HOUR_MS, (i + 1) * ONE_HOUR_MS - 1, 100, 101, 99, 100)
+        for i in range(25)
+    ]
+    atr_signal_bars.append(
+        HourBar(25 * ONE_HOUR_MS, 26 * ONE_HOUR_MS - 1, 100, 110, 100, 109)
+    )
+    atr_signal = wilder_atr(atr_signal_bars)
+    expected_signal_atr = ((23 * 2.0) + 10.0) / 24.0
+    atr_includes_signal_bar = abs(
+        atr_signal[26 * ONE_HOUR_MS - 1] - expected_signal_atr
+    ) < 1e-12
 
     profile = {"entry_cost_rate": .0011, "exit_cost_rate": .0011}
     costs_both_sides = long_net_return(100, 100, profile) < 0 and short_net_return(100, 100, profile) < 0
@@ -563,13 +621,56 @@ def smoke_cases() -> dict[str, bool]:
     except ValueError as exc:
         invalid_final_rejected = str(exc) == "invalid_final_5m_close"
 
+    missing_entry_rejected = False
+    missing_entry = [
+        dict(row) for row in synthetic
+        if int(row["open_time"]) != 25 * ONE_HOUR_MS
+    ]
+    try:
+        simulate_b_v1(
+            missing_entry, synthetic,
+            evaluation_start_ms=eval_start,
+            evaluation_end_ms=eval_end,
+            stake_amount=50,
+            initial_capital=100,
+            cost_profile=profile,
+        )
+    except ValueError as exc:
+        missing_entry_rejected = str(exc) in {
+            "evaluation_5m_gap",
+            "missing_required_entry_bar",
+        }
+
+    # Missing BTC 1h data in T-1/T/T+1 drops the taken trade from both
+    # overlap numerator and denominator and is surfaced in metrics.
+    btc_missing = [
+        dict(row) for row in synthetic
+        if not (24 * ONE_HOUR_MS <= int(row["open_time"]) < 25 * ONE_HOUR_MS)
+    ]
+    btc_missing_outcome = simulate_b_v1(
+        synthetic, btc_missing,
+        evaluation_start_ms=eval_start,
+        evaluation_end_ms=eval_end,
+        stake_amount=50,
+        initial_capital=100,
+        cost_profile=profile,
+    )
+    btc_missing_accounted = (
+        btc_missing_outcome["metrics"]["btc_overlap_dropped_trades"] == 1
+        and btc_missing_outcome["metrics"]["btc_same_direction_overlap_denominator"] == 0
+        and btc_missing_outcome["verdict"] == "INSUFFICIENT_SAMPLE"
+    )
+
     return {
         "utc_1h_aggregation": utc_hour,
         "breakout_excludes_current_bar": breakout_excludes_current,
         "wilder_atr_24": wilder_ready,
+        "atr_includes_signal_bar": atr_includes_signal_bar,
         "long_short_costs": costs_both_sides,
         "entry_on_next_5m_open": next_5m_entry,
         "end_of_test_accounted": end_of_test_counted,
         "intrabar_no_retroactive_stop": intrabar_no_retro,
         "invalid_final_close_rejected": invalid_final_rejected,
+        "missing_required_entry_bar_rejected": missing_entry_rejected,
+        "btc_missing_overlap_accounted": btc_missing_accounted,
     }
