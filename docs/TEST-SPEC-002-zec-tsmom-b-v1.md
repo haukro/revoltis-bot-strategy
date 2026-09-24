@@ -183,11 +183,17 @@ The same stored fee + spread + impact cost model used for Strategy A is applied 
 
 ### 5.4 Evaluation-boundary bookkeeping
 
-If a position remains open at the exact end of the official evaluation fold, it is liquidated at the final 5m close and labeled `end_of_test`.
+If a position remains open at `2025-11-30 23:59:59.999 UTC`:
 
-The same locked transaction-cost model is applied.
+- liquidate it at the close of the final 5m candle in the evaluation fold
+- set `exit_reason = end_of_test`
+- apply the same locked fee + spread + impact model as for an ordinary exit
+- include the trade in closed-trade count, net PnL, expectancy, profit factor, side PnL, drawdown and all other evaluation metrics
+- do not update the chandelier stop or position extrema again on this bookkeeping tick; the final 5m close is used directly
 
-This is an evaluation bookkeeping close only, not an additional Strategy B exit rule.
+If the final 5m candle does not have a valid finite positive close, the position is not interpolated, estimated, or silently dropped. The official run is invalid and must not produce PASS / FAIL / INSUFFICIENT_SAMPLE.
+
+This is evaluation bookkeeping only. It does not change N, ATR, the 2× ATR stop, long/short logic, next-5m-open entry, or the rule that there is no time-based timeout. `end_of_test` is not a Strategy B exit signal during the fold.
 
 ## 6. Parameters that are not tuned
 
