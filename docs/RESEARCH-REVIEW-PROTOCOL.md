@@ -36,6 +36,11 @@ Purpose: prevent post-hoc tuning and keep all research decisions reproducible.
      - REJECT — conflicts with locked methodology
      - DEFER — new hypothesis requiring separate preregistration
      - CLARIFY — implementation detail that must be fixed before run
+   - After every Grok review, report back to the user in three explicit sections:
+     - **ACCEPTED** — what from Grok's response is accepted and why
+     - **IMPLEMENTED** — exactly what was changed in spec/code as a result
+     - **DISAGREED / MODIFIED** — what is rejected or reinterpreted, with the technical reason
+   - Never summarize a Grok review as generic agreement; preserve the specific disposition of each material point.
 
 5. **LOCK**
    - Commit the final spec to `main`.
