@@ -419,14 +419,19 @@ async def paper_system_health():
 
 @app.get("/api/paper/market-health")
 async def paper_market_health():
-    """Blind-safe feed health. Deliberately contains no fills, sides or performance."""
+    """Blind-safe aggregate feed health; never returns pair/timeframe rows."""
     require_durable_production_store()
-    rows = await supabase_get("market_data_health", "order=updated_at.desc&limit=100")
+    snapshot = await _paper_ops_snapshot()
+    counts = snapshot.get("market_health_counts", {})
+    degraded = sum(
+        int(counts.get(key, 0) or 0)
+        for key in ("STALE", "DEGRADED", "HALTED")
+    )
     return {
-        "status": "ok",
-        "rows": rows,
-        "live_trading": False,
+        "status": "degraded" if degraded else "ok",
+        "status_counts": counts,
         "blind_safe": True,
+        "live_trading": False,
     }
 
 
