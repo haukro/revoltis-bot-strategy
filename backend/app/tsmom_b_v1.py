@@ -507,6 +507,20 @@ def smoke_cases() -> dict[str, bool]:
     first_atr_time = 25 * ONE_HOUR_MS - 1
     wilder_ready = len(atr) == 1 and abs(atr[first_atr_time] - 2.0) < 1e-12
 
+    # ATR at signal close includes the fully closed signal bar TR.
+    atr_signal_bars = [
+        HourBar(i * ONE_HOUR_MS, (i + 1) * ONE_HOUR_MS - 1, 100, 101, 99, 100)
+        for i in range(25)
+    ]
+    atr_signal_bars.append(
+        HourBar(25 * ONE_HOUR_MS, 26 * ONE_HOUR_MS - 1, 100, 110, 100, 109)
+    )
+    atr_signal = wilder_atr(atr_signal_bars)
+    expected_signal_atr = ((23 * 2.0) + 10.0) / 24.0
+    atr_includes_signal_bar = abs(
+        atr_signal[26 * ONE_HOUR_MS - 1] - expected_signal_atr
+    ) < 1e-12
+
     profile = {"entry_cost_rate": .0011, "exit_cost_rate": .0011}
     costs_both_sides = long_net_return(100, 100, profile) < 0 and short_net_return(100, 100, profile) < 0
 
@@ -586,13 +600,56 @@ def smoke_cases() -> dict[str, bool]:
     except ValueError as exc:
         invalid_final_rejected = str(exc) == "invalid_final_5m_close"
 
+    missing_entry_rejected = False
+    missing_entry = [
+        dict(row) for row in synthetic
+        if int(row["open_time"]) != 25 * ONE_HOUR_MS
+    ]
+    try:
+        simulate_b_v1(
+            missing_entry, synthetic,
+            evaluation_start_ms=eval_start,
+            evaluation_end_ms=eval_end,
+            stake_amount=50,
+            initial_capital=100,
+            cost_profile=profile,
+        )
+    except ValueError as exc:
+        missing_entry_rejected = str(exc) in {
+            "evaluation_5m_gap",
+            "missing_required_entry_bar",
+        }
+
+    # Missing BTC 1h data in T-1/T/T+1 drops the taken trade from both
+    # overlap numerator and denominator and is surfaced in metrics.
+    btc_missing = [
+        dict(row) for row in synthetic
+        if not (24 * ONE_HOUR_MS <= int(row["open_time"]) < 25 * ONE_HOUR_MS)
+    ]
+    btc_missing_outcome = simulate_b_v1(
+        synthetic, btc_missing,
+        evaluation_start_ms=eval_start,
+        evaluation_end_ms=eval_end,
+        stake_amount=50,
+        initial_capital=100,
+        cost_profile=profile,
+    )
+    btc_missing_accounted = (
+        btc_missing_outcome["metrics"]["btc_overlap_dropped_trades"] == 1
+        and btc_missing_outcome["metrics"]["btc_same_direction_overlap_denominator"] == 0
+        and btc_missing_outcome["verdict"] == "INSUFFICIENT_SAMPLE"
+    )
+
     return {
         "utc_1h_aggregation": utc_hour,
         "breakout_excludes_current_bar": breakout_excludes_current,
         "wilder_atr_24": wilder_ready,
+        "atr_includes_signal_bar": atr_includes_signal_bar,
         "long_short_costs": costs_both_sides,
         "entry_on_next_5m_open": next_5m_entry,
         "end_of_test_accounted": end_of_test_counted,
         "intrabar_no_retroactive_stop": intrabar_no_retro,
         "invalid_final_close_rejected": invalid_final_rejected,
+        "missing_required_entry_bar_rejected": missing_entry_rejected,
+        "btc_missing_overlap_accounted": btc_missing_accounted,
     }
