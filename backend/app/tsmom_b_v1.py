@@ -448,7 +448,7 @@ def simulate_b_v1(
 
 
 def smoke_cases() -> dict[str, bool]:
-    """Synthetic-only checks. No official evaluation data."""
+    """Synthetic-only checks. Never touches the official evaluation fold."""
     def candle(ts: int, o: float, h: float, l: float, c: float) -> dict[str, Any]:
         return {
             "open_time": ts,
@@ -457,7 +457,7 @@ def smoke_cases() -> dict[str, bool]:
             "volume": 1.0, "quote_volume": 1.0,
         }
 
-    # UTC 1h aggregation and next-5m execution geometry.
+    # UTC 1h aggregation.
     rows = []
     for i in range(24):
         ts = i * FIVE_MIN_MS
@@ -468,10 +468,10 @@ def smoke_cases() -> dict[str, bool]:
 
     # Signal excludes current bar.
     hbars = [
-        HourBar(i * ONE_HOUR_MS, (i + 1) * ONE_HOUR_MS - 1, 100, 100, 99, 100)
+        HourBar(i * ONE_HOUR_MS, (i + 1) * ONE_HOUR_MS - 1, 100, 101, 99, 100)
         for i in range(24)
     ]
-    hbars.append(HourBar(24 * ONE_HOUR_MS, 25 * ONE_HOUR_MS - 1, 100, 102, 100, 101))
+    hbars.append(HourBar(24 * ONE_HOUR_MS, 25 * ONE_HOUR_MS - 1, 100, 102, 100, 101.5))
     sig = hourly_signals(hbars)
     breakout_excludes_current = sig.get(25 * ONE_HOUR_MS - 1) == "long"
 
@@ -484,23 +484,92 @@ def smoke_cases() -> dict[str, bool]:
     first_atr_time = 25 * ONE_HOUR_MS - 1
     wilder_ready = len(atr) == 1 and abs(atr[first_atr_time] - 2.0) < 1e-12
 
-    # Cost accounting round-trip must be negative at unchanged price.
     profile = {"entry_cost_rate": .0011, "exit_cost_rate": .0011}
     costs_both_sides = long_net_return(100, 100, profile) < 0 and short_net_return(100, 100, profile) < 0
 
-    # Intrabar rule: a high can only tighten stop for the next candle.
-    # We test the ordering primitive directly: old stop is not replaced until after hit check.
-    old_stop = 95.0
-    high = 110.0
-    low = 96.0
-    atr_value = 5.0
-    newly_computed = high - 2 * atr_value  # 100
-    no_same_bar_retro_stop = low > old_stop and low <= newly_computed
+    # Full synthetic engine path: 24h warmup, one breakout signal in the
+    # first evaluation hour, entry exactly at the next 5m open.
+    synthetic: list[dict[str, Any]] = []
+    for hour in range(26):
+        for j in range(12):
+            ts = hour * ONE_HOUR_MS + j * FIVE_MIN_MS
+            if hour < 24:
+                synthetic.append(candle(ts, 100, 101, 99, 100))
+            elif hour == 24:
+                close = 102.0 if j == 11 else 100.0
+                high = 102.2 if j == 11 else 101.0
+                synthetic.append(candle(ts, 100, high, 99.5, close))
+            else:
+                if j == 0:
+                    synthetic.append(candle(ts, 102.5, 103.0, 102.0, 102.4))
+                else:
+                    synthetic.append(candle(ts, 102.4, 102.8, 101.5, 101.8))
+
+    eval_start = 24 * ONE_HOUR_MS
+    eval_end = 26 * ONE_HOUR_MS - 1
+    engine = simulate_b_v1(
+        synthetic, synthetic,
+        evaluation_start_ms=eval_start,
+        evaluation_end_ms=eval_end,
+        stake_amount=50,
+        initial_capital=100,
+        cost_profile=profile,
+    )
+    next_5m_entry = (
+        len(engine["trades"]) == 1
+        and engine["trades"][0]["entry_time"] == 25 * ONE_HOUR_MS
+        and abs(engine["trades"][0]["entry_price"] - 102.5) < 1e-12
+    )
+    end_of_test_counted = (
+        len(engine["trades"]) == 1
+        and engine["trades"][0]["exit_reason"] == "end_of_test"
+        and engine["metrics"]["closed_trades"] == 1
+        and engine["metrics"]["net_expectancy_usdt_per_trade"] is not None
+    )
+
+    # Intrabar ordering: current candle makes a large new high, but its low is
+    # above the old stop and below the newly implied stop. It must survive this
+    # candle and may only gap through the tightened stop on the next 5m open.
+    retro = [dict(row) for row in synthetic]
+    first_entry_idx = next(i for i, row in enumerate(retro) if int(row["open_time"]) == 25 * ONE_HOUR_MS)
+    retro[first_entry_idx].update({"open": 102.5, "high": 110.0, "low": 100.0, "close": 105.0})
+    retro[first_entry_idx + 1].update({"open": 105.0, "high": 105.5, "low": 104.5, "close": 105.0})
+    retro_engine = simulate_b_v1(
+        retro, retro,
+        evaluation_start_ms=eval_start,
+        evaluation_end_ms=eval_end,
+        stake_amount=50,
+        initial_capital=100,
+        cost_profile=profile,
+    )
+    intrabar_no_retro = (
+        len(retro_engine["trades"]) >= 1
+        and retro_engine["trades"][0]["exit_reason"] == "chandelier_stop_gap"
+        and retro_engine["trades"][0]["exit_time"] == 25 * ONE_HOUR_MS + FIVE_MIN_MS
+    )
+
+    invalid_final_rejected = False
+    bad = [dict(row) for row in synthetic]
+    bad[-1]["close"] = float("nan")
+    try:
+        simulate_b_v1(
+            bad, bad,
+            evaluation_start_ms=eval_start,
+            evaluation_end_ms=eval_end,
+            stake_amount=50,
+            initial_capital=100,
+            cost_profile=profile,
+        )
+    except ValueError as exc:
+        invalid_final_rejected = str(exc) == "invalid_final_5m_close"
 
     return {
         "utc_1h_aggregation": utc_hour,
         "breakout_excludes_current_bar": breakout_excludes_current,
         "wilder_atr_24": wilder_ready,
         "long_short_costs": costs_both_sides,
-        "intrabar_no_retroactive_stop": no_same_bar_retro_stop,
+        "entry_on_next_5m_open": next_5m_entry,
+        "end_of_test_accounted": end_of_test_counted,
+        "intrabar_no_retroactive_stop": intrabar_no_retro,
+        "invalid_final_close_rejected": invalid_final_rejected,
     }
