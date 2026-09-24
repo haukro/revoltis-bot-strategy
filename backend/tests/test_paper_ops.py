@@ -1,6 +1,7 @@
 from app.paper_ops import (
     canonical_book_hash,
     canonical_book_payload,
+    walk_canonical_quote_notional,
     smoke_cases,
 )
 
@@ -68,3 +69,25 @@ def test_crossed_book_rejected():
         assert str(exc) == "crossed_or_locked_book"
     else:
         raise AssertionError("crossed book must fail closed")
+
+
+def test_decimal_book_walk_partial_and_complete():
+    partial = walk_canonical_quote_notional(
+        side="BUY",
+        quote_notional="50",
+        bids=[["99.9", "10"]],
+        asks=[["100", "0.2"]],
+    )
+    assert partial["complete"] is False
+    assert partial["filled_quote_notional"] == "20"
+    assert partial["filled_base_quantity"] == "0.2"
+
+    full = walk_canonical_quote_notional(
+        side="BUY",
+        quote_notional="50",
+        bids=[["99.9", "10"]],
+        asks=[["100", "0.2"], ["100.5", "1"]],
+    )
+    assert full["complete"] is True
+    assert full["levels_used"] == 2
+    assert full["vwap"] is not None

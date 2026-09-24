@@ -34,7 +34,12 @@ from .tsmom_c_v1 import (
 )
 from .momentum_prescreen import pack_market_series, unpack_market_series, analyze_block, pooled_analysis
 from .paper_execution import smoke_cases as paper_execution_smoke_cases
-from .paper_ops import smoke_cases as paper_ops_smoke_cases
+from .paper_ops import (
+    canonical_book_payload,
+    canonical_book_hash,
+    walk_canonical_quote_notional,
+    smoke_cases as paper_ops_smoke_cases,
+)
 from .rebound_experiment import (
     filter_b as rebound_filter_b,
     rebound_confirmation_context,
@@ -299,6 +304,83 @@ async def _paper_ops_snapshot() -> dict[str, Any]:
     raise HTTPException(503, "ops_health_unavailable")
 
 
+
+async def _paper_active_ops_policy() -> dict[str, Any]:
+    state = await supabase_get(
+        "ops_policy_state",
+        "account_key=eq.paper-default&select=policy_version_id&limit=1",
+    )
+    policy_id = (state[0] if state else {}).get("policy_version_id")
+    if not policy_id:
+        raise HTTPException(503, "paper_ops_policy_not_configured")
+    rows = await supabase_get("ops_policy_versions", f"id=eq.{policy_id}&limit=1")
+    if not rows:
+        raise HTTPException(503, "paper_ops_policy_missing")
+    return rows[0]
+
+
+async def _paper_runtime_binding(strategy_version_id: str) -> dict[str, Any] | None:
+    rows = await supabase_get(
+        "paper_strategy_runtime_bindings",
+        f"strategy_version_id=eq.{strategy_version_id}&limit=1",
+    )
+    return rows[0] if rows else None
+
+
+async def _fetch_okx_execution_book(pair: str, depth: int) -> dict[str, Any]:
+    if depth < 1 or depth > 400:
+        raise ValueError("invalid_market_book_depth")
+    async with httpx.AsyncClient(timeout=10, trust_env=False) as client:
+        response = await client.get(
+            OKX_BOOKS_URL,
+            params={"instId": pair.replace("/", "-"), "sz": depth},
+        )
+        response.raise_for_status()
+        payload = response.json()
+    if payload.get("code") != "0" or not payload.get("data"):
+        raise ValueError("okx_book_unavailable")
+    book = payload["data"][0]
+    provider_ts_ms = int(book.get("ts") or 0)
+    bids = book.get("bids") or []
+    asks = book.get("asks") or []
+    canonical = canonical_book_payload(
+        provider="okx",
+        pair=pair,
+        provider_ts_ms=provider_ts_ms,
+        bids=bids,
+        asks=asks,
+    )
+    snapshot_hash = canonical_book_hash(
+        provider="okx",
+        pair=pair,
+        provider_ts_ms=provider_ts_ms,
+        bids=bids,
+        asks=asks,
+    )
+    return {
+        **canonical,
+        "snapshot_hash": snapshot_hash,
+        "received_at": datetime.now(UTC).isoformat(),
+    }
+
+
+async def _paper_ack(
+    outbox_id: str,
+    worker_id: str,
+    lease_generation: int,
+    error: str | None = None,
+) -> Any:
+    return await supabase_rpc(
+        "paper_ack_outbox",
+        {
+            "p_outbox_id": outbox_id,
+            "p_worker_id": worker_id,
+            "p_lease_generation": lease_generation,
+            "p_error": error,
+        },
+    )
+
+
 @app.get("/api/paper/spec-004/smoke")
 async def paper_spec_004_smoke():
     """Synthetic-only checks for the locked strategy-neutral execution primitives."""
@@ -479,6 +561,421 @@ async def paper_kill_switch_enable(
             "p_account_key": "paper-default",
         },
     )
+
+
+@app.post("/api/internal/paper/recover")
+async def internal_paper_recover(
+    x_paper_scheduler_token: str | None = Header(default=None, alias="X-Paper-Scheduler-Token"),
+):
+    require_durable_production_store()
+    _require_internal_secret(x_paper_scheduler_token, "PAPER_SCHEDULER_TOKEN")
+    policy = await _paper_active_ops_policy()
+    limit = int(policy.get("max_worker_batch") or 0)
+    if limit < 1:
+        raise HTTPException(503, "paper_max_worker_batch_not_configured")
+
+    run_id = str(uuid4())
+    commit = os.getenv("VERCEL_GIT_COMMIT_SHA", "unknown")
+    worker = "paper-recovery-worker"
+    await supabase_rpc(
+        "paper_record_worker_heartbeat",
+        {
+            "p_worker_name": worker,
+            "p_run_id": run_id,
+            "p_phase": "START",
+            "p_status": "RUNNING",
+            "p_claimed_count": 0,
+            "p_processed_count": 0,
+            "p_error_code": None,
+            "p_software_commit": commit,
+        },
+    )
+
+    processed = 0
+    try:
+        candidates = await supabase_rpc(
+            "paper_recovery_candidates",
+            {"p_account_key": "paper-default", "p_limit": limit},
+        )
+        candidates = candidates or {}
+
+        for reservation_id in candidates.get("stale_reservations", [])[:limit]:
+            result = await supabase_rpc(
+                "paper_release_stale_reservation",
+                {
+                    "p_reservation_id": reservation_id,
+                    "p_worker_id": worker,
+                    "p_software_commit": commit,
+                    "p_account_key": "paper-default",
+                },
+            )
+            if (result or {}).get("released"):
+                processed += 1
+
+        remaining = max(0, limit - processed)
+        for order_id in candidates.get("kill_switch_cancel_orders", [])[:remaining]:
+            result = await supabase_rpc(
+                "paper_recover_order",
+                {
+                    "p_order_id": order_id,
+                    "p_action": "KILL_SWITCH_CANCEL",
+                    "p_worker_id": worker,
+                    "p_software_commit": commit,
+                    "p_account_key": "paper-default",
+                },
+            )
+            if (result or {}).get("applied"):
+                processed += 1
+
+        remaining = max(0, limit - processed)
+        for order_id in candidates.get("expired_orders", [])[:remaining]:
+            result = await supabase_rpc(
+                "paper_recover_order",
+                {
+                    "p_order_id": order_id,
+                    "p_action": "ORDER_TIMEOUT",
+                    "p_worker_id": worker,
+                    "p_software_commit": commit,
+                    "p_account_key": "paper-default",
+                },
+            )
+            if (result or {}).get("applied"):
+                processed += 1
+
+        await supabase_rpc(
+            "paper_record_worker_heartbeat",
+            {
+                "p_worker_name": worker,
+                "p_run_id": run_id,
+                "p_phase": "COMPLETE",
+                "p_status": "IDLE",
+                "p_claimed_count": len(candidates.get("stale_reservations", []))
+                    + len(candidates.get("kill_switch_cancel_orders", []))
+                    + len(candidates.get("expired_orders", [])),
+                "p_processed_count": processed,
+                "p_error_code": None,
+                "p_software_commit": commit,
+            },
+        )
+        return {
+            "status": "ok",
+            "processed": processed,
+            "live_trading": False,
+            "alpha_logic_touched": False,
+            "strategy_b_modified": False,
+        }
+    except Exception:
+        try:
+            await supabase_rpc(
+                "paper_record_worker_heartbeat",
+                {
+                    "p_worker_name": worker,
+                    "p_run_id": run_id,
+                    "p_phase": "COMPLETE",
+                    "p_status": "FAILED",
+                    "p_claimed_count": 0,
+                    "p_processed_count": processed,
+                    "p_error_code": "RECOVERY_WORKER_FAILED",
+                    "p_software_commit": commit,
+                },
+            )
+        finally:
+            raise
+
+
+@app.post("/api/internal/paper/outbox-tick")
+async def internal_paper_outbox_tick(
+    x_paper_scheduler_token: str | None = Header(default=None, alias="X-Paper-Scheduler-Token"),
+):
+    require_durable_production_store()
+    _require_internal_secret(x_paper_scheduler_token, "PAPER_SCHEDULER_TOKEN")
+
+    ops_policy = await _paper_active_ops_policy()
+    limit = int(ops_policy.get("max_worker_batch") or 0)
+    depth = int(ops_policy.get("market_book_depth") or 0)
+    lease_seconds = int(os.getenv("PAPER_OUTBOX_LEASE_SECONDS", "0") or 0)
+    if limit < 1:
+        raise HTTPException(503, "paper_max_worker_batch_not_configured")
+    if depth < 1 or depth > 400:
+        raise HTTPException(503, "paper_market_book_depth_not_configured")
+    if lease_seconds < 1:
+        raise HTTPException(503, "paper_outbox_lease_seconds_not_configured")
+
+    run_id = str(uuid4())
+    commit = os.getenv("VERCEL_GIT_COMMIT_SHA", "unknown")
+    worker = f"paper-outbox-worker:{run_id}"
+    claimed = await supabase_rpc(
+        "paper_claim_outbox",
+        {
+            "p_worker_id": worker,
+            "p_limit": limit,
+            "p_lease_seconds": lease_seconds,
+        },
+    )
+    claimed = claimed or []
+
+    await supabase_rpc(
+        "paper_record_worker_heartbeat",
+        {
+            "p_worker_name": "paper-outbox-worker",
+            "p_run_id": run_id,
+            "p_phase": "START",
+            "p_status": "RUNNING",
+            "p_claimed_count": len(claimed),
+            "p_processed_count": 0,
+            "p_error_code": None,
+            "p_software_commit": commit,
+        },
+    )
+
+    processed = 0
+    errors = 0
+
+    for item in claimed:
+        outbox_id = item["id"]
+        generation = int(item["lease_generation"])
+        event_type = item["event_type"]
+        entity_id = item["entity_id"]
+        try:
+            if event_type == "RISK_EVALUATE":
+                signals = await supabase_get("paper_signals", f"id=eq.{entity_id}&limit=1")
+                if not signals:
+                    raise ValueError("signal_not_found")
+                signal = signals[0]
+                binding = await _paper_runtime_binding(signal["strategy_version_id"])
+                if not binding or not binding.get("enabled"):
+                    await _paper_ack(outbox_id, worker, generation, "RUNTIME_BINDING_DISABLED")
+                    errors += 1
+                    continue
+
+                risk = await supabase_rpc(
+                    "paper_reserve_risk",
+                    {
+                        "p_signal_id": entity_id,
+                        "p_policy_version_id": binding["risk_policy_version_id"],
+                        "p_account_key": "paper-default",
+                        "p_worker_id": worker,
+                        "p_software_commit": commit,
+                    },
+                )
+                if (risk or {}).get("decision") == "APPROVED":
+                    reservations = await supabase_get(
+                        "risk_reservations",
+                        f"signal_id=eq.{entity_id}&limit=1",
+                    )
+                    reservation = reservations[0] if reservations else None
+                    if reservation and reservation.get("status") in ("RESERVED", "PARTIALLY_CONSUMED"):
+                        await supabase_rpc(
+                            "paper_create_order_from_approved_signal",
+                            {
+                                "p_signal_id": entity_id,
+                                "p_side": "BUY" if signal["side"] == "LONG" else "SELL",
+                                "p_intent_type": "ENTRY",
+                                "p_order_type": "MARKET",
+                                "p_worker_id": worker,
+                                "p_software_commit": commit,
+                            },
+                        )
+                ack = await _paper_ack(outbox_id, worker, generation, None)
+                if (ack or {}).get("acknowledged"):
+                    processed += 1
+                continue
+
+            if event_type == "BIND_FILL_ATTEMPT":
+                orders = await supabase_get("paper_orders", f"id=eq.{entity_id}&limit=1")
+                if not orders:
+                    raise ValueError("order_not_found")
+                order = orders[0]
+
+                reservations = await supabase_get(
+                    "risk_reservations",
+                    f"signal_id=eq.{order['signal_id']}&limit=1",
+                )
+                if not reservations:
+                    raise ValueError("risk_reservation_not_found")
+                reservation = reservations[0]
+
+                policies = await supabase_get(
+                    "risk_policy_versions",
+                    f"id=eq.{reservation['policy_version_id']}&limit=1",
+                )
+                if not policies:
+                    raise ValueError("risk_policy_not_found")
+                risk_policy = policies[0]
+                fee_rate = risk_policy.get("fee_rate")
+                if fee_rate is None:
+                    await supabase_rpc(
+                        "paper_terminalize_order",
+                        {
+                            "p_order_id": entity_id,
+                            "p_terminal_state": "FAILED",
+                            "p_reason_code": "EXECUTION_FEE_POLICY_MISSING",
+                            "p_worker_id": worker,
+                            "p_software_commit": commit,
+                            "p_account_key": "paper-default",
+                        },
+                    )
+                    await _paper_ack(outbox_id, worker, generation, None)
+                    processed += 1
+                    continue
+
+                fetched = await _fetch_okx_execution_book(order["pair"], depth)
+                snapshot = await supabase_rpc(
+                    "paper_ingest_market_snapshot",
+                    {
+                        "p_pair": fetched["pair"],
+                        "p_provider": fetched["provider"],
+                        "p_provider_ts_ms": fetched["provider_ts_ms"],
+                        "p_received_at": fetched["received_at"],
+                        "p_bid_levels": fetched["bids"],
+                        "p_ask_levels": fetched["asks"],
+                        "p_best_bid": fetched["bids"][0][0],
+                        "p_best_ask": fetched["asks"][0][0],
+                        "p_snapshot_hash": fetched["snapshot_hash"],
+                        "p_software_commit": commit,
+                    },
+                )
+                attempt_seq = int((item.get("payload") or {}).get("attempt_seq") or 1)
+                bound = await supabase_rpc(
+                    "paper_bind_execution_attempt",
+                    {
+                        "p_outbox_id": outbox_id,
+                        "p_lease_generation": generation,
+                        "p_order_id": entity_id,
+                        "p_market_snapshot_id": snapshot["id"],
+                        "p_policy_version_id": reservation["policy_version_id"],
+                        "p_attempt_seq": attempt_seq,
+                        "p_worker_id": worker,
+                        "p_software_commit": commit,
+                    },
+                )
+                if not (bound or {}).get("execution_attempt_id"):
+                    # Lease lost or event became terminal while fetching market data.
+                    continue
+
+                bound_snapshot_id = bound.get("market_snapshot_id") or snapshot["id"]
+                if bound_snapshot_id != snapshot["id"]:
+                    rows = await supabase_get(
+                        "execution_market_snapshots",
+                        f"id=eq.{bound_snapshot_id}&limit=1",
+                    )
+                    if not rows:
+                        raise ValueError("bound_market_snapshot_missing")
+                    use_snapshot = rows[0]
+                    bids = use_snapshot["bid_levels"]
+                    asks = use_snapshot["ask_levels"]
+                    provider_ts_ms = int(use_snapshot["provider_ts_ms"])
+                else:
+                    bids = fetched["bids"]
+                    asks = fetched["asks"]
+                    provider_ts_ms = int(fetched["provider_ts_ms"])
+
+                remaining_notional = max(
+                    0.0,
+                    float(order["intended_notional"]) - float(order.get("filled_notional") or 0),
+                )
+                if remaining_notional <= 0:
+                    await _paper_ack(outbox_id, worker, generation, None)
+                    processed += 1
+                    continue
+
+                fill = walk_canonical_quote_notional(
+                    side=order["side"],
+                    quote_notional=str(remaining_notional),
+                    bids=bids,
+                    asks=asks,
+                )
+                if float(fill["filled_quote_notional"]) <= 0:
+                    await _paper_ack(outbox_id, worker, generation, "NO_EXECUTABLE_DEPTH")
+                    errors += 1
+                    continue
+
+                if not fill["complete"] and not risk_policy.get("partial_fill_allowed"):
+                    await supabase_rpc(
+                        "paper_terminalize_order",
+                        {
+                            "p_order_id": entity_id,
+                            "p_terminal_state": "FAILED",
+                            "p_reason_code": "INSUFFICIENT_BOOK_DEPTH",
+                            "p_worker_id": worker,
+                            "p_software_commit": commit,
+                            "p_account_key": "paper-default",
+                        },
+                    )
+                    await _paper_ack(outbox_id, worker, generation, None)
+                    processed += 1
+                    continue
+
+                prior_fills = await supabase_get(
+                    "paper_fills",
+                    f"order_id=eq.{entity_id}&select=fill_seq&order=fill_seq.desc&limit=1",
+                )
+                fill_seq = int(prior_fills[0]["fill_seq"]) + 1 if prior_fills else 1
+                fee_amount = float(fill["filled_quote_notional"]) * float(fee_rate)
+                filled_at = datetime.fromtimestamp(provider_ts_ms / 1000, UTC).isoformat()
+
+                applied = await supabase_rpc(
+                    "paper_apply_fill",
+                    {
+                        "p_outbox_id": outbox_id,
+                        "p_lease_generation": generation,
+                        "p_order_id": entity_id,
+                        "p_execution_attempt_id": bound["execution_attempt_id"],
+                        "p_fill_seq": fill_seq,
+                        "p_fill_quantity": fill["filled_base_quantity"],
+                        "p_fill_price": fill["vwap"],
+                        "p_fee_amount": str(fee_amount),
+                        "p_spread_bps": fill["spread_bps"],
+                        "p_impact_bps": fill["impact_bps"],
+                        "p_filled_at": filled_at,
+                        "p_account_key": "paper-default",
+                        "p_worker_id": worker,
+                        "p_software_commit": commit,
+                    },
+                )
+                if (applied or {}).get("applied") or (applied or {}).get("idempotent_replay"):
+                    ack = await _paper_ack(outbox_id, worker, generation, None)
+                    if (ack or {}).get("acknowledged"):
+                        processed += 1
+                continue
+
+            # Unknown events are released for retry and surfaced as worker errors.
+            await _paper_ack(outbox_id, worker, generation, f"UNHANDLED_EVENT:{event_type}")
+            errors += 1
+        except Exception as exc:
+            errors += 1
+            try:
+                await _paper_ack(
+                    outbox_id,
+                    worker,
+                    generation,
+                    f"{type(exc).__name__}:{str(exc)[:120]}",
+                )
+            except Exception:
+                pass
+
+    await supabase_rpc(
+        "paper_record_worker_heartbeat",
+        {
+            "p_worker_name": "paper-outbox-worker",
+            "p_run_id": run_id,
+            "p_phase": "COMPLETE",
+            "p_status": "IDLE" if errors == 0 else "DEGRADED",
+            "p_claimed_count": 0,
+            "p_processed_count": processed,
+            "p_error_code": None if errors == 0 else "OUTBOX_ITEM_ERRORS",
+            "p_software_commit": commit,
+        },
+    )
+    return {
+        "status": "ok" if errors == 0 else "degraded",
+        "claimed": len(claimed),
+        "processed": processed,
+        "errors": errors,
+        "live_trading": False,
+        "alpha_logic_touched": False,
+        "strategy_b_modified": False,
+    }
 
 
 @app.post("/api/internal/paper/reconcile")

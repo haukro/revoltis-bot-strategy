@@ -121,6 +121,92 @@ def canonical_book_hash(**kwargs: Any) -> str:
     return hashlib.sha256(canonical_book_bytes(**kwargs)).hexdigest()
 
 
+
+def walk_canonical_quote_notional(
+    *,
+    side: str,
+    quote_notional: Any,
+    bids: Iterable[Iterable[Any]],
+    asks: Iterable[Iterable[Any]],
+) -> dict[str, Any]:
+    """Walk a canonical book using exact Decimal arithmetic.
+
+    Returns canonical decimal strings so the caller may persist them without
+    binary-float drift.
+    """
+    if side not in ("BUY", "SELL"):
+        raise ValueError("invalid_side")
+    try:
+        requested = Decimal(str(quote_notional))
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise ValueError("invalid_quote_notional") from exc
+    if not requested.is_finite() or requested <= 0:
+        raise ValueError("invalid_quote_notional")
+
+    nb = _normalize_levels(bids, descending=True)
+    na = _normalize_levels(asks, descending=False)
+    best_bid = Decimal(nb[0][0])
+    best_ask = Decimal(na[0][0])
+    if best_bid >= best_ask:
+        raise ValueError("crossed_or_locked_book")
+
+    levels = na if side == "BUY" else nb
+    best = best_ask if side == "BUY" else best_bid
+    remaining = requested
+    quote_filled = Decimal("0")
+    base_filled = Decimal("0")
+    levels_used = 0
+
+    for price_s, qty_s in levels:
+        if remaining <= 0:
+            break
+        price = Decimal(price_s)
+        available_base = Decimal(qty_s)
+        available_quote = price * available_base
+        take_quote = min(remaining, available_quote)
+        take_base = take_quote / price
+        quote_filled += take_quote
+        base_filled += take_base
+        remaining -= take_quote
+        levels_used += 1
+
+    complete = remaining <= Decimal("0")
+    if base_filled <= 0:
+        return {
+            "side": side,
+            "requested_quote_notional": _canonical_decimal(requested),
+            "filled_quote_notional": "0",
+            "filled_base_quantity": "0",
+            "vwap": None,
+            "best_price": _canonical_decimal(best),
+            "spread_bps": None,
+            "impact_bps": None,
+            "levels_used": 0,
+            "complete": False,
+        }
+
+    vwap = quote_filled / base_filled
+    mid = (best_bid + best_ask) / Decimal("2")
+    spread_bps = (best_ask - best_bid) / mid * Decimal("10000")
+    impact_bps = (
+        (vwap / best - Decimal("1")) * Decimal("10000")
+        if side == "BUY"
+        else (Decimal("1") - vwap / best) * Decimal("10000")
+    )
+
+    return {
+        "side": side,
+        "requested_quote_notional": _canonical_decimal(requested),
+        "filled_quote_notional": _canonical_decimal(quote_filled),
+        "filled_base_quantity": _canonical_decimal(base_filled),
+        "vwap": _canonical_decimal(vwap),
+        "best_price": _canonical_decimal(best),
+        "spread_bps": _canonical_decimal(spread_bps),
+        "impact_bps": _canonical_decimal(impact_bps),
+        "levels_used": levels_used,
+        "complete": complete,
+    }
+
 def blind_worker_projection(row: dict[str, Any], age_category: str) -> dict[str, Any]:
     """Blind-safe worker projection: no lifetime throughput counters."""
     return {
@@ -207,6 +293,13 @@ def smoke_cases() -> dict[str, bool]:
     except ValueError as exc:
         crossed_rejected = str(exc) == "crossed_or_locked_book"
 
+    exact_walk = walk_canonical_quote_notional(
+        side="BUY",
+        quote_notional="50",
+        bids=[["99.9", "10"]],
+        asks=[["100", "0.2"], ["100.5", "1"]],
+    )
+
     return {
         "canonical_format_equivalent": a == b,
         "canonical_hash_equivalent": h1 == h2,
@@ -216,4 +309,6 @@ def smoke_cases() -> dict[str, bool]:
         "zero_qty_dropped": all(level[0] != "8" for level in a["bids"]),
         "scale_over_18_rejected_without_rounding": scale_rejected,
         "crossed_book_rejected": crossed_rejected,
+        "decimal_book_walk_complete": exact_walk["complete"] is True,
+        "decimal_book_walk_uses_depth": exact_walk["levels_used"] == 2,
     }
