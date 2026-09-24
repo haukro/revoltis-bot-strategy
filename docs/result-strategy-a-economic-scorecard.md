@@ -44,6 +44,16 @@ Block A: 2025-12-27 17:15 UTC to 2026-03-27 17:14:59.999 UTC
 Block B: 2026-03-27 17:15 UTC to 2026-06-25 17:14:59.999 UTC  
 Block C: 2026-06-25 17:15 UTC to 2026-09-23 17:14:59.999 UTC
 
+
+### Why block A has 89 trades while run 8ec7642c had 40
+
+These counts come from different research procedures and must not be compared as if they were the same run.
+
+- Economic scorecard block A trades the full 90-day interval continuously after indicator warmup. That produces 89 trades.
+- Run `8ec7642c-fbdc-4dc3-a28b-ee53fc6bb819` was a preregistered paired evaluation using three walk-forward validation slices plus the final holdout. Training portions were deliberately not traded or counted. That produced 40 baseline trades.
+- The underlying calendar block overlaps, but the traded subperiods differ by design.
+- Strategy B comparisons against Strategy A must therefore use the economic scorecard definition when comparing full-block economics, and must use the paired/WF definition only when reproducing that specific evaluation methodology.
+
 ## Economic conclusion
 
 Across the three fixed 90-day blocks:
