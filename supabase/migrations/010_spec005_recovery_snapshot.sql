@@ -54,14 +54,26 @@ begin
     raise exception 'risk_policy_execution_ages_required';
   end if;
 
+  select * into v_row
+  from public.paper_strategy_runtime_bindings
+  where strategy_version_id=p_strategy_version_id
+  for update;
+
+  if found then
+    if v_row.risk_policy_version_id<>p_risk_policy_version_id then
+      raise exception 'runtime_binding_policy_locked';
+    end if;
+    update public.paper_strategy_runtime_bindings
+    set enabled=p_enabled
+    where strategy_version_id=p_strategy_version_id
+    returning * into v_row;
+    return v_row;
+  end if;
+
   insert into public.paper_strategy_runtime_bindings(
     strategy_version_id,risk_policy_version_id,enabled
   )
   values(p_strategy_version_id,p_risk_policy_version_id,p_enabled)
-  on conflict(strategy_version_id) do update
-  set risk_policy_version_id=excluded.risk_policy_version_id,
-      enabled=excluded.enabled,
-      locked_at=clock_timestamp()
   returning * into v_row;
 
   return v_row;
@@ -155,7 +167,7 @@ declare
   v_from text;
 begin
   if p_side not in ('BUY','SELL') then raise exception 'invalid_order_side'; end if;
-  if p_intent_type <> 'ENTRY' then raise exception 'phase2_entry_only'; end if;
+  if p_intent_type not in ('ENTRY','EXIT','EMERGENCY_EXIT') then raise exception 'invalid_intent_type'; end if;
   if p_order_type <> 'MARKET' then raise exception 'unsupported_order_type'; end if;
 
   select * into v_signal from public.paper_signals where id = p_signal_id;
@@ -176,28 +188,34 @@ begin
   where account_key='paper-default'
   for update;
 
-  if v_ks.state <> 'RUNNING' then
+  if p_intent_type='ENTRY' and v_ks.state<>'RUNNING' then
     raise exception 'new_entry_blocked_kill_switch:%',v_ks.state;
   end if;
 
-  select * into v_risk_state
-  from public.portfolio_risk_state
-  where account_key='paper-default'
-  for update;
-
-  if not found then raise exception 'portfolio_risk_state_missing'; end if;
-
-  select * into v_res
-  from public.risk_reservations
-  where signal_id=p_signal_id
-  for update;
-
-  if not found or v_res.status not in ('RESERVED','PARTIALLY_CONSUMED') then
-    raise exception 'active_risk_reservation_required';
+  if p_intent_type<>'ENTRY' and v_ks.state in ('HALTED','RECOVERY_PENDING') then
+    raise exception 'new_order_blocked_kill_switch:%',v_ks.state;
   end if;
 
-  if v_res.expires_at is not null and v_res.expires_at<clock_timestamp() then
-    raise exception 'risk_reservation_expired';
+  if p_intent_type='ENTRY' then
+    select * into v_risk_state
+    from public.portfolio_risk_state
+    where account_key='paper-default'
+    for update;
+
+    if not found then raise exception 'portfolio_risk_state_missing'; end if;
+
+    select * into v_res
+    from public.risk_reservations
+    where signal_id=p_signal_id
+    for update;
+
+    if not found or v_res.status not in ('RESERVED','PARTIALLY_CONSUMED') then
+      raise exception 'active_risk_reservation_required';
+    end if;
+
+    if v_res.expires_at is not null and v_res.expires_at<clock_timestamp() then
+      raise exception 'risk_reservation_expired';
+    end if;
   end if;
 
   v_key := encode(digest(convert_to(
@@ -220,14 +238,16 @@ begin
   )
   returning * into v_order;
 
-  update public.risk_reservations
-  set expires_at = case
-      when v_policy.max_order_age_ms is not null and v_policy.max_order_age_ms > 0
-        then clock_timestamp() + (v_policy.max_order_age_ms * interval '1 millisecond')
-      else expires_at
-    end,
-    state_version=state_version+1
-  where id=v_res.id;
+  if p_intent_type='ENTRY' then
+    update public.risk_reservations
+    set expires_at = case
+        when v_policy.max_order_age_ms is not null and v_policy.max_order_age_ms > 0
+          then clock_timestamp() + (v_policy.max_order_age_ms * interval '1 millisecond')
+        else expires_at
+      end,
+      state_version=state_version+1
+    where id=v_res.id;
+  end if;
 
   insert into public.paper_order_events(order_id, from_state, to_state, reason_code)
   values (v_order.id, null, 'CREATED', 'ORDER_CREATED');
