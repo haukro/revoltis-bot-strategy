@@ -1541,7 +1541,7 @@ async def finalize_momentum_prescreen():
 
 
 _TSMOM_B_V1_SPEC = "TEST-SPEC-002"
-_TSMOM_B_V1_SPEC_BASE_COMMIT = "1a178c3f1c61424e3d77b6912749c261a0a943d5"
+_TSMOM_B_V1_SPEC_BASE_COMMIT = "264a15ef39ad176827d806419c0c13f671257dc1"
 _TSMOM_B_V1_COST_SOURCE_RUN = "c4279991-66ae-44a2-9840-073c96bd8251"
 _TSMOM_B_V1_COST_BOOK_TS = "1790183884652"
 _TSMOM_B_V1_ENTRY_COST_RATE = 0.001086487119183424
@@ -1593,7 +1593,8 @@ async def tsmom_b_v1_data(symbol: str):
     pair = _TSMOM_B_V1_DATA[symbol]
     eval_start_ms = int(_TSMOM_B_V1_EVAL_START.timestamp() * 1000)
     eval_end_ms = int(_TSMOM_B_V1_EVAL_END.timestamp() * 1000)
-    warmup_ms = 24 * 60 * 60 * 1000
+    warmup_hours = 24 if symbol == "ZEC" else 25
+    warmup_ms = warmup_hours * 60 * 60 * 1000
     fetch_start = eval_start_ms - warmup_ms
     step = TIMEFRAME_MILLISECONDS["5m"]
     expected = int((eval_end_ms - fetch_start + 1) // step)
@@ -1631,7 +1632,7 @@ async def tsmom_b_v1_data(symbol: str):
             "snapshot": snapshot,
             "bars": expected,
             "source": "okx_public_spot",
-            "warmup_hours": 24,
+            "warmup_hours": warmup_hours,
         },
     }
     return await supabase_upsert("optimizer_runs", record)
