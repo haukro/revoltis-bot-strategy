@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field
 from .local_store import LocalStore
 from .simulation import simulate
 from .optimizer import optimize, present_optimizer_record, assess_candidate, aggregate_metrics
-from .trade_audit import matches_target, prepare_replay, replay_validation, unpack_snapshot, trade_tape, tape_summary
+from .trade_audit import matches_target, prepare_replay, replay_validation, unpack_snapshot, trade_tape, tape_summary, entry_path_audit
 from .costs import book_costs, FEE_SCHEDULE, FEE_TAKER, FEE_MAKER, net_return
 
 
@@ -887,6 +887,59 @@ def _same_numeric_metrics(expected: dict[str, Any], actual: dict[str, Any], tole
             if not math.isfinite(float(value)) or not math.isfinite(float(actual[key])) or abs(float(actual[key]) - float(value)) >= tolerance:
                 return False
     return True
+
+
+@app.get("/api/optimizer/{job_id}/entry-path-audit")
+async def optimizer_entry_path_audit(job_id: str):
+    """Read-only per-entry regime/path diagnostics from the stored validation snapshot."""
+    stored = await supabase_get("optimizer_runs", f"id=eq.{job_id}&limit=1")
+    record = next((row for row in stored if row.get("id") == job_id), None)
+    if record is None or record.get("status") != "completed":
+        raise HTTPException(404, "Completed optimizer run nebol nájdený.")
+
+    result = record.get("result") or {}
+    variants = result.get("variant_results") or []
+    selected_variant_id = result.get("variant_id")
+    row = next((item for item in variants if item.get("variant_id") == selected_variant_id), None)
+    if row is None:
+        raise HTTPException(422, "Run nemá auditovateľný vybraný variant.")
+    if row.get("timeframe") != "5m":
+        raise HTTPException(422, "Entry path audit je zatiaľ definovaný pre 5m tape.")
+
+    snapshot = (result.get("replay_snapshots") or {}).get(row.get("snapshot_id"))
+    if not snapshot:
+        raise HTTPException(422, "Run nemá validačný snapshot.")
+    candles = unpack_snapshot(snapshot)
+    trades = [
+        trade for trade in (row.get("trades") or result.get("trades") or [])
+        if trade.get("window") in {"wf1", "wf2", "wf3"}
+    ]
+    expected = int((row.get("walk_forward_metrics") or {}).get("closed_trades") or 0)
+    if len(trades) != expected:
+        raise HTTPException(409, "Uložený WF tape nie je kompletný.")
+
+    trail_start = float((row.get("settings") or {}).get("trailing_start_percent") or 0)
+    if trail_start <= 0:
+        raise HTTPException(422, "Run nemá platný trailing start.")
+
+    audit = entry_path_audit(candles, trades, trail_start)
+    return {
+        "source_job_id": job_id,
+        "pair": row.get("pair"),
+        "timeframe": row.get("timeframe"),
+        "variant_id": row.get("variant_id"),
+        "trail_start_percent": trail_start,
+        "read_only": True,
+        "grid_started": False,
+        "definitions": {
+            "pre_return_1h": "entry close / close 12 bars earlier - 1",
+            "pre_return_4h": "entry close / close 48 bars earlier - 1",
+            "realized_vol": "population stdev of close-to-close log returns; not annualized",
+            "local_swing": "rolling 24h high/low over 288 five-minute bars ending at entry",
+            "path_thresholds": "post-entry candle high/low; entry candle excluded",
+        },
+        **audit,
+    }
 
 
 @app.get("/api/optimizer/{job_id}/benchmark-risk")
