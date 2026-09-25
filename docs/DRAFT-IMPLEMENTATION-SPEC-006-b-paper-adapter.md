@@ -1,6 +1,6 @@
 # IMPLEMENTATION-SPEC-006 — Frozen Strategy-B Paper Adapter + Durable Reduce-Only Flatten
 
-Status: **DRAFT V3 HARDENED AFTER LOCK-GATE REVIEW — INDEPENDENT RE-REVIEW REQUIRED — NOT LOCKED, NOT IMPLEMENTED**
+Status: **DRAFT V4 PATCHED AFTER GROK LOCK-GATE — INDEPENDENT RE-REVIEW REQUIRED — NOT LOCKED, NOT IMPLEMENTED**
 
 Purpose: connect frozen TEST-SPEC-002 to the existing SPEC-004/005 paper execution stack without changing alpha logic, official verdict logic, or blind-test secrecy.
 
@@ -305,6 +305,12 @@ Rules:
 - the ownership row is immutable and survives position close for audit
 - a `NEVER_CREATED_FENCED` / no-fill ENTRY lifecycle can never own a paper position
 - ownership is not inferred from side, pair, timing, or current quantity; it is proved by this durable relation
+- when a paper position reaches `CLOSED`, that `paper_positions.id` is permanently closed and may never transition back to `OPENING|OPEN|EXIT_PENDING|CLOSING`
+- every later paper ENTRY cycle for the same `strategy_version_id + pair` must insert a **new** `paper_positions.id`
+- that new position id must receive a new immutable `paper_position_entry_ownership` row for the new `entry_action_id` / ENTRY order
+- no SPEC-006 RPC may “reopen” or recycle a historical CLOSED row
+
+Thus one paper position id corresponds to one paper exposure cycle only.
 
 A `REFERENCE_EXIT` may reduce only the paper position whose ownership `entry_action_id` equals its own `linked_entry_action_id`.
 ## 6. Durable paper flatten intent
@@ -362,15 +368,16 @@ Before any flatten intent may create or continue an EXIT order against non-zero 
 - `INVALID_RECOVERY` may claim the current position only when no other OPEN/PAUSED/CRITICAL intent already claims it
 - a claim conflict creates no second order and no economic effect
 - OPEN/PAUSED claim conflict with the true owner => wait/retry the current intent
-- CRITICAL claim conflict => do not steal the position; preserve the critical hold for explicit recovery
+- a transition to `CRITICAL` while paper quantity is non-zero may commit only if that same transaction already owns or atomically acquires `claimed_position_id` for the live paper position
+- no new `CRITICAL` intent with live qty may be persisted with `claimed_position_id IS NULL`
+- if another OPEN/PAUSED/CRITICAL intent already owns the position, do not steal the claim and do not create a competing CRITICAL owner/order; preserve/wait on the existing owner and surface the integrity fault without a second flatten owner
+- legacy/malformed CRITICAL rows with live qty and null claim, if ever discovered by reconciliation, block `INVALID_RECOVERY` for that same position or unresolved pair-cycle until explicit repair establishes ownership
 - `SATISFIED` intent no longer blocks the partial unique claim index
 - claim identity is internal/blind-hidden
 
 This DB invariant is the final duplicate-flatten gate across multiple reference cycles, recovery workers, crashes and retries.
 
 ### 6.2 Fence scope
-
-### 6.1 Fence scope
 
 Only `OPEN` or `PAUSED` flatten intents, regardless of `intent_origin`, fence new paper ENTRY creation or ENTRY fill application.
 
@@ -616,10 +623,10 @@ For `REFERENCE_EXIT`:
 - before creating/continuing an EXIT order, atomically set/reuse `claimed_position_id` for that exact position; claim conflict creates no order
 - if its linked ENTRY lifecycle is `NEVER_CREATED_FENCED` / terminal-no-fill, it can never claim a position owned by another cycle
 - if the active paper position is owned by a different ENTRY and another `OPEN`/`PAUSED` flatten intent owns that ENTRY, this intent stays OPEN and creates **no** EXIT order; the owning flatten proceeds
-- if the active paper position is owned by a different ENTRY and no live flatten owns that exposure, set CRITICAL: this is unowned/cross-cycle paper exposure
+- if the active paper position is owned by a different ENTRY and no live flatten owns that exposure, atomically claim that position for the faulting intent and set CRITICAL in the same transaction: this is unowned/cross-cycle paper exposure; no CRITICAL-with-live-qty may exist unclaimed
 - only after ownership matches may current paper side be compared to `reference_position_side`
 - immutable `locked_reduce_side` must equal LONG -> SELL or SHORT -> BUY
-- side mismatch after ownership match => CRITICAL, no order, no flip, no auto-satisfaction merely because reference is FLAT
+- side mismatch after ownership match => retain/acquire the same `claimed_position_id` and set CRITICAL atomically, no order, no flip, no auto-satisfaction merely because reference is FLAT
 
 For `INVALID_RECOVERY`:
 
@@ -629,7 +636,7 @@ For `INVALID_RECOVERY`:
 - if another OPEN/PAUSED intent already claims the position, INVALID recovery creates no competing EXIT order and waits while that existing durable flatten continues
 - if a CRITICAL intent claims the position, INVALID recovery does not steal it; explicit critical recovery is required
 - otherwise current paper side must be reducible by the intent's immutable `locked_reduce_side`
-- if the current paper side has changed such that `locked_reduce_side` would increase/reverse exposure, set intent CRITICAL, create no order, and do not flip
+- if the current paper side has changed such that `locked_reduce_side` would increase/reverse exposure, retain/acquire `claimed_position_id` and set intent CRITICAL in the same transaction, create no order, and do not flip
 
 If the ownership and origin-specific side invariants pass:
 
@@ -778,16 +785,32 @@ The paper LONG still belongs to the old cycle. The adapter must remain INVALID; 
 
 Then, and only then, persist the recovered shadow/cursor and resume with the next future 5m bar.
 
-If recovered reference is LONG/SHORT but paper is flat, opposite-side, same-side-but-wrong-cycle, or otherwise not coherent, do not issue a delayed ENTRY or flip. Remain INVALID and continue only through an allowed future reconciliation/new-epoch path.
+If recovered reference is LONG/SHORT but paper is flat, opposite-side, same-side-but-wrong-cycle, or otherwise not coherent:
+
+1. do not issue a delayed ENTRY or flip
+2. remain `INVALID`
+3. continue frozen incremental replay internally only as new exact 5m bars become available
+4. do not emit paper actions during that internal replay
+5. when replay first reaches a later verified reference `FLAT` boundary, execute the §14.3 decision under locks:
+   - if paper is already flat and no late ENTRY path/live flatten remains, recovery may proceed to coherent resume/new epoch
+   - if paper is still open, first defer to any existing owner claim; otherwise create/reuse the one `INVALID_RECOVERY` flatten and reduce paper to zero
+6. only after the recovery flatten is safely SATISFIED (or paper was already safely flat) may §14.4 create a new epoch if an integrity reset is required
+
+The required sequence for a hidden `EXIT_TO_FLAT -> later same-side ENTRY` gap is therefore:
+
+`stay INVALID -> internal replay to later FLAT -> §14.3 flatten old/wrong-cycle paper if needed -> paper flat + no late-entry capability -> optional §14.4 new epoch`
+
+At no point may recovery synthesize the hidden later ENTRY against a current book.
 
 ### 14.3 Recovery-only flatten when replay reference is FLAT
 
 If verified replay at the cutoff leaves reference `FLAT` but paper quantity is still > 0, historical dispatch suppression must not wedge paper.
 
-Under execution fence + shadow + paper-position lock, first inspect `paper_position_entry_ownership` and all OPEN/PAUSED flatten intents:
+Under execution fence + shadow + paper-position lock, first inspect `paper_position_entry_ownership` and all OPEN/PAUSED/CRITICAL flatten intents, including any reconciled malformed CRITICAL row whose claim is null but whose unresolved fault targets this same position or pair-cycle:
 
 - if an existing OPEN/PAUSED flatten intent already claims the active paper position, do **not** create a competing recovery EXIT order; remain INVALID and let that durable intent continue
 - if a CRITICAL intent claims the active position, do not steal it or auto-recover it through INVALID_RECOVERY
+- if reconciliation finds a CRITICAL-with-live-qty row whose claim is unexpectedly null for this same unresolved position/pair-cycle, treat recovery as blocked; do not create INVALID_RECOVERY until explicit repair establishes the one owner
 - once that owner intent finishes, re-evaluate recovery from the now-current paper state
 - only when paper exposure is not already owned by a live flatten may recovery create/reuse the one gap-scoped operational recovery intent
 
@@ -912,40 +935,56 @@ Do not enable TEST-SPEC-002 runtime binding until all are true:
 
 ### 17.1 Initial bootstrap is not an ENTRY
 
-Because paper runtime may be enabled after the official TEST-SPEC-002 fold has already started, the adapter must not assume reference `FLAT` at activation time and must not emit delayed historical paper trades.
+Because paper runtime may be enabled after the official TEST-SPEC-002 fold has already started, the adapter must not assume reference `FLAT` at activation time and must never catch up historical paper actions against current books.
+
+Definitions:
+
+- `bootstrap_commit_wall_time` = server wall-clock time captured inside the bootstrap commit transaction
+- `bootstrap_cutoff_5m` = the **latest fully closed exact 5m bar** available at or before `bootstrap_commit_wall_time`
+- a bar before `bootstrap_cutoff_5m` is historical bootstrap state only and is permanently non-dispatchable
+- while runtime binding is DISABLED, later newly closed 5m bars may be consumed internally one-by-one to find a safe FLAT boundary; they are also permanently non-dispatchable
 
 Before creating/enabling the first runtime binding:
 
 1. keep runtime binding DISABLED
-2. require paper state for this strategy_version + pair to be flat with no nonterminal ENTRY/EXIT order, no active lifecycle capable of exposure, and no OPEN/PAUSED flatten intent
-3. fetch a verified contiguous exact 5m series from the frozen forward-fold start (or an earlier frozen-B warmup checkpoint sufficient to reproduce the same state) through an activation cutoff
-4. replay the frozen incremental B logic internally only
-5. emit no `paper_strategy_actions`, paper orders, fills, or dispatch for historical bootstrap bars
-6. do not call official scoring/PASS/FAIL and do not copy official B result output
-7. expose no bootstrap position/side/entry/stop/cursor details on blind surfaces
+2. require paper state for this strategy_version + pair to be flat with no nonterminal ENTRY/EXIT order, no active lifecycle capable of exposure, and no OPEN/PAUSED/CRITICAL flatten claim
+3. capture `bootstrap_commit_wall_time`
+4. set `bootstrap_cutoff_5m` to the latest fully closed exact 5m at that wall time; never choose an older convenient FLAT bar as the activation cursor
+5. fetch a verified contiguous exact 5m series from the frozen forward-fold start (or an earlier frozen-B warmup checkpoint sufficient to reproduce the same state) through that cutoff
+6. replay frozen incremental B internally only
+7. emit no `paper_strategy_actions`, paper orders, fills, or dispatch for any bootstrap-consumed bar
+8. do not call official scoring/PASS/FAIL and do not copy official B result output
+9. expose no bootstrap position/side/entry/stop/cursor/activation timing on blind surfaces
 
-If bootstrap replay at the cutoff is `FLAT`:
+If reference state at `bootstrap_cutoff_5m` is `FLAT`:
 
 - create the first `adapter_epoch_id`
-- persist shadow = CONTIGUOUS + FLAT at that verified cursor
+- persist shadow = CONTIGUOUS + FLAT with cursor exactly at `bootstrap_cutoff_5m`
 - set paper activation time separately
-- enable runtime dispatch only for the **next future expected 5m** after the committed bootstrap cursor
+- enable runtime binding only after that commit
+- the **first dispatch-eligible bar is the first newly closed expected 5m strictly after the committed cutoff**
+- there is no catch-up dispatch for any bar at or before the cutoff
 
-If bootstrap replay at the cutoff is `LONG` or `SHORT`:
+If reference state at `bootstrap_cutoff_5m` is `LONG` or `SHORT`:
 
 - do not synthesize or delay an ENTRY
 - keep runtime binding DISABLED
-- continue internal contiguous frozen-B bootstrap replay until the first verified future reference FLAT boundary
-- initialize the first epoch at that FLAT boundary
-- enable dispatch only for subsequent 5m bars
+- after bootstrap commit, consume only **subsequent newly closed exact 5m bars** internally in chronological order
+- those internally consumed bars emit no paper action/dispatch
+- remain unbound until one of those newly closed bars produces the first verified reference FLAT boundary
+- commit the first epoch/cursor at that newly observed FLAT bar
+- enable runtime binding only after that FLAT commit
+- the first dispatch-eligible bar is the next newly closed expected 5m strictly after the FLAT cursor
 
-If bootstrap data has a true gap or parity/integrity check fails:
+Therefore a past FLAT discovered anywhere before `bootstrap_commit_wall_time` can never become a dispatch start point. No historical interval between an older FLAT and “now” is ever replayed into paper execution.
+
+If bootstrap or unbound-forward data has a true gap or parity/integrity check fails:
 
 - do not create/enable the runtime binding
 - do not guess state
-- remain operationally unbound until contiguous state can be verified
+- remain operationally unbound until contiguous state can be verified under the same no-historical-dispatch rule
 
-Thus the paper adapter begins from a clean, verified FLAT boundary without rewriting or contaminating official B history.
+Thus the paper adapter begins only from a clean, verified FLAT boundary at the bootstrap frontier or later, without delayed exposure and without rewriting or contaminating official B history.
 
 Paper activation time must be stored separately from the official fold start and remain internal/blind-hidden until the blind period ends.
 
@@ -980,7 +1019,9 @@ Lock order / race:
 ENTRY lifecycle / same-bar:
 20. every reference ENTRY has a durable lifecycle row
 21. first economic ENTRY fill creates immutable paper-position ownership linked to that ENTRY action/order
-22. later fills reuse ownership; NEVER_CREATED_FENCED/no-fill ENTRY can never own a position
+21a. closing a paper position permanently retires that `paper_positions.id`; a later ENTRY cycle inserts a new id and new ownership row
+21b. no SPEC-006 path can mutate a CLOSED position row back to an active state
+22. later fills of the same ENTRY order reuse ownership; NEVER_CREATED_FENCED/no-fill ENTRY can never own a position
 23. same-bar ENTRY+EXIT persists lifecycle=`NEVER_CREATED_FENCED`
 24. same-bar ENTRY outbox retry permanently no-ops and never creates a delayed order
 25. missing lifecycle row is never treated as terminal
@@ -1001,6 +1042,8 @@ Fence scope / next cycles:
 Reduce-only / durable intent:
 37. one exit intent => at most one EXIT order enforced by schema unique constraint
 38. one non-zero paper position => at most one OPEN/PAUSED/CRITICAL flatten intent claim enforced by partial unique claimed_position_id
+38a. every transition to CRITICAL with live qty atomically owns/acquires claimed_position_id; no CRITICAL-with-live-qty and null claim can be created
+38b. INVALID_RECOVERY refuses a position/pair-cycle blocked by a CRITICAL claim or reconciled malformed null-claim CRITICAL
 39. PAUSED resumes the same intent and same order; if order absent it is created once on first valid resume
 40. each attempt sizes from remaining locked base qty, not original `intended_quantity`
 41. each attempt has new attempt_seq + immutable book snapshot + current lease binding
@@ -1039,8 +1082,11 @@ Blind:
 
 Activation bootstrap:
 68. bootstrap replay emits no historical paper action/order/fill/dispatch
-69. bootstrap ending FLAT + paper flat initializes first epoch and dispatch starts only on next future 5m
-70. bootstrap ending LONG/SHORT keeps binding disabled until a verified future FLAT boundary; no delayed ENTRY
+68a. bootstrap cutoff is the latest fully closed exact 5m at bootstrap commit wall time, never an older convenient FLAT
+68b. no bar at or before bootstrap cutoff can ever become dispatch-eligible
+69. bootstrap ending FLAT + paper flat initializes first epoch at the cutoff and dispatch starts only on the first newly closed expected 5m strictly after it
+70. bootstrap ending LONG/SHORT keeps binding disabled; only subsequent newly closed bars are internally consumed until a newly observed FLAT, and dispatch begins only on the next newly closed 5m
+70a. there is no catch-up dispatch between any older FLAT and bootstrap/enable wall time
 71. bootstrap gap/integrity failure leaves runtime binding disabled
 72. bootstrap never calls official scoring or copies official B output
 
