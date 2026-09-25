@@ -316,15 +316,18 @@ Constraints:
 - partial unique: `UNIQUE(recovery_key) WHERE recovery_key IS NOT NULL`
 - `intent_origin='REFERENCE_EXIT'` requires non-null `exit_action_id`, `linked_entry_action_id`, and `reference_position_side`; `recovery_key` must be null
 - `intent_origin='INVALID_RECOVERY'` requires `exit_action_id IS NULL`, `linked_entry_action_id IS NULL`, and non-null canonical `recovery_key`
-- `locked_reduce_side` is immutable after intent creation and must reduce the paper side observed under the execution fence + position lock
+- for `REFERENCE_EXIT`, `locked_reduce_side` is immutable and derived from `reference_position_side`: LONG -> SELL, SHORT -> BUY
+- for `INVALID_RECOVERY`, `locked_reduce_side` is immutable and derived from the actual paper side observed under execution-fence + position lock
 
 One EXIT_TO_FLAT action creates exactly one `REFERENCE_EXIT` paper_exit_intent.
 
 One INVALID recovery incident may create at most one `INVALID_RECOVERY` intent using:
 
-`recovery_key = SHA256("INVALID_RECOVERY|" + adapter_epoch_id + "|" + strategy_version_id + "|" + pair + "|" + invalid_at_5m_open_time_utc_ms + "|" + recovery_cutoff_utc_ms)`
+`recovery_key = SHA256("INVALID_RECOVERY|" + adapter_epoch_id + "|" + strategy_version_id + "|" + pair + "|" + invalid_at_5m_open_time_utc_ms)`
 
-Duplicate recovery workers must collide on that key and reuse the same intent.
+The recovery cutoff is deliberately **not** part of the key. Different workers/retries may choose different verified replay cutoffs, but one gap in one adapter epoch may own only one recovery intent.
+
+Duplicate recovery workers must therefore collide on the same gap key and reuse the same intent/order.
 
 ### 6.1 Fence scope
 
@@ -545,25 +548,29 @@ If lifecycle is missing, dispatch is still fill-capable, an ENTRY order/attempt/
 
 Continue the same intent. A new reference ENTRY encountered during this lag is fenced as `NEVER_CREATED_FENCED` by section 9 and is not CRITICAL.
 
-### Paper position exists and side matches `reference_position_side`
+### Paper position exists: origin-specific reduce-only validation
+
+For `REFERENCE_EXIT`:
+
+- current paper side must equal `reference_position_side`
+- immutable `locked_reduce_side` must equal LONG -> SELL or SHORT -> BUY
+- if paper side conflicts with the reference side, set intent `CRITICAL`, emit CRITICAL integrity issue, create no order, do not flip, and do not auto-satisfy merely because reference is FLAT
+
+For `INVALID_RECOVERY`:
+
+- there is no reference side to compare against
+- current paper side must be reducible by the intent's immutable `locked_reduce_side`
+- if the current paper side has changed such that `locked_reduce_side` would increase/reverse exposure, set intent `CRITICAL`, create no order, and do not flip
+
+If the origin-specific side invariant passes:
 
 - create the single reduce-only EXIT order if it does not already exist
 - otherwise reuse the same order
 - no risk reservation
-- LONG -> SELL
-- SHORT -> BUY
+- every attempt uses the intent's immutable `locked_reduce_side`
 - every attempt sizes from the **remaining locked current base quantity**, not the original order notional or original intended quantity
 - create a new `BIND_FILL_ATTEMPT` with a new immutable book snapshot
-
-### Paper position side conflicts with reference side
-
-- set intent `CRITICAL`
-- emit CRITICAL reconciliation/integrity issue
-- no order
-- no flip
-- do not later auto-satisfy this intent merely because reference is FLAT
-- kill/recovery must hold the inconsistent exposure until explicitly resolved
-- reference plane unchanged
+- reference plane remains unchanged
 ## 11. Reduce-only EXIT order semantics
 
 Existing `paper_orders.intent_type='EXIT'` is used.
@@ -876,7 +883,7 @@ Reduce-only / durable intent:
 36. stale snapshot/lease failure creates no second order/economic effect
 37. partial EXIT uses same intent/order and leaves residual unsatisfied
 38. no over-close/no flip
-39. side mismatch => CRITICAL/no order/no auto-SATISFIED
+39. REFERENCE_EXIT side mismatch or INVALID_RECOVERY locked-reduce-side mismatch => CRITICAL/no order/no auto-SATISFIED
 40. reference FLAT alone never satisfies paper intent
 
 Kill switch / INVALID separation:
@@ -894,7 +901,7 @@ Recovery:
 50. recovered LONG/SHORT may return same epoch to CONTIGUOUS only when recovered reference cycle identity is unchanged from pre-gap and paper is linked to that same ENTRY lifecycle
 51. replay that crosses EXIT then later same-side ENTRY must not accept the old same-side paper position as a match
 52. recovered LONG/SHORT + paper flat/opposite/wrong-cycle emits no delayed ENTRY/flip and remains INVALID
-53. recovered FLAT + paper open creates/reuses exactly one operational `INVALID_RECOVERY` intent via unique recovery_key and with no reference action link
+53. recovered FLAT + paper open creates/reuses exactly one operational `INVALID_RECOVERY` intent via a gap-identity recovery_key that excludes recovery cutoff, with no reference action link
 54. recovery flatten is reduce-only/current-book/non-official and uses one order/many attempts; it cannot SATISFY until all old ENTRY lifecycles/orders/attempts on the pair are exposure-incapable
 55. recovery flatten completion can clear the wedge without fabricating a second reference EXIT
 56. new epoch at a future verified FLAT boundary remains available when coherence cannot otherwise be restored
