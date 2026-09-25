@@ -378,6 +378,9 @@ Before any flatten intent may create or continue an EXIT order against non-zero 
 - `REFERENCE_EXIT` may claim only a position whose `paper_position_entry_ownership.entry_action_id == linked_entry_action_id`
 - `INVALID_RECOVERY` may claim the current position only when no other OPEN/PAUSED/CRITICAL intent already claims it
 - `INTEGRITY_CRITICAL` must atomically claim the live paper position in the same fence -> position transaction that creates/reuses the integrity intent
+- before that CRITICAL transaction commits, it must also lock and terminalize/fence every ENTRY lifecycle/order/attempt/reservation whose remaining economic effect could still increase the claimed position
+- any unused reservation from those fenced ENTRY paths is released through the existing terminal path
+- the CRITICAL claim may commit only after proving no in-flight/unacknowledged ENTRY economic effect can still increase the claimed position
 - a claim conflict creates no second order and no economic effect
 - OPEN/PAUSED claim conflict with the true owner => wait/retry the current intent
 - a transition to `CRITICAL` while paper quantity is non-zero may commit only if that same transaction already owns or atomically acquires `claimed_position_id` for the live paper position
@@ -548,7 +551,9 @@ If no `OPEN`/`PAUSED` flatten intent exists but a paper position is already acti
 - if an existing OPEN/PAUSED/CRITICAL intent already claims that exact `paper_positions.id`, preserve/reuse that owner and create no second intent/order
 - otherwise create/reuse exactly one `INTEGRITY_CRITICAL` intent using the canonical `integrity_key` from §6, atomically setting `claimed_position_id` to the locked active position in the same transaction
 - the integrity intent status is `CRITICAL`; it creates **no automatic EXIT order**
-- the new reference ENTRY lifecycle is terminalized/fenced so it cannot later create exposure
+- fence/terminalize every fill-capable ENTRY path that could still increase the claimed existing position, including the position-owning ENTRY lifecycle if it is not yet safe-terminal
+- prove there is no in-flight/unacknowledged ENTRY economic effect before committing CRITICAL
+- the new reference ENTRY lifecycle is also terminalized/fenced so it cannot later create exposure
 - do not flip or stack exposure
 - reference plane remains unchanged
 
@@ -1092,6 +1097,7 @@ Fence scope / next cycles:
 31. that lagging new reference ENTRY is not CRITICAL solely because paper qty remains >0 under the live flatten
 32. paper qty >0 with **no** live flatten on new reference ENTRY => exactly one claimed `INTEGRITY_CRITICAL` intent/no stack/no automatic EXIT order
 32a. two concurrent §9.1 workers collide on integrity_key/claimed_position_id and cannot mint two CRITICAL owners
+32b. §9.1 CRITICAL commit fences/terminalizes every old ENTRY path that could still increase the claimed paper position and cannot commit while an in-flight/unacknowledged ENTRY effect remains
 33. historical `SATISFIED` intent does not fence the next cycle
 34. historical `CRITICAL` intent does not act as perpetual fence; active-position/integrity guards still prevent stack/flip
 35. if a fenced newer reference cycle later emits EXIT while an older paper flatten is still live, the newer EXIT intent must not claim the older position
