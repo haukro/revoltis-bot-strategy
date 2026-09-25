@@ -34,6 +34,7 @@ from .tsmom_c_v1 import (
 )
 from .momentum_prescreen import pack_market_series, unpack_market_series, analyze_block, pooled_analysis
 from .paper_execution import smoke_cases as paper_execution_smoke_cases
+from .spec006_adapter import smoke_cases as spec006_adapter_smoke_cases
 from .paper_ops import (
     canonical_book_payload,
     canonical_book_hash,
@@ -433,6 +434,24 @@ async def paper_market_health():
         "status_counts": counts,
         "blind_safe": True,
         "live_trading": False,
+    }
+
+
+@app.get("/api/paper/spec-006/smoke")
+async def paper_spec_006_smoke():
+    """Synthetic/blind-safe checks for the locked SPEC-006 reference adapter only."""
+    checks = spec006_adapter_smoke_cases()
+    binding = await _paper_runtime_binding("TEST-SPEC-002")
+    runtime_enabled = bool(binding and binding.get("enabled"))
+    return {
+        "status": "passed" if all(checks.values()) and not runtime_enabled else "failed",
+        "checks": checks,
+        "runtime_b_enabled": runtime_enabled,
+        "live_trading": False,
+        "alpha_logic_touched": False,
+        "official_b_scoring_touched": False,
+        "blind_safe": True,
+        "spec": "IMPLEMENTATION-SPEC-006",
     }
 
 
