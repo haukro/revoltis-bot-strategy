@@ -2,7 +2,15 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
-from app.main import OptimizerRequest, StrategySettings, combine_optimizer_lock_results, optimizer_jobs, run_optimizer_job
+from app.main import (
+    OptimizerFinalizeRequest,
+    OptimizerRequest,
+    StrategySettings,
+    combine_optimizer_lock_results,
+    finalize_optimizer,
+    optimizer_jobs,
+    run_optimizer_job,
+)
 
 
 def test_job_rejects_missing_lock_before_fetching_any_candles():
@@ -141,3 +149,94 @@ def test_optimizer_candle_downloads_are_bounded_and_concurrent():
     assert optimizer_jobs["test-bounded-downloads"]["status"] == "completed"
     assert load.await_count == 4
     assert max_active == 3
+
+
+def test_finalize_batches_source_runs_and_avoids_broad_optimizer_scan():
+    pairs = ["XRP/USDT", "ZEC/USDT"]
+    version_id = "locked-version"
+    source_ids = ["job-xrp", "job-zec"]
+    versions = [{
+        "id": version_id,
+        "created_at": datetime.now(UTC).isoformat(),
+        "settings": {
+            **StrategySettings(selected_pairs=pairs).model_dump(),
+            "_universe": {
+                "pairs": pairs,
+                "lock": {"expires_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat()},
+            },
+        },
+    }]
+    source_records = [
+        {
+            "id": "job-xrp",
+            "status": "completed",
+            "request": {"pairs": ["XRP/USDT"]},
+            "result": {
+                "pair": "XRP/USDT",
+                "timeframe": "5m",
+                "qualified": False,
+                "validation_passed": True,
+                "walk_forward_metrics": {"closed_trades": 25, "realized_profit": 1.0, "max_drawdown_percent": 2.0},
+                "tested_combinations": 6,
+                "max_validation_trades": 25,
+                "variant_results": [],
+                "per_coin_results": [{"pair": "XRP/USDT", "verdict": "NEPREŠIEL"}],
+                "pairs_ready": ["XRP-USDT"],
+                "pairs_dropped": [],
+                "replay_snapshots": {},
+                "cost_profiles": {},
+                "source_job_id": "job-xrp",
+                "version_id": version_id,
+            },
+        },
+        {
+            "id": "job-zec",
+            "status": "completed",
+            "request": {"pairs": ["ZEC/USDT"]},
+            "result": {
+                "pair": "ZEC/USDT",
+                "timeframe": "5m",
+                "qualified": False,
+                "validation_passed": True,
+                "walk_forward_metrics": {"closed_trades": 30, "realized_profit": 2.0, "max_drawdown_percent": 3.0},
+                "tested_combinations": 6,
+                "max_validation_trades": 30,
+                "variant_results": [],
+                "per_coin_results": [{"pair": "ZEC/USDT", "verdict": "NEPREŠIEL"}],
+                "pairs_ready": ["ZEC-USDT"],
+                "pairs_dropped": [],
+                "replay_snapshots": {},
+                "cost_profiles": {},
+                "source_job_id": "job-zec",
+                "version_id": version_id,
+            },
+        },
+    ]
+    queries = []
+
+    async def get(table, query=""):
+        queries.append((table, query))
+        if table == "strategy_versions":
+            return versions
+        if "id=eq." in query:
+            return []
+        if "id=in.(" in query:
+            return source_records
+        raise AssertionError(f"unexpected query: {table} {query}")
+
+    async def save(table, record):
+        return record
+
+    with patch("app.main.require_durable_production_store"), \
+         patch("app.main.supabase_get", new=AsyncMock(side_effect=get)), \
+         patch("app.main.supabase_upsert", new=AsyncMock(side_effect=save)):
+        result = asyncio.run(finalize_optimizer(OptimizerFinalizeRequest(
+            version_id=version_id,
+            source_job_ids=source_ids,
+        )))
+
+    source_queries = [query for table, query in queries if table == "optimizer_runs" and "id=in.(" in query]
+    assert len(source_queries) == 1
+    assert "order=finished_at.desc&limit=100" not in [query for _, query in queries]
+    assert result["result"]["version_id"] == version_id
+    assert result["result"]["locked_pairs"] == pairs
