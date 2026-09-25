@@ -5,7 +5,7 @@ import re
 import asyncio
 import math
 import secrets
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 from datetime import UTC, datetime, timedelta
 from statistics import median
 from typing import Any, Literal
@@ -4597,6 +4597,24 @@ async def finalize_optimizer(request: OptimizerFinalizeRequest):
             "Finálny výsledok musí obsahovať presne jeden beh pre každý coin locku.",
         )
 
+    # Finalization is intentionally idempotent and uses a deterministic id.
+    # This avoids a broad "latest 100 optimizer_runs" read, which can time out
+    # once individual optimizer result payloads become large (for example 90d
+    # runs with trade tapes and replay snapshots).
+    source_key = sorted(source_job_ids)
+    aggregate_id = str(
+        uuid5(
+            NAMESPACE_URL,
+            f"revoltis-optimizer:{request.version_id}:{','.join(source_key)}",
+        )
+    )
+    existing = await supabase_get(
+        "optimizer_runs",
+        f"id=eq.{aggregate_id}&limit=1",
+    )
+    if existing:
+        return present_optimizer_record(existing[0])
+
     records: list[dict[str, Any]] = []
     for job_id in source_job_ids:
         stored = await supabase_get(
@@ -4635,26 +4653,6 @@ async def finalize_optimizer(request: OptimizerFinalizeRequest):
             "Zdrojové optimizer runy nepokrývajú presne aktuálny lock.",
         )
 
-    recent = await supabase_get(
-        "optimizer_runs",
-        "order=finished_at.desc&limit=100",
-    )
-    source_key = sorted(source_job_ids)
-    existing = next(
-        (
-            row
-            for row in recent
-            if (row.get("request") or {}).get("kind") == "aggregate"
-            and (row.get("request") or {}).get("version_id") == request.version_id
-            and sorted(
-                (row.get("request") or {}).get("source_job_ids") or []
-            ) == source_key
-        ),
-        None,
-    )
-    if existing:
-        return present_optimizer_record(existing)
-
     combined = combine_optimizer_lock_results(
         [record["result"] for record in records],
         lock["pairs"],
@@ -4664,7 +4662,7 @@ async def finalize_optimizer(request: OptimizerFinalizeRequest):
 
     now = datetime.now(UTC).isoformat()
     aggregate_record = {
-        "id": str(uuid4()),
+        "id": aggregate_id,
         "status": "completed",
         "created_at": now,
         "finished_at": now,
@@ -4688,18 +4686,13 @@ async def optimizer_latest():
 
     stored = await supabase_get(
         "optimizer_runs",
-        "order=finished_at.desc&limit=100",
-    )
-    aggregate = next(
         (
-            row
-            for row in stored
-            if (row.get("request") or {}).get("kind") == "aggregate"
-            and (row.get("result") or {}).get("version_id") == lock["version_id"]
+            "request->>kind=eq.aggregate"
+            f"&result->>version_id=eq.{lock['version_id']}"
+            "&order=finished_at.desc&limit=1"
         ),
-        None,
     )
-    return present_optimizer_record(aggregate) if aggregate else None
+    return present_optimizer_record(stored[0]) if stored else None
 
 
 @app.get("/api/dashboard")
