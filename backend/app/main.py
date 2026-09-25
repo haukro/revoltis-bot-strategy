@@ -878,7 +878,7 @@ async def internal_spec006_recover(
         )
         if (result or {}).get("reason") == "RECOVERY_FLATTEN_REQUIRED":
             binding = await _paper_runtime_binding(strategy_version_id)
-            if binding and binding.get("enabled"):
+            if binding:
                 queued = await supabase_rpc(
                     "paper_spec006_queue_exit_attempt",
                     {
@@ -1263,13 +1263,25 @@ async def internal_paper_outbox_tick(
                 if not actions:
                     raise ValueError("strategy_action_not_found")
                 action = actions[0]
-                binding = await _paper_runtime_binding(action["strategy_version_id"])
-                if not binding or not binding.get("enabled"):
-                    await _paper_ack(outbox_id, worker, generation, "RUNTIME_BINDING_DISABLED")
-                    errors += 1
-                    continue
 
                 if action["action_type"] == "ENTRY":
+                    binding = await _paper_runtime_binding(action["strategy_version_id"])
+                    if not binding or not binding.get("enabled"):
+                        # Never leave a queued historical ENTRY retryable for a later re-enable.
+                        await supabase_rpc(
+                            "paper_spec006_fence_entry_lifecycle",
+                            {
+                                "p_entry_action_id": entity_id,
+                                "p_reason": "RUNTIME_BINDING_DISABLED",
+                                "p_worker_id": worker,
+                                "p_software_commit": commit,
+                            },
+                        )
+                        ack = await _paper_ack(outbox_id, worker, generation, None)
+                        if (ack or {}).get("acknowledged"):
+                            processed += 1
+                        continue
+
                     dispatched = await supabase_rpc(
                         "paper_spec006_dispatch_entry_action",
                         {
@@ -1322,17 +1334,31 @@ async def internal_paper_outbox_tick(
                 if not signals:
                     raise ValueError("signal_not_found")
                 signal = signals[0]
-                binding = await _paper_runtime_binding(signal["strategy_version_id"])
-                if not binding or not binding.get("enabled"):
-                    await _paper_ack(outbox_id, worker, generation, "RUNTIME_BINDING_DISABLED")
-                    errors += 1
-                    continue
-
                 spec006_lifecycles = await supabase_get(
                     "paper_entry_lifecycles",
                     f"paper_signal_id=eq.{entity_id}&limit=1",
                 )
                 spec006_lifecycle = spec006_lifecycles[0] if spec006_lifecycles else None
+
+                binding = await _paper_runtime_binding(signal["strategy_version_id"])
+                if not binding or not binding.get("enabled"):
+                    if spec006_lifecycle:
+                        await supabase_rpc(
+                            "paper_spec006_fence_entry_lifecycle",
+                            {
+                                "p_entry_action_id": spec006_lifecycle["entry_action_id"],
+                                "p_reason": "RUNTIME_BINDING_DISABLED",
+                                "p_worker_id": worker,
+                                "p_software_commit": commit,
+                            },
+                        )
+                        ack = await _paper_ack(outbox_id, worker, generation, None)
+                        if (ack or {}).get("acknowledged"):
+                            processed += 1
+                    else:
+                        await _paper_ack(outbox_id, worker, generation, "RUNTIME_BINDING_DISABLED")
+                        errors += 1
+                    continue
                 if spec006_lifecycle and spec006_lifecycle.get("status") in {
                     "TERMINAL_FILLED",
                     "TERMINAL_NO_FILL",
@@ -1424,8 +1450,8 @@ async def internal_paper_outbox_tick(
                     policy_id = reservation["policy_version_id"]
                 elif is_spec006 and order["intent_type"] == "EXIT":
                     binding = await _paper_runtime_binding(order["strategy_version_id"])
-                    if not binding or not binding.get("enabled"):
-                        await _paper_ack(outbox_id, worker, generation, "RUNTIME_BINDING_DISABLED")
+                    if not binding:
+                        await _paper_ack(outbox_id, worker, generation, "EXECUTION_POLICY_UNAVAILABLE")
                         errors += 1
                         continue
                     policy_id = binding["risk_policy_version_id"]
@@ -1448,6 +1474,15 @@ async def internal_paper_outbox_tick(
                 risk_policy = policies[0]
                 fee_rate = risk_policy.get("fee_rate")
                 if fee_rate is None:
+                    if is_spec006 and order["intent_type"] == "EXIT":
+                        await _paper_ack(
+                            outbox_id,
+                            worker,
+                            generation,
+                            "EXECUTION_POLICY_UNAVAILABLE",
+                        )
+                        errors += 1
+                        continue
                     await supabase_rpc(
                         "paper_terminalize_order",
                         {
@@ -1515,19 +1550,16 @@ async def internal_paper_outbox_tick(
                     provider_ts_ms = int(fetched["provider_ts_ms"])
 
                 if is_spec006 and order["intent_type"] == "EXIT":
-                    positions = await supabase_get(
-                        "paper_positions",
-                        "strategy_version_id=eq."
-                        + order["strategy_version_id"]
-                        + "&pair=eq."
-                        + order["pair"].replace("/", "%2F")
-                        + "&status=in.(OPENING,OPEN,EXIT_PENDING,CLOSING)&limit=1",
-                    )
-                    if not positions:
-                        await _paper_ack(outbox_id, worker, generation, None)
-                        processed += 1
+                    remaining_base = (item.get("payload") or {}).get("remaining_base_qty")
+                    if remaining_base is None:
+                        await _paper_ack(
+                            outbox_id,
+                            worker,
+                            generation,
+                            "SPEC006_EXIT_MISSING_LOCKED_BASE_QTY",
+                        )
+                        errors += 1
                         continue
-                    remaining_base = positions[0]["quantity"]
                     fill = walk_canonical_base_quantity(
                         side=order["side"],
                         base_quantity=remaining_base,
