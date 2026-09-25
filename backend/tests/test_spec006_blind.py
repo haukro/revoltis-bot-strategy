@@ -47,3 +47,24 @@ def test_spec006_smoke_is_safe_without_preview_supabase(monkeypatch):
     assert payload["runtime_b_enabled"] is False
     assert payload["blind_safe"] is True
     assert payload["live_trading"] is False
+
+
+
+def test_locked_regression_smoke_endpoints_stay_green(monkeypatch):
+    monkeypatch.delenv("SUPABASE_URL", raising=False)
+    monkeypatch.delenv("SUPABASE_SERVICE_ROLE_KEY", raising=False)
+    with TestClient(app) as client:
+        spec004 = client.get("/api/paper/spec-004/smoke")
+        spec005 = client.get("/api/paper/spec-005/smoke")
+        frozen_b = client.get("/api/research/tsmom-b-v1/smoke")
+
+    assert spec004.status_code == 200
+    assert spec004.json()["status"] == "passed"
+    assert spec005.status_code == 200
+    assert spec005.json()["status"] == "passed"
+    assert frozen_b.status_code == 200
+    payload = frozen_b.json()
+    assert payload["status"] == "passed"
+    assert len(payload["checks"]) == 11
+    assert all(payload["checks"].values())
+    assert payload["official_data_touched"] is False
