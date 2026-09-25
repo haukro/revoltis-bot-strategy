@@ -198,7 +198,7 @@ class Previous90dOOSRequest(BaseModel):
 
 DEFAULT = StrategySettings()
 local_store = LocalStore()
-app = FastAPI(title="Revoltis Bot Strategy API", version="1.0.0")
+app = FastAPI(title="NoFomo API", version="1.0.0")
 origins = os.getenv("CORS_ORIGINS", "http://localhost:5173,http://localhost:8080").split(",")
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 OKX_BASE_URL = "https://www.okx.com"
