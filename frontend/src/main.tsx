@@ -412,6 +412,8 @@ function App() {
     <FreqtradeVisual
   result={optimizer?.result || null}
   activeVersionId={activeUniverse?.version_id || null}
+  activePairs={activeUniverse?.pairs || selected}
+  timeframe={String(config.timeframe)}
 />
     <section className="panel market-panel"><div className="section-title"><span>LIVE</span><div><h3>Aktuálne sviečky z burzy</h3><p>Verejné spot dáta OKX · bez API kľúča · {config.timeframe}</p></div><select className="market-pair" value={marketPair} onChange={event => setMarketPair(event.target.value)}>{selected.map(pair => <option key={pair}>{pair}</option>)}</select></div><MarketChart market={market} error={marketError} />{simulation && <div className="simulation-result"><b>Výsledok poslednej simulácie · {currentPair}</b><span>Hodnota portfólia: {metrics.portfolio_value} USDT</span><span>Zisk/strata: {metrics.realized_profit >= 0 ? '+' : ''}{metrics.realized_profit} USDT</span><span>Obchody: {metrics.closed_trades}</span><span>Drawdown: {metrics.max_drawdown_percent} %</span>{currentCoverage && <span className={currentCoverage.complete ? 'positive' : 'negative'}>Dáta: {currentCoverage.candles}/{currentCoverage.expected_candles} sviečok {currentCoverage.complete ? '✓' : '⚠'}</span>}</div>}</section>
     <section className="workspace"><aside className="settings panel"><div className="section-title"><span>01</span><div><h3>Konfigurátor stratégie</h3><p>Vyber coiny a hranice simulácie.</p></div></div><div className="universe-actions"><button className="ghost" onClick={proposeUniverse} disabled={universeLoading || universeSaving || optimizerRunning || isRunning}>{universeLoading ? 'Vyhodnocujem OKX…' : 'Navrhnúť z OKX'}</button>{universeProposal?.status === 'ok' && <button onClick={acceptUniverse} disabled={universeSaving || optimizerRunning || isRunning}>{universeSaving ? 'Ukladám…' : 'Použiť návrh'}</button>}</div>{universeProposal && <div className={`universe-proposal ${universeProposal.status}`}><b>{universeProposal.status === 'ok' ? 'Návrh – zatiaľ nepoužitý' : 'Návrh nevytvorený'}</b><p>{universeProposal.message}</p>{universeProposal.picks?.map((item: any) => <span key={item.pair}>{item.pair} <strong>{item.score}/100</strong><small>spread {(item.spread_ratio * 100).toFixed(3)} % · ATR {(item.atr_ratio * 100).toFixed(2)} %</small></span>)}{universeProposal.data_quality?.incomplete_pairs?.length > 0 && <small>Neúplné dáta: {universeProposal.data_quality.incomplete_pairs.join(', ')}</small>}</div>}<p className="universe-lock" role="status">{universeLocked ? `Uložené a zamknuté: ${activeUniverse.pairs.join(', ')}. Návrh sa ukladá automaticky.` : 'Pre optimalizáciu použi a ulož návrh z OKX tlačidlom „Použiť návrh“.'}</p><h4>Vybrané coiny <small>{selected.length}</small></h4><div className="coin-grid">{availableCoins.map(coin => <label className={selected.includes(coin) ? 'coin active' : 'coin'} key={coin}><input type="checkbox" disabled={universeLocked || optimizerRunning || universeSaving} checked={selected.includes(coin)} onChange={event => update('selected_pairs', event.target.checked ? [...selected, coin] : selected.filter(item => item !== coin))} /><span>{coin.replace('/USDT', '')}</span><small>USDT</small></label>)}</div>{groups.map(([title, keys]) => <details key={title} open={title !== 'Rozšírené indikátory'}><summary>{title}<span>⌄</span></summary><div className="field-grid">{keys.map(key => <label key={key}>{fields[key]}{key === 'timeframe' ? <select value={String(config[key])} onChange={event => update(key, event.target.value)}>{['1m', '3m', '5m', '15m'].map(value => <option key={value}>{value}</option>)}</select> : <div className="number"><input type="number" value={Number(config[key])} step="0.01" onChange={event => update(key, Number(event.target.value))} /><span>{key.includes('percent') || key.includes('ratio') || key.includes('stop') || key.includes('trailing') || key.includes('rebound') ? '%' : key.includes('capital') || key.includes('amount') || key.includes('volume') ? 'USDT' : ''}</span></div>}</label>)}</div></details>)}</aside>
@@ -435,7 +437,7 @@ function BotControlCenter({ scanner, error, loading, running, onRefresh, onToggl
     <footer><span>{scanner ? `${scanner.scanned} obchodovateľných párov skontrolovaných` : 'Načítavam verejné OKX trhy…'}</span><span>{scanner?.method || 'Likvidita · spread · volatilita'}</span><span>Výbery cez API: <b>ZAKÁZANÉ</b></span></footer>
   </section>;
 }
-function FreqtradeVisual({ result, activeVersionId }: { result: any, activeVersionId: string | null }) {
+function FreqtradeVisual({ result, activeVersionId, activePairs, timeframe }: { result: any, activeVersionId: string | null, activePairs: string[], timeframe: string }) {
   const evaluated = Boolean(result && activeVersionId && result.version_id === activeVersionId);
   const candidate = evaluated && normalizeOptimizerResult(result).qualified;
 
@@ -459,8 +461,8 @@ function FreqtradeVisual({ result, activeVersionId }: { result: any, activeVersi
     <div className="ft-bottom">
       <div>
         <span>DIAGNOSTICKÝ ROZSAH</span>
-        <p>UNI/USDT · ZEC/USDT · 5m · exchange okx · spot</p>
-        <p>download-data · backtesting --export trades</p>
+        <p>{activePairs.length ? activePairs.join(' · ') : 'Bez aktívneho locku'} · {timeframe} · exchange okx · spot</p>
+        <p>{evaluated ? 'Aktuálny lock vyhodnotený' : 'Čaká na výsledok aktuálneho locku'} · download-data · backtesting --export trades</p>
       </div>
 
       <div className="ft-safety">
@@ -547,9 +549,9 @@ function ReplayAvailabilityNotice({ availability }: { availability: any }) {
   if (availability?.status !== 'replay_unavailable') return null;
   return (
     <p className="diagnostics-missing" role="status">
-      <strong>Historická diagnostika UNI/ZEC nedostupná</strong> ·
-      Pôvodný report, parametre, okná a snapshot sviečok pre starý UNI/ZEC 5m v2 replay
-      sa nepodarilo overiť. Tento stav nie je verdiktom aktuálneho locku.
+      <strong>Legacy replay diagnostika nedostupná</strong> ·
+      Starší historický replay sa nepodarilo overiť. Tento stav je iba informačný
+      a nie je verdiktom aktuálneho locku ani aktuálnej optimalizácie.
     </p>
   );
 }
