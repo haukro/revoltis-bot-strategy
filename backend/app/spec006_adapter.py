@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from math import isfinite
 from typing import Any
 
@@ -61,8 +62,8 @@ def reference_bar_rpc_row(
     return {
         "strategy_version_id": strategy_version_id,
         "pair": pair.upper(),
-        "open_time": int(candle["open_time"]),
-        "close_time": int(candle["close_time"]),
+        "open_time": datetime.fromtimestamp(int(candle["open_time"]) / 1000, UTC).isoformat(),
+        "close_time": datetime.fromtimestamp(int(candle["close_time"]) / 1000, UTC).isoformat(),
         "open": str(candle["open"]),
         "high": str(candle["high"]),
         "low": str(candle["low"]),
