@@ -15,4 +15,4 @@ def test_baseline_economic_metrics_split_trail_and_never_trail():
     assert out["profit_factor_net"] == 1.5
     assert out["trail_hit"]["net_pnl_usdt"] == 1.5
     assert out["trail_never_reached"]["net_pnl_usdt"] == -1.0
-    assert out["time_in_market_percent"] == round(100 * 450 / (30 * 24 * 60), 4)
+    assert out["time_in_market_percent"] == 100 * 450 / (30 * 24 * 60)
