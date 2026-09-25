@@ -334,12 +334,18 @@ For `REFERENCE_EXIT`, the intent target is:
 
 A missing ENTRY lifecycle row is not terminal and therefore cannot satisfy a `REFERENCE_EXIT` intent.
 
-For `INVALID_RECOVERY`, there is intentionally no linked reference ENTRY lifecycle. It may become `SATISFIED` only when:
+For `INVALID_RECOVERY`, there is intentionally no single linked reference ENTRY lifecycle. Before it may become `SATISFIED`, recovery processing must terminalize/fence **every extant paper ENTRY lifecycle for the same strategy_version_id + pair that is still capable of creating exposure**, using the normal fence -> position -> order/fill/reservation order.
+
+It may become `SATISFIED` only when:
 
 1. current paper position quantity is zero
-2. its single recovery EXIT order has no in-flight attempt or unacknowledged fill
-3. no economic effect from that recovery order can still arrive
-4. recovery remains internally marked non-official and reference history is unchanged
+2. no extant ENTRY lifecycle for the same strategy_version_id + pair is dispatch-capable or fill-capable
+3. no active ENTRY order exists
+4. no in-flight ENTRY `BIND_FILL_ATTEMPT` or unacknowledged ENTRY fill exists
+5. all relevant ENTRY reservations are unused/released/terminal
+6. its single recovery EXIT order has no in-flight attempt or unacknowledged fill
+7. no economic effect from either an old ENTRY path or the recovery EXIT order can still arrive
+8. recovery remains internally marked non-official and reference history is unchanged
 
 Reference state being FLAT is never sufficient to satisfy a paper intent.
 
@@ -697,6 +703,8 @@ Create/reuse one durable **operational recovery flatten**:
 - current locked paper base qty determines each attempt size
 - current immutable book snapshot per attempt
 - same lease/stale-snapshot/`BIND_FILL_ATTEMPT` rules as normal EXIT
+- while the recovery intent is OPEN/PAUSED, ENTRY dispatch/fill fencing applies to every ENTRY lifecycle on the same strategy_version_id + pair
+- before recovery SATISFIED, any old fill-capable ENTRY lifecycle/order/attempt must be terminalized/fenced and its unused reservation released
 - one recovery-flatten intent -> one EXIT order -> many attempts
 - no over-close, no flip
 
@@ -870,7 +878,7 @@ Recovery:
 51. replay that crosses EXIT then later same-side ENTRY must not accept the old same-side paper position as a match
 52. recovered LONG/SHORT + paper flat/opposite/wrong-cycle emits no delayed ENTRY/flip and remains INVALID
 53. recovered FLAT + paper open creates/reuses exactly one operational `INVALID_RECOVERY` intent via unique recovery_key and with no reference action link
-54. recovery flatten is reduce-only/current-book/non-official and uses one order/many attempts
+54. recovery flatten is reduce-only/current-book/non-official and uses one order/many attempts; it cannot SATISFY until all old ENTRY lifecycles/orders/attempts on the pair are exposure-incapable
 55. recovery flatten completion can clear the wedge without fabricating a second reference EXIT
 56. new epoch at a future verified FLAT boundary remains available when coherence cannot otherwise be restored
 
