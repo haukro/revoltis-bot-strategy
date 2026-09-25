@@ -204,7 +204,8 @@ TIMEFRAME_MILLISECONDS = {"1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900
 optimizer_jobs: dict[str, dict[str, Any]] = {}
 validation_replay_lock = asyncio.Lock()
 validation_replay_attempts: dict[tuple[str, ...], dict] = {}
-okx_history_semaphore = asyncio.Semaphore(1)
+OKX_HISTORY_CONCURRENCY = 3
+okx_history_semaphore = asyncio.Semaphore(OKX_HISTORY_CONCURRENCY)
 okx_history_rate_lock = asyncio.Lock()
 okx_history_last_request = 0.0
 okx_candle_cache: dict[tuple[str, str, int, int, int], tuple[float, list[dict[str, Any]]]] = {}
@@ -1201,12 +1202,16 @@ async def load_okx_candles(pair: str, timeframe: str, limit: int, start_time: in
                 global okx_history_last_request
                 response = None
                 for attempt in range(5):
+                    # Pace request starts globally, but do not hold the rate lock
+                    # while the network request is in flight. This keeps the
+                    # conservative ~6.7 req/s start rate while allowing bounded
+                    # overlap between slow OKX responses.
                     async with okx_history_rate_lock:
                         elapsed = asyncio.get_running_loop().time() - okx_history_last_request
                         if elapsed < OKX_HISTORY_MIN_INTERVAL:
                             await asyncio.sleep(OKX_HISTORY_MIN_INTERVAL - elapsed)
-                        response = await client.get(url, params=params)
                         okx_history_last_request = asyncio.get_running_loop().time()
+                    response = await client.get(url, params=params)
                     if response.status_code != 429:
                         break
                     if cache_info is not None:
@@ -1573,23 +1578,78 @@ async def run_optimizer_job(job_id: str, request: OptimizerRequest) -> None:
         markets = sorted(((pair, timeframe) for pair in job_pairs if pair in cost_models for timeframe in job_timeframes), key=lambda item: (timeframe_order.get(item[1], 9), item[0]))
         download_errors: list[dict[str, str]] = list(cost_errors)
         coverage_by_pair: dict[str, dict[str, Any]] = {}
-        for number, (pair, timeframe) in enumerate(markets, 1):
+        download_semaphore = asyncio.Semaphore(OKX_HISTORY_CONCURRENCY)
+        completed_downloads = 0
+
+        async def fetch_optimizer_market(pair: str, timeframe: str) -> tuple[str, str, list[dict[str, Any]] | None, dict[str, Any], str | None]:
+            nonlocal completed_downloads
             count = min(45000, max(100, request.history_days * 86_400_000 // TIMEFRAME_MILLISECONDS[timeframe]))
             cache_state: dict[str, Any] = {}
-            job.update({"phase": "fetching_candles", "bar": timeframe, "inst_id": pair.replace("/", "-"), "message": f"Načítavam {pair} · {timeframe}", "progress": round(number / max(1, len(markets)) * 30), "cached": False, "retries_429": 0})
+
             def download_progress(page: int, total: int, current_pair: str = pair, current_timeframe: str = timeframe) -> None:
-                job.update({"phase": "fetching_candles", "bar": current_timeframe, "inst_id": current_pair.replace("/", "-"), "page": page, "pages_est": total, "message": f"Sťahujem {current_pair} · {current_timeframe}: {page}/{total} strán", "cached": bool(cache_state.get("cached")), "retries_429": int(cache_state.get("retries_429", 0))})
+                job.update({
+                    "phase": "fetching_candles",
+                    "bar": current_timeframe,
+                    "inst_id": current_pair.replace("/", "-"),
+                    "page": page,
+                    "pages_est": total,
+                    "message": f"Sťahujem {current_pair} · {current_timeframe}: {page}/{total} strán",
+                    "cached": bool(cache_state.get("cached")),
+                    "retries_429": int(cache_state.get("retries_429", 0)),
+                })
+
+            candles: list[dict[str, Any]] | None = None
+            error_reason: str | None = None
+            coverage_row: dict[str, Any]
             try:
-                candles = await load_okx_candles(pair, timeframe, int(count), start_time, end_time, download_progress, cache_state)
+                async with download_semaphore:
+                    job.update({
+                        "phase": "fetching_candles",
+                        "bar": timeframe,
+                        "inst_id": pair.replace("/", "-"),
+                        "message": f"Načítavam {pair} · {timeframe}",
+                        "cached": False,
+                        "retries_429": 0,
+                    })
+                    candles = await load_okx_candles(
+                        pair, timeframe, int(count), start_time, end_time, download_progress, cache_state
+                    )
                 coverage = len(candles) / max(1, int(count))
-                coverage_by_pair.setdefault(pair, {})[timeframe] = {"candles": len(candles), "expected": int(count), "coverage": round(coverage, 4), "cached": bool(cache_state.get("cached")), "retries_429": int(cache_state.get("retries_429", 0))}
-                if len(candles) >= 100 and coverage >= .95:
-                    candle_sets[(pair, timeframe)] = candles
-                else:
-                    download_errors.append({"pair": pair, "timeframe": timeframe, "reason": f"neúplné dáta ({coverage:.1%})"})
+                coverage_row = {
+                    "candles": len(candles),
+                    "expected": int(count),
+                    "coverage": round(coverage, 4),
+                    "cached": bool(cache_state.get("cached")),
+                    "retries_429": int(cache_state.get("retries_429", 0)),
+                }
+                if len(candles) < 100 or coverage < .95:
+                    error_reason = f"neúplné dáta ({coverage:.1%})"
+                    candles = None
             except Exception as error:
-                coverage_by_pair.setdefault(pair, {})[timeframe] = {"candles": 0, "expected": int(count), "coverage": 0, "cached": bool(cache_state.get("cached")), "retries_429": int(cache_state.get("retries_429", 0))}
-                download_errors.append({"pair": pair, "timeframe": timeframe, "reason": str(error)[:180]})
+                coverage_row = {
+                    "candles": 0,
+                    "expected": int(count),
+                    "coverage": 0,
+                    "cached": bool(cache_state.get("cached")),
+                    "retries_429": int(cache_state.get("retries_429", 0)),
+                }
+                error_reason = str(error)[:180]
+                candles = None
+            finally:
+                completed_downloads += 1
+                job["progress"] = round(completed_downloads / max(1, len(markets)) * 30)
+
+            return pair, timeframe, candles, coverage_row, error_reason
+
+        market_results = await asyncio.gather(
+            *(fetch_optimizer_market(pair, timeframe) for pair, timeframe in markets)
+        )
+        for pair, timeframe, candles, coverage_row, error_reason in market_results:
+            coverage_by_pair.setdefault(pair, {})[timeframe] = coverage_row
+            if candles is not None:
+                candle_sets[(pair, timeframe)] = candles
+            if error_reason is not None:
+                download_errors.append({"pair": pair, "timeframe": timeframe, "reason": error_reason})
         required_timeframes = set(job_timeframes)
         pairs_ready = [pair for pair in job_pairs if required_timeframes.issubset({timeframe for candidate_pair, timeframe in candle_sets if candidate_pair == pair})]
         pairs_dropped = []
