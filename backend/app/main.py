@@ -338,6 +338,41 @@ async def _paper_runtime_binding(strategy_version_id: str) -> dict[str, Any] | N
     return rows[0] if rows else None
 
 
+async def _spec006_blind_runtime_active() -> bool:
+    binding = await _paper_runtime_binding("TEST-SPEC-002")
+    return bool(binding and binding.get("enabled"))
+
+
+def _blind_worker_category(workers: list[dict[str, Any]]) -> str:
+    rank = {"FRESH": 0, "LATE": 1, "STALE": 2, "NEVER": 2, "UNCONFIGURED": 2}
+    worst = "FRESH"
+    for row in workers or []:
+        category = str(row.get("last_success_age_category") or "STALE")
+        if rank.get(category, 2) > rank.get(worst, 0):
+            worst = "STALE" if category in {"NEVER", "UNCONFIGURED"} else category
+    return worst
+
+
+def _blind_reconciliation_category(reconciliation: dict[str, Any]) -> str:
+    latest = reconciliation.get("latest") or {}
+    if latest.get("audit_integrity_passed") is False or latest.get("status") == "FAILED":
+        return "CRITICAL"
+    severities = {
+        str(row.get("severity") or "").upper()
+        for row in (reconciliation.get("open_issue_counts") or [])
+    }
+    if "CRITICAL" in severities:
+        return "CRITICAL"
+    if severities & {"WARNING", "FAILED", "ERROR"} or latest.get("status") == "WARNING":
+        return "WARNING"
+    return "PASS"
+
+
+def _blind_market_category(counts: dict[str, Any]) -> str:
+    degraded = sum(int(counts.get(key, 0) or 0) for key in ("STALE", "DEGRADED", "HALTED"))
+    return "DEGRADED" if degraded else "HEALTHY"
+
+
 async def _fetch_okx_execution_book(pair: str, depth: int) -> dict[str, Any]:
     if depth < 1 or depth > 400:
         raise ValueError("invalid_market_book_depth")
@@ -413,6 +448,18 @@ async def paper_system_health():
     require_durable_production_store()
     rows = await supabase_get("kill_switch_state", "account_key=eq.paper-default&limit=1")
     state = rows[0] if rows else None
+    if await _spec006_blind_runtime_active():
+        shadow = await supabase_get(
+            "paper_strategy_shadow_state",
+            "strategy_version_id=eq.TEST-SPEC-002&pair=eq.ZEC%2FUSDT&select=data_state&limit=1",
+        )
+        return {
+            "status": "ok" if state else "degraded",
+            "adapter_health": "INVALID" if shadow and shadow[0].get("data_state") == "INVALID" else "HEALTHY",
+            "kill_switch": {"state": (state or {}).get("state")},
+            "live_trading": False,
+            "blind_safe": True,
+        }
     return {
         "status": "ok" if state else "degraded",
         "persistence": persistence_status(),
@@ -432,10 +479,13 @@ async def paper_market_health():
     require_durable_production_store()
     snapshot = await _paper_ops_snapshot()
     counts = snapshot.get("market_health_counts", {})
-    degraded = sum(
-        int(counts.get(key, 0) or 0)
-        for key in ("STALE", "DEGRADED", "HALTED")
-    )
+    if await _spec006_blind_runtime_active():
+        return {
+            "market": _blind_market_category(counts),
+            "blind_safe": True,
+            "live_trading": False,
+        }
+    degraded = sum(int(counts.get(key, 0) or 0) for key in ("STALE", "DEGRADED", "HALTED"))
     return {
         "status": "degraded" if degraded else "ok",
         "status_counts": counts,
@@ -758,6 +808,13 @@ async def paper_spec_005_smoke():
 async def paper_queue_health():
     require_durable_production_store()
     snapshot = await _paper_ops_snapshot()
+    if await _spec006_blind_runtime_active():
+        backlog = int((snapshot.get("queue") or {}).get("current_backlog") or 0)
+        return {
+            "queue": "DEGRADED" if backlog else "HEALTHY",
+            "blind_safe": True,
+            "live_trading": False,
+        }
     return {
         "queue": snapshot.get("queue", {}),
         "blind_safe": True,
@@ -769,6 +826,12 @@ async def paper_queue_health():
 async def paper_worker_health():
     require_durable_production_store()
     snapshot = await _paper_ops_snapshot()
+    if await _spec006_blind_runtime_active():
+        return {
+            "worker": _blind_worker_category(snapshot.get("workers", [])),
+            "blind_safe": True,
+            "live_trading": False,
+        }
     return {
         "workers": snapshot.get("workers", []),
         "blind_safe": True,
@@ -780,6 +843,12 @@ async def paper_worker_health():
 async def paper_reconciliation_health():
     require_durable_production_store()
     snapshot = await _paper_ops_snapshot()
+    if await _spec006_blind_runtime_active():
+        return {
+            "reconciliation": _blind_reconciliation_category(snapshot.get("reconciliation", {})),
+            "blind_safe": True,
+            "live_trading": False,
+        }
     return {
         "reconciliation": snapshot.get("reconciliation", {}),
         "blind_safe": True,
@@ -792,6 +861,12 @@ async def paper_audit_health():
     require_durable_production_store()
     snapshot = await _paper_ops_snapshot()
     reconciliation = snapshot.get("reconciliation", {})
+    if await _spec006_blind_runtime_active():
+        return {
+            "audit": _blind_reconciliation_category(reconciliation),
+            "blind_safe": True,
+            "live_trading": False,
+        }
     latest = reconciliation.get("latest", {}) if isinstance(reconciliation, dict) else {}
     return {
         "audit_integrity_passed": latest.get("audit_integrity_passed"),
@@ -804,8 +879,15 @@ async def paper_audit_health():
 async def paper_kill_switch_status():
     require_durable_production_store()
     snapshot = await _paper_ops_snapshot()
+    kill_switch = snapshot.get("kill_switch", {})
+    if await _spec006_blind_runtime_active():
+        return {
+            "kill_switch": {"state": kill_switch.get("state")},
+            "blind_safe": True,
+            "live_trading": False,
+        }
     return {
-        "kill_switch": snapshot.get("kill_switch", {}),
+        "kill_switch": kill_switch,
         "blind_safe": True,
         "live_trading": False,
     }
