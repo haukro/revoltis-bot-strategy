@@ -90,7 +90,8 @@ def test_spec006_fill_worker_never_calls_legacy_apply():
          patch("app.main._paper_active_ops_policy", new=AsyncMock(return_value={"max_worker_batch": 10, "market_book_depth": 20})), \
          patch("app.main.supabase_get", new=AsyncMock(side_effect=fake_get)), \
          patch("app.main.supabase_rpc", new=AsyncMock(side_effect=fake_rpc)), \
-         patch("app.main._fetch_okx_execution_book", new=AsyncMock(return_value=book)):
+         patch("app.main._fetch_okx_execution_book", new=AsyncMock(return_value=book)), \
+         patch.dict("os.environ", {"PAPER_OUTBOX_LEASE_SECONDS": "30"}):
         asyncio.run(internal_paper_outbox_tick("test-token"))
 
     assert "paper_spec006_bind_execution_attempt" in rpc_names
