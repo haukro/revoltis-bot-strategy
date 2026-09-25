@@ -34,7 +34,11 @@ from .tsmom_c_v1 import (
 )
 from .momentum_prescreen import pack_market_series, unpack_market_series, analyze_block, pooled_analysis
 from .paper_execution import smoke_cases as paper_execution_smoke_cases
-from .spec006_adapter import smoke_cases as spec006_adapter_smoke_cases
+from .spec006_adapter import (
+    reference_bar_hash as spec006_reference_bar_hash,
+    replay_bootstrap_state as spec006_replay_bootstrap_state,
+    smoke_cases as spec006_adapter_smoke_cases,
+)
 from .paper_ops import (
     canonical_book_payload,
     canonical_book_hash,
@@ -435,6 +439,111 @@ async def paper_market_health():
         "status_counts": counts,
         "blind_safe": True,
         "live_trading": False,
+    }
+
+
+@app.post("/api/internal/paper/spec-006/bootstrap")
+async def internal_spec006_bootstrap(
+    x_paper_scheduler_token: str | None = Header(default=None, alias="X-Paper-Scheduler-Token"),
+):
+    """Build blind internal reference state only; never enables runtime B."""
+    require_durable_production_store()
+    _require_internal_secret(x_paper_scheduler_token, "PAPER_SCHEDULER_TOKEN")
+
+    strategy_version_id = "TEST-SPEC-002"
+    pair = "ZEC/USDT"
+    existing_binding = await _paper_runtime_binding(strategy_version_id)
+    if existing_binding and existing_binding.get("enabled"):
+        raise HTTPException(409, "spec006_runtime_already_enabled")
+
+    shadow = await supabase_get(
+        "paper_strategy_shadow_state",
+        f"strategy_version_id=eq.{strategy_version_id}&pair=eq.ZEC%2FUSDT&limit=1",
+    )
+    if shadow:
+        return {
+            "status": "already_initialized",
+            "runtime_b_enabled": False,
+            "blind_safe": True,
+        }
+
+    step = TIMEFRAME_MILLISECONDS["5m"]
+    now = datetime.now(UTC)
+    now_ms = int(now.timestamp() * 1000)
+    cutoff_open_ms = (now_ms // step) * step - step
+    evaluation_start_ms = int(datetime(2026, 9, 24, 12, 0, tzinfo=UTC).timestamp() * 1000)
+    warmup_start_ms = evaluation_start_ms - 30 * 3_600_000
+    count = int((cutoff_open_ms - warmup_start_ms) // step + 1)
+
+    candles = await load_okx_candles(
+        pair,
+        "5m",
+        min(45000, count),
+        warmup_start_ms,
+        cutoff_open_ms,
+    )
+    if (
+        not candles
+        or int(candles[-1]["open_time"]) != cutoff_open_ms
+        or not any(int(row["open_time"]) == evaluation_start_ms for row in candles)
+        or any(
+            int(right["open_time"]) - int(left["open_time"]) != step
+            for left, right in zip(candles, candles[1:])
+        )
+    ):
+        return {
+            "status": "data_not_contiguous",
+            "runtime_b_enabled": False,
+            "blind_safe": True,
+        }
+
+    rows = [
+        {
+            "strategy_version_id": strategy_version_id,
+            "pair": pair,
+            "open_time": datetime.fromtimestamp(int(row["open_time"]) / 1000, UTC).isoformat(),
+            "close_time": datetime.fromtimestamp(int(row["close_time"]) / 1000, UTC).isoformat(),
+            "open": str(row["open"]),
+            "high": str(row["high"]),
+            "low": str(row["low"]),
+            "close": str(row["close"]),
+            "source_hash": spec006_reference_bar_hash(row),
+        }
+        for row in candles
+    ]
+    for start in range(0, len(rows), 200):
+        await supabase_rpc(
+            "paper_spec006_ingest_reference_bars",
+            {"p_rows": rows[start : start + 200]},
+        )
+
+    state = spec006_replay_bootstrap_state(
+        candles,
+        evaluation_start_ms=evaluation_start_ms,
+        cutoff_open_ms=cutoff_open_ms,
+        strategy_version_id=strategy_version_id,
+        pair=pair,
+    )
+    if state.reference_position_state != "FLAT":
+        return {
+            "status": "waiting_safe_boundary",
+            "runtime_b_enabled": False,
+            "blind_safe": True,
+        }
+
+    initialized = await supabase_rpc(
+        "paper_spec006_initialize_flat_epoch",
+        {
+            "p_strategy_version_id": strategy_version_id,
+            "p_pair": pair,
+            "p_cursor_open_time": datetime.fromtimestamp(cutoff_open_ms / 1000, UTC).isoformat(),
+            "p_enable_commit_time": now.isoformat(),
+        },
+    )
+    return {
+        "status": "ready_for_binding" if (initialized or {}).get("initialized") else "already_initialized",
+        "runtime_b_enabled": False,
+        "blind_safe": True,
     }
 
 
