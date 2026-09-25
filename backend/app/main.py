@@ -39,6 +39,7 @@ from .paper_ops import (
     canonical_book_payload,
     canonical_book_hash,
     walk_canonical_quote_notional,
+    walk_canonical_base_quantity,
     quote_fee_amount,
     remaining_quote_notional,
     smoke_cases as paper_ops_smoke_cases,
@@ -764,6 +765,65 @@ async def internal_paper_outbox_tick(
         event_type = item["event_type"]
         entity_id = item["entity_id"]
         try:
+            if event_type == "STRATEGY_ACTION_DISPATCH":
+                actions = await supabase_get("paper_strategy_actions", f"id=eq.{entity_id}&limit=1")
+                if not actions:
+                    raise ValueError("strategy_action_not_found")
+                action = actions[0]
+                binding = await _paper_runtime_binding(action["strategy_version_id"])
+                if not binding or not binding.get("enabled"):
+                    await _paper_ack(outbox_id, worker, generation, "RUNTIME_BINDING_DISABLED")
+                    errors += 1
+                    continue
+
+                if action["action_type"] == "ENTRY":
+                    dispatched = await supabase_rpc(
+                        "paper_spec006_dispatch_entry_action",
+                        {
+                            "p_action_id": entity_id,
+                            "p_intended_notional": 50,
+                            "p_blind_test_id": "TEST-SPEC-002-forward-2026",
+                            "p_worker_id": worker,
+                            "p_software_commit": commit,
+                        },
+                    )
+                    reason = (dispatched or {}).get("reason")
+                    if reason in {"WAIT_ENTRY_IN_FLIGHT"}:
+                        await _paper_ack(outbox_id, worker, generation, "SPEC006_ENTRY_WAIT")
+                        errors += 1
+                        continue
+                elif action["action_type"] == "EXIT_TO_FLAT":
+                    intents = await supabase_get(
+                        "paper_exit_intents",
+                        f"exit_action_id=eq.{entity_id}&limit=1",
+                    )
+                    if not intents:
+                        raise ValueError("exit_intent_not_found")
+                    queued = await supabase_rpc(
+                        "paper_spec006_queue_exit_attempt",
+                        {
+                            "p_exit_intent_id": intents[0]["id"],
+                            "p_software_commit": commit,
+                        },
+                    )
+                    reason = (queued or {}).get("reason")
+                    if reason in {
+                        "WAIT_ENTRY_IN_FLIGHT",
+                        "WAIT_ENTRY_LIFECYCLES",
+                        "WAIT_OTHER_OWNER",
+                        "PAUSED_KILL_SWITCH",
+                    }:
+                        await _paper_ack(outbox_id, worker, generation, "SPEC006_EXIT_WAIT")
+                        errors += 1
+                        continue
+                else:
+                    raise ValueError("unsupported_strategy_action")
+
+                ack = await _paper_ack(outbox_id, worker, generation, None)
+                if (ack or {}).get("acknowledged"):
+                    processed += 1
+                continue
+
             if event_type == "RISK_EVALUATE":
                 signals = await supabase_get("paper_signals", f"id=eq.{entity_id}&limit=1")
                 if not signals:
@@ -773,6 +833,22 @@ async def internal_paper_outbox_tick(
                 if not binding or not binding.get("enabled"):
                     await _paper_ack(outbox_id, worker, generation, "RUNTIME_BINDING_DISABLED")
                     errors += 1
+                    continue
+
+                spec006_lifecycles = await supabase_get(
+                    "paper_entry_lifecycles",
+                    f"paper_signal_id=eq.{entity_id}&limit=1",
+                )
+                spec006_lifecycle = spec006_lifecycles[0] if spec006_lifecycles else None
+                if spec006_lifecycle and spec006_lifecycle.get("status") in {
+                    "TERMINAL_FILLED",
+                    "TERMINAL_NO_FILL",
+                    "NEVER_CREATED_FENCED",
+                    "TERMINAL_REJECTED",
+                }:
+                    ack = await _paper_ack(outbox_id, worker, generation, None)
+                    if (ack or {}).get("acknowledged"):
+                        processed += 1
                     continue
 
                 risk = await supabase_rpc(
@@ -792,17 +868,27 @@ async def internal_paper_outbox_tick(
                     )
                     reservation = reservations[0] if reservations else None
                     if reservation and reservation.get("status") in ("RESERVED", "PARTIALLY_CONSUMED"):
-                        await supabase_rpc(
-                            "paper_create_order_from_approved_signal",
-                            {
-                                "p_signal_id": entity_id,
-                                "p_side": "BUY" if signal["side"] == "LONG" else "SELL",
-                                "p_intent_type": "ENTRY",
-                                "p_order_type": "MARKET",
-                                "p_worker_id": worker,
-                                "p_software_commit": commit,
-                            },
-                        )
+                        if spec006_lifecycle:
+                            await supabase_rpc(
+                                "paper_spec006_create_entry_order_from_approved_signal",
+                                {
+                                    "p_signal_id": entity_id,
+                                    "p_worker_id": worker,
+                                    "p_software_commit": commit,
+                                },
+                            )
+                        else:
+                            await supabase_rpc(
+                                "paper_create_order_from_approved_signal",
+                                {
+                                    "p_signal_id": entity_id,
+                                    "p_side": "BUY" if signal["side"] == "LONG" else "SELL",
+                                    "p_intent_type": "ENTRY",
+                                    "p_order_type": "MARKET",
+                                    "p_worker_id": worker,
+                                    "p_software_commit": commit,
+                                },
+                            )
                 ack = await _paper_ack(outbox_id, worker, generation, None)
                 if (ack or {}).get("acknowledged"):
                     processed += 1
@@ -814,17 +900,42 @@ async def internal_paper_outbox_tick(
                     raise ValueError("order_not_found")
                 order = orders[0]
 
-                reservations = await supabase_get(
-                    "risk_reservations",
-                    f"signal_id=eq.{order['signal_id']}&limit=1",
+                spec006_entries = await supabase_get(
+                    "paper_entry_lifecycles",
+                    f"paper_entry_order_id=eq.{entity_id}&limit=1",
                 )
-                if not reservations:
-                    raise ValueError("risk_reservation_not_found")
-                reservation = reservations[0]
+                is_spec006 = bool(spec006_entries) or bool(order.get("exit_intent_id"))
+
+                reservation = None
+                if order["intent_type"] == "ENTRY":
+                    reservations = await supabase_get(
+                        "risk_reservations",
+                        f"signal_id=eq.{order['signal_id']}&limit=1",
+                    )
+                    if not reservations:
+                        raise ValueError("risk_reservation_not_found")
+                    reservation = reservations[0]
+                    policy_id = reservation["policy_version_id"]
+                elif is_spec006 and order["intent_type"] == "EXIT":
+                    binding = await _paper_runtime_binding(order["strategy_version_id"])
+                    if not binding or not binding.get("enabled"):
+                        await _paper_ack(outbox_id, worker, generation, "RUNTIME_BINDING_DISABLED")
+                        errors += 1
+                        continue
+                    policy_id = binding["risk_policy_version_id"]
+                else:
+                    reservations = await supabase_get(
+                        "risk_reservations",
+                        f"signal_id=eq.{order['signal_id']}&limit=1",
+                    )
+                    if not reservations:
+                        raise ValueError("risk_reservation_not_found")
+                    reservation = reservations[0]
+                    policy_id = reservation["policy_version_id"]
 
                 policies = await supabase_get(
                     "risk_policy_versions",
-                    f"id=eq.{reservation['policy_version_id']}&limit=1",
+                    f"id=eq.{policy_id}&limit=1",
                 )
                 if not policies:
                     raise ValueError("risk_policy_not_found")
@@ -863,21 +974,21 @@ async def internal_paper_outbox_tick(
                     },
                 )
                 attempt_seq = int((item.get("payload") or {}).get("attempt_seq") or 1)
+                bind_rpc = "paper_spec006_bind_execution_attempt" if is_spec006 else "paper_bind_execution_attempt"
                 bound = await supabase_rpc(
-                    "paper_bind_execution_attempt",
+                    bind_rpc,
                     {
                         "p_outbox_id": outbox_id,
                         "p_lease_generation": generation,
                         "p_order_id": entity_id,
                         "p_market_snapshot_id": snapshot["id"],
-                        "p_policy_version_id": reservation["policy_version_id"],
+                        "p_policy_version_id": policy_id,
                         "p_attempt_seq": attempt_seq,
                         "p_worker_id": worker,
                         "p_software_commit": commit,
                     },
                 )
                 if not (bound or {}).get("execution_attempt_id"):
-                    # Lease lost or event became terminal while fetching market data.
                     continue
 
                 bound_snapshot_id = bound.get("market_snapshot_id") or snapshot["id"]
@@ -897,27 +1008,52 @@ async def internal_paper_outbox_tick(
                     asks = fetched["asks"]
                     provider_ts_ms = int(fetched["provider_ts_ms"])
 
-                remaining_notional = remaining_quote_notional(
-                    order["intended_notional"],
-                    order.get("filled_notional") or 0,
-                )
-                if remaining_notional == "0":
-                    await _paper_ack(outbox_id, worker, generation, None)
-                    processed += 1
-                    continue
+                if is_spec006 and order["intent_type"] == "EXIT":
+                    positions = await supabase_get(
+                        "paper_positions",
+                        "strategy_version_id=eq."
+                        + order["strategy_version_id"]
+                        + "&pair=eq."
+                        + order["pair"].replace("/", "%2F")
+                        + "&status=in.(OPENING,OPEN,EXIT_PENDING,CLOSING)&limit=1",
+                    )
+                    if not positions:
+                        await _paper_ack(outbox_id, worker, generation, None)
+                        processed += 1
+                        continue
+                    remaining_base = positions[0]["quantity"]
+                    fill = walk_canonical_base_quantity(
+                        side=order["side"],
+                        base_quantity=remaining_base,
+                        bids=bids,
+                        asks=asks,
+                    )
+                else:
+                    remaining_notional = remaining_quote_notional(
+                        order["intended_notional"],
+                        order.get("filled_notional") or 0,
+                    )
+                    if remaining_notional == "0":
+                        await _paper_ack(outbox_id, worker, generation, None)
+                        processed += 1
+                        continue
+                    fill = walk_canonical_quote_notional(
+                        side=order["side"],
+                        quote_notional=remaining_notional,
+                        bids=bids,
+                        asks=asks,
+                    )
 
-                fill = walk_canonical_quote_notional(
-                    side=order["side"],
-                    quote_notional=remaining_notional,
-                    bids=bids,
-                    asks=asks,
-                )
                 if fill["filled_quote_notional"] == "0":
                     await _paper_ack(outbox_id, worker, generation, "NO_EXECUTABLE_DEPTH")
                     errors += 1
                     continue
 
-                if not fill["complete"] and not risk_policy.get("partial_fill_allowed"):
+                if (
+                    order["intent_type"] == "ENTRY"
+                    and not fill["complete"]
+                    and not risk_policy.get("partial_fill_allowed")
+                ):
                     await supabase_rpc(
                         "paper_terminalize_order",
                         {
@@ -941,8 +1077,9 @@ async def internal_paper_outbox_tick(
                 fee_amount = quote_fee_amount(fill["filled_quote_notional"], fee_rate)
                 filled_at = datetime.fromtimestamp(provider_ts_ms / 1000, UTC).isoformat()
 
+                apply_rpc = "paper_spec006_apply_fill" if is_spec006 else "paper_apply_fill"
                 applied = await supabase_rpc(
-                    "paper_apply_fill",
+                    apply_rpc,
                     {
                         "p_outbox_id": outbox_id,
                         "p_lease_generation": generation,
@@ -964,6 +1101,14 @@ async def internal_paper_outbox_tick(
                     ack = await _paper_ack(outbox_id, worker, generation, None)
                     if (ack or {}).get("acknowledged"):
                         processed += 1
+                elif is_spec006:
+                    await _paper_ack(
+                        outbox_id,
+                        worker,
+                        generation,
+                        "SPEC006_APPLY_DEFERRED",
+                    )
+                    errors += 1
                 continue
 
             # Unknown events are released for retry and surfaced as worker errors.
