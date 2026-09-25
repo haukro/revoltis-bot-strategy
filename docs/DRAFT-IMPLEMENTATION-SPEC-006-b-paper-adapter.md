@@ -479,8 +479,8 @@ For each expected next 5m bar, one DB transaction/RPC must:
 2. lock shadow state
 3. re-read `last_processed_5m_open_time`, `dispatch_frontier_5m_open_time`, and `dispatch_enable_commit_time` after both locks
 4. if another adapter already advanced the cursor, exit with no writes
-5. if the expected bar is at/before the persisted dispatch frontier or has `close_time <= dispatch_enable_commit_time`, route it to the internal non-emitting frontier-extension path; it may update shadow/cursor/frontier but must not create action/lifecycle/intent/outbox rows
-6. verify `data_state=CONTIGUOUS`
+5. verify `data_state=CONTIGUOUS`; if INVALID, normal reference processing stops and only the §14 recovery path may advance state
+6. if the expected bar is at/before the persisted dispatch frontier or has `close_time <= dispatch_enable_commit_time`, route it to the internal non-emitting frontier-extension path; it may update shadow/cursor/frontier but must not create action/lifecycle/intent/outbox rows
 7. verify current bar open_time is exactly the expected next 5m key
 8. compute frozen B transition for that bar
 9. insert zero, one, or two immutable actions
@@ -1012,7 +1012,7 @@ Because paper runtime may be enabled after the official TEST-SPEC-002 fold has a
 Definitions:
 
 - `bootstrap_commit_wall_time` = server wall-clock time captured inside the bootstrap commit transaction
-- `bootstrap_cutoff_5m` = the **latest fully closed exact 5m bar** available at or before `bootstrap_commit_wall_time`
+- `bootstrap_cutoff_5m` = the **latest fully closed exact 5m bar present in the verified immutable adapter source series** at or before `bootstrap_commit_wall_time`
 - a bar before `bootstrap_cutoff_5m` is historical bootstrap state only and is permanently non-dispatchable
 - while runtime binding is DISABLED, later newly closed 5m bars may be consumed internally one-by-one to find a safe FLAT boundary; they are also permanently non-dispatchable
 
@@ -1045,10 +1045,9 @@ If reference state at `bootstrap_cutoff_5m` is `LONG` or `SHORT`:
 - after bootstrap commit, consume only **subsequent newly closed exact 5m bars** internally in chronological order
 - those internally consumed bars emit no paper action/dispatch
 - remain unbound until one of those newly closed bars produces the first verified reference FLAT boundary
-- commit the first epoch/cursor at that newly observed FLAT bar
-- in that enable commit, persist the new `dispatch_frontier_5m_open_time` and `dispatch_enable_commit_time`
-- enable runtime binding only after that FLAT commit
-- after the FLAT commit, capture the binding-enable commit wall time; the first dispatch-eligible bar is the next expected 5m after the FLAT cursor whose `close_time` is strictly later than that enable commit wall time
+- in one atomic FLAT/enable commit, capture `binding_enable_commit_wall_time`, commit the first epoch/cursor at that newly observed FLAT bar, and persist `dispatch_frontier_5m_open_time` plus `dispatch_enable_commit_time = binding_enable_commit_wall_time`
+- enable runtime binding only after that commit
+- the first dispatch-eligible bar is the next expected 5m after the FLAT cursor whose `close_time` is strictly later than `binding_enable_commit_wall_time`
 
 Therefore a past FLAT discovered anywhere before `bootstrap_commit_wall_time` can never become a dispatch start point. No historical interval between an older FLAT and “now” is ever replayed into paper execution.
 
