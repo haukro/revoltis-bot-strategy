@@ -353,7 +353,7 @@ Constraints:
 - `intent_origin='INTEGRITY_CRITICAL'` requires `exit_action_id IS NULL`, `recovery_key IS NULL`, non-null `integrity_key`, non-null `claimed_position_id`, and `status='CRITICAL'`; it creates no EXIT order automatically
 - for `REFERENCE_EXIT`, `locked_reduce_side` is immutable and derived from `reference_position_side`: LONG -> SELL, SHORT -> BUY
 - for `INVALID_RECOVERY`, `locked_reduce_side` is immutable and derived from the actual paper side observed under execution-fence + position lock
-- for `INTEGRITY_CRITICAL`, `locked_reduce_side` may be recorded from the claimed paper side for audit/recovery planning but must never auto-create an order while status remains CRITICAL
+- for `INTEGRITY_CRITICAL`, `locked_reduce_side` is immutable and derived from the claimed paper side for audit/recovery planning, but must never auto-create an order while status remains CRITICAL
 
 One EXIT_TO_FLAT action creates exactly one `REFERENCE_EXIT` paper_exit_intent.
 
@@ -793,7 +793,8 @@ Definitions for each such transition:
 - the enable/resume cursor must be advanced internally through every verified bar up to `enable_frontier_5m`
 - all bars with open_time <= `enable_frontier_5m` are permanently non-dispatchable for that enable transition
 - no recovered/bootstrap cursor older than `enable_frontier_5m` may become the dispatch cursor
-- the first dispatch-eligible bar is the first newly closed expected 5m strictly after the committed `enable_frontier_5m`
+- the first dispatch-eligible bar is the first expected 5m strictly after the committed `enable_frontier_5m` whose candle `close_time > enable_commit_wall_time`
+- a candle that arrives late after enable but whose `close_time <= enable_commit_wall_time` is historical/non-dispatchable even if it was absent from the source at commit
 
 Internal recovery workers may replay to different historical cutoffs for verification. Those cutoffs are **never** dispatch-enable cursors by themselves.
 
@@ -803,7 +804,7 @@ If reference is not in a state eligible for safe enable at `enable_frontier_5m`:
 - continue consuming subsequent newly closed exact 5m bars internally only
 - every internally consumed bar remains non-dispatchable
 - enable only when a newly reached safe boundary satisfies the relevant ownership/paper-flat conditions
-- dispatch starts on the next newly closed expected 5m after that boundary
+- dispatch starts on the next expected 5m after that boundary only when its `close_time` is strictly later than the enable commit wall time
 
 This invariant forbids historical catch-up dispatch on every recovery/bootstrap/new-epoch path, not only first bootstrap.
 
@@ -1018,7 +1019,7 @@ If reference state at `bootstrap_cutoff_5m` is `FLAT`:
 - persist shadow = CONTIGUOUS + FLAT with cursor exactly at `bootstrap_cutoff_5m`
 - set paper activation time separately
 - enable runtime binding only after that commit
-- the **first dispatch-eligible bar is the first newly closed expected 5m strictly after the committed cutoff**
+- the **first dispatch-eligible bar is the first expected 5m strictly after the committed cutoff whose `close_time > bootstrap_commit_wall_time`**
 - there is no catch-up dispatch for any bar at or before the cutoff
 
 If reference state at `bootstrap_cutoff_5m` is `LONG` or `SHORT`:
@@ -1030,7 +1031,7 @@ If reference state at `bootstrap_cutoff_5m` is `LONG` or `SHORT`:
 - remain unbound until one of those newly closed bars produces the first verified reference FLAT boundary
 - commit the first epoch/cursor at that newly observed FLAT bar
 - enable runtime binding only after that FLAT commit
-- the first dispatch-eligible bar is the next newly closed expected 5m strictly after the FLAT cursor
+- after the FLAT commit, capture the binding-enable commit wall time; the first dispatch-eligible bar is the next expected 5m after the FLAT cursor whose `close_time` is strictly later than that enable commit wall time
 
 Therefore a past FLAT discovered anywhere before `bootstrap_commit_wall_time` can never become a dispatch start point. No historical interval between an older FLAT and “now” is ever replayed into paper execution.
 
@@ -1120,7 +1121,7 @@ Kill switch / INVALID separation:
 
 Recovery:
 53. replay uses exact contiguous data through missing key and persists reference state/cursor only
-53a. every INVALID resume/recovery completion/new epoch enable applies §14.2 frontier; no already-closed post-recovery bar can become dispatch-eligible
+53a. every INVALID resume/recovery completion/new epoch enable applies §14.2 frontier; no bar with close_time <= enable_commit_wall_time can become dispatch-eligible, even if it arrives late
 53b. two recovery workers may use different internal replay cutoffs but neither cutoff can become a past dispatch cursor
 54. replay emits no historical paper dispatch
 55. replay never copies official B output
@@ -1142,7 +1143,7 @@ Blind:
 Activation bootstrap:
 68. bootstrap replay emits no historical paper action/order/fill/dispatch
 68a. bootstrap cutoff is the latest fully closed exact 5m at bootstrap commit wall time, never an older convenient FLAT
-68b. no bar at or before bootstrap cutoff can ever become dispatch-eligible
+68b. no bar at or before bootstrap cutoff and no late-arriving bar with close_time <= bootstrap_commit_wall_time can ever become dispatch-eligible
 69. bootstrap ending FLAT + paper flat initializes first epoch at the cutoff and dispatch starts only on the first newly closed expected 5m strictly after it
 70. bootstrap ending LONG/SHORT keeps binding disabled; only subsequent newly closed bars are internally consumed until a newly observed FLAT, and dispatch begins only on the next newly closed 5m
 70a. there is no catch-up dispatch between any older FLAT and bootstrap/enable wall time
