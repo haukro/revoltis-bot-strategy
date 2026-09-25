@@ -18,7 +18,7 @@ It is an operational paper-execution mirror only.
 7. Paper flattening is reduce-only to zero; it may never open, reverse, or increase exposure.
 8. No live real-money routing.
 9. No synthetic liquidation.
-10. TEST-SPEC-002 runtime binding remains disabled until SPEC-006 passes a second Grok review, is locked, implemented, and validated.
+10. TEST-SPEC-002 runtime binding remains disabled until SPEC-006 passes the current lock gate, is locked, implemented, and validated.
 11. A reference EXIT_TO_FLAT and a paper flatten intent are different durable objects.
 12. Any reference/paper divergence is operational evidence only and never changes official B.
 
@@ -647,16 +647,32 @@ Recovery parity against `simulate_b_v1` is validated on synthetic fixtures only.
 
 ### 14.2 Same-epoch recovery when reference remains open
 
-If verified replay at the cutoff leaves reference `LONG` or `SHORT`, the current adapter epoch may return to `CONTIGUOUS` **without waiting for an invented FLAT boundary** when all are true:
+If verified replay at the cutoff leaves reference `LONG` or `SHORT`, the current adapter epoch may return to `CONTIGUOUS` **without waiting for an invented FLAT boundary** only when the recovered open reference cycle is provably the same cycle that existed before the gap.
+
+All must be true:
 
 - data is verified contiguous through the missing key and cutoff
-- paper has an active position on the same side as the recovered reference state
+- replay did **not** cross a reference `EXIT_TO_FLAT` followed by a later reference `ENTRY` for the position that is open at the cutoff
+- recovered `reference_entry_action_id` / cycle identity is unchanged from the last known-good pre-gap open position
+- the active paper position is linked to that same ENTRY lifecycle/cycle, not merely the same side
+- paper side matches the recovered reference side
 - there is no contradictory live flatten intent
 - no critical execution-integrity issue remains
 
-Then persist the recovered shadow/cursor and resume only with the next future 5m bar.
+Same-side equality alone is insufficient.
 
-If recovered reference is LONG/SHORT but paper is flat, opposite-side, or otherwise not coherent, do not issue a delayed ENTRY or flip. Remain INVALID and continue only through an allowed future reconciliation/new-epoch path.
+Example forbidden resume:
+
+- pre-gap reference LONG + paper LONG
+- hidden recovered bars exit that reference LONG
+- later hidden recovered bars enter a new LONG
+- cutoff is LONG again
+
+The paper LONG still belongs to the old cycle. The adapter must remain INVALID; it must not treat that position as matching the new recovered LONG.
+
+Then, and only then, persist the recovered shadow/cursor and resume with the next future 5m bar.
+
+If recovered reference is LONG/SHORT but paper is flat, opposite-side, same-side-but-wrong-cycle, or otherwise not coherent, do not issue a delayed ENTRY or flip. Remain INVALID and continue only through an allowed future reconciliation/new-epoch path.
 
 ### 14.3 Recovery-only flatten when replay reference is FLAT
 
@@ -841,26 +857,27 @@ Recovery:
 47. replay uses exact contiguous data through missing key and persists reference state/cursor only
 48. replay emits no historical paper dispatch
 49. replay never copies official B output
-50. recovered LONG/SHORT + matching paper side may return same epoch to CONTIGUOUS after verification
-51. recovered LONG/SHORT + paper flat/opposite emits no delayed ENTRY/flip and remains INVALID
-52. recovered FLAT + paper open creates exactly one operational `INVALID_RECOVERY` flatten
-53. recovery flatten is reduce-only/current-book/non-official and uses one order/many attempts
-54. recovery flatten completion can clear the wedge without fabricating a second reference EXIT
-55. new epoch at a future verified FLAT boundary remains available when coherence cannot otherwise be restored
+50. recovered LONG/SHORT may return same epoch to CONTIGUOUS only when recovered reference cycle identity is unchanged from pre-gap and paper is linked to that same ENTRY lifecycle
+51. replay that crosses EXIT then later same-side ENTRY must not accept the old same-side paper position as a match
+52. recovered LONG/SHORT + paper flat/opposite/wrong-cycle emits no delayed ENTRY/flip and remains INVALID
+53. recovered FLAT + paper open creates exactly one operational `INVALID_RECOVERY` flatten
+54. recovery flatten is reduce-only/current-book/non-official and uses one order/many attempts
+55. recovery flatten completion can clear the wedge without fabricating a second reference EXIT
+56. new epoch at a future verified FLAT boundary remains available when coherence cannot otherwise be restored
 
 Blind:
-56. no action/intent/order/fill/position rows or counts leak
-57. no internal fence code/idempotency key/linked id/pair/side/exact cursor leaks
-58. queue/worker/recon surfaces are category-only with B enabled
-59. logs redact B payloads, outbox bodies and constraint errors
-60. generic client errors reveal no B action timing/type
+57. no action/intent/order/fill/position rows or counts leak
+58. no internal fence code/idempotency key/linked id/pair/side/exact cursor leaks
+59. queue/worker/recon surfaces are category-only with B enabled
+60. logs redact B payloads, outbox bodies and constraint errors
+61. generic client errors reveal no B action timing/type
 
 Regression:
-61. TEST-SPEC-002 11/11 smoke unchanged
-62. SPEC-004 smoke unchanged
-63. SPEC-005 smoke unchanged
-64. no official B performance data/scoring touched
-65. TEST-SPEC-002 runtime binding remains DISABLED
+62. TEST-SPEC-002 11/11 smoke unchanged
+63. SPEC-004 smoke unchanged
+64. SPEC-005 smoke unchanged
+65. no official B performance data/scoring touched
+66. TEST-SPEC-002 runtime binding remains DISABLED
 ## 19. Implementation order after second review lock
 
 1. shadow state + execution fence + actions + exit-intent schema
