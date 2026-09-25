@@ -796,6 +796,9 @@ Definitions for each such transition:
 - `enable_commit_wall_time` = server wall-clock time captured inside the enable/resume transaction
 - `enable_frontier_5m` = the latest fully closed **exact 5m bar present in the adapter's verified immutable source series** at or before that commit wall time
 - the enable/resume cursor must be advanced internally through every verified bar up to `enable_frontier_5m`
+- any safe-enable decision made at an earlier recovery/bootstrap cutoff is provisional only
+- after internal advance reaches `enable_frontier_5m`, re-evaluate the full relevant reference-cycle identity, paper ownership/side/flatness, live-claim, late-ENTRY and integrity conditions under locks
+- if those conditions changed during internal advance, do not enable; follow the resulting INVALID/recovery path from the frontier state
 - all bars with open_time <= `enable_frontier_5m` are permanently non-dispatchable for that enable transition
 - no recovered/bootstrap cursor older than `enable_frontier_5m` may become the dispatch cursor
 - the first dispatch-eligible bar is the first expected 5m strictly after the committed `enable_frontier_5m` whose candle `close_time > enable_commit_wall_time`
@@ -1128,6 +1131,7 @@ Kill switch / INVALID separation:
 Recovery:
 53. replay uses exact contiguous data through missing key and persists reference state/cursor only
 53a. every INVALID resume/recovery completion/new epoch enable applies §14.2 frontier; no bar with close_time <= enable_commit_wall_time can become dispatch-eligible, even if it arrives late
+53a.1. all safe-enable ownership/reference/paper conditions are re-evaluated after internal advance reaches the frontier; pre-frontier eligibility cannot authorize dispatch
 53b. two recovery workers may use different internal replay cutoffs but neither cutoff can become a past dispatch cursor
 54. replay emits no historical paper dispatch
 55. replay never copies official B output
