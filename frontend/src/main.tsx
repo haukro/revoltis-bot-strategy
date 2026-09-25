@@ -103,7 +103,7 @@ function App() {
   const scanOkx = async () => {
     setScannerLoading(true); setScannerError('');
     try {
-      const response = await fetch('/api/market/scan?quote=USDT&limit=12');
+      const response = await fetch('/api/market/scan?quote=USDT&limit=500');
       if (!response.ok) throw new Error('scan_failed');
       setScanner(await response.json());
     } catch {
@@ -386,7 +386,7 @@ function App() {
     <header className="topbar"><div className="brand"><div className="brand-mark">R</div><div><h1>Revoltis <b>Bot Strategy</b></h1><p>Navrhuj · testuj · porovnávaj</p></div></div><div className="top-actions"><span className="mode"><i />SIMULÁCIA</span><button className="install-app" onClick={installApp}>⇩ Inštalovať aplikáciu</button><button className="ghost" onClick={exportConfig} disabled={!optimizer?.result || !normalizeOptimizerResult(optimizer.result).qualified}>Export pre backtest</button><button onClick={save}>Uložiť</button></div></header>
     <section className="hero"><div><span className="eyebrow">AKTÍVNY PRACOVNÝ PRIESTOR</span><h2>Stratégia pre pohyb trhu,<br /><em>nie pre domnienky.</em></h2><p>Každá úprava parametrov ostáva v bezpečnom dry-run režime. Pred ďalším krokom ju porovnaj s historickým výsledkom.</p></div><div className="hero-status"><span>Stav synchronizácie</span><strong>{dashboard.last_sync ? 'Dáta prijaté' : 'Čaká na údaje'}</strong><small>{dashboard.last_sync?.received_at ? new Date(dashboard.last_sync.received_at).toLocaleString('sk-SK') : 'Zatiaľ bez simulovaných obchodov'}</small></div></section>
     <OpsPanel />
-    <BotControlCenter scanner={scanner} error={scannerError} loading={scannerLoading} running={paperBotRunning} onRefresh={scanOkx} onToggle={togglePaperBot} onChoose={testScannerPair} dailyLoss={Math.min(5, Number(config.stop_loss_percent || 4))} stake={Number(config.stake_amount || 0)} />
+    <BotControlCenter scanner={scanner} error={scannerError} loading={scannerLoading} running={paperBotRunning} onRefresh={scanOkx} onToggle={togglePaperBot} onChoose={testScannerPair} dailyLoss={Math.min(5, Number(config.stop_loss_percent || 4))} stake={Number(config.stake_amount || 0)} preferredPairs={universeLocked ? (activeUniverse?.pairs || []) : []} />
     <section className={`simulation-control status-${runStatus}`}>
       <div className="run-state"><span className="state-dot" /><div><small>STAV SIMULÁCIE</small><strong>{runStatus === 'running' ? (historicalMode ? 'HISTORICKÝ TEST PREBIEHA' : 'PREBIEHA') : runStatus === 'completed' ? (historicalMode ? 'Historický test dokončený' : 'Čas simulácie uplynul – dokončená') : runStatus === 'stopped' ? 'Simulácia zastavená' : runStatus === 'failed' ? 'Simulácia zlyhala' : 'Simulácia nebeží'}</strong><p>{runStatus === 'running' ? (historicalMode ? 'Spracúvam zvolené historické sviečky zrýchlene.' : timeLimited ? `Aktívna do ${new Date(testEnd).toLocaleString('sk-SK')}. Stav zostane rozsvietený až do ukončenia.` : 'Stav zostáva aktívny, kým nestlačíš Zastaviť simuláciu.') : lastRun ? `Posledné vyhodnotenie: ${new Date(lastRun.finished_at).toLocaleString('sk-SK')}` : 'Spusti živú simuláciu alebo zapni historický test.'}</p></div></div>
       <div className="run-actions">{isRunning ? <button className="stop-button" onClick={stopSimulation}>■ Zastaviť simuláciu</button> : <button className="run-button" onClick={runSimulation}>▶ Spustiť simuláciu</button>}</div>
@@ -421,8 +421,10 @@ function App() {
     </section><section className="settings-info"><div className="info-heading"><span className="eyebrow">INFO</span><h3>Vysvetlenie nastavení stratégie</h3><p>Otvor bod, ktorý chceš upraviť. Nájdeš tu význam parametra, jeho vplyv aj spôsob fungovania v simulácii.</p></div><div className="info-grid">{Object.entries(settingInfo).map(([key, info]) => <details key={key}><summary>{fields[key] || 'Vybrané coiny'}<span>+</span></summary><div><p><b>Na čo slúži:</b> {info.purpose}</p><p><b>Čo ovplyvní:</b> {info.effect}</p><p><b>Ako funguje:</b> {info.mechanism}</p></div></details>)}</div></section><p className="message">{message}</p>
   </main>;
 }
-function BotControlCenter({ scanner, error, loading, running, onRefresh, onToggle, onChoose, dailyLoss, stake }: { scanner: any, error: string, loading: boolean, running: boolean, onRefresh: () => void, onToggle: () => void, onChoose: (pair: string) => void, dailyLoss: number, stake: number }) {
+function BotControlCenter({ scanner, error, loading, running, onRefresh, onToggle, onChoose, dailyLoss, stake, preferredPairs }: { scanner: any, error: string, loading: boolean, running: boolean, onRefresh: () => void, onToggle: () => void, onChoose: (pair: string) => void, dailyLoss: number, stake: number, preferredPairs: string[] }) {
   const leaders = scanner?.markets || [];
+  const preferredMarkets = preferredPairs.map(pair => leaders.find((market: any) => market.pair === pair)).filter(Boolean);
+  const visibleMarkets = preferredPairs.length ? preferredMarkets : leaders.slice(0, 8);
   const best = leaders[0];
   const money = (value: number) => new Intl.NumberFormat('sk-SK', { notation: 'compact', maximumFractionDigits: 1 }).format(value || 0);
   return <section className={`bot-control ${running ? 'bot-running' : ''}`}>
@@ -433,7 +435,7 @@ function BotControlCenter({ scanner, error, loading, running, onRefresh, onToggl
       <article><span>MAX. SUMA NA OBCHOD</span><b>{stake} USDT</b><small>podľa konfigurácie</small></article>
       <article><span>DENNÁ OCHRANA</span><b>{dailyLoss.toFixed(1)} %</b><small>po limite sa nové vstupy zastavia</small></article>
     </div>
-    {error ? <div className="bot-error">{error}</div> : <div className="scanner-table"><div className="scanner-row scanner-header"><span># / Pár</span><span>Objem 24 h</span><span>Spread</span><span>Volatilita</span><span>Skóre</span><span /></div>{leaders.slice(0, 8).map((market: any, index: number) => <div className="scanner-row" key={market.pair}><span><i>{index + 1}</i><b>{market.pair}</b><small className={market.change_24h_percent >= 0 ? 'positive' : 'negative'}>{market.change_24h_percent >= 0 ? '+' : ''}{market.change_24h_percent} %</small></span><span>{money(market.volume_24h)} USDT</span><span>{market.spread_percent.toFixed(3)} %</span><span>{market.volatility_24h_percent.toFixed(2)} %</span><span><strong>{market.score}</strong>/100</span><span><button className="ghost" onClick={() => onChoose(market.pair)}>Testovať</button></span></div>)}</div>}
+    {error ? <div className="bot-error">{error}</div> : <div className="scanner-table"><div className="scanner-row scanner-header"><span># / Pár</span><span>Objem 24 h</span><span>Spread</span><span>Volatilita</span><span>Skóre</span><span /></div>{visibleMarkets.map((market: any, index: number) => <div className="scanner-row" key={market.pair}><span><i>{index + 1}</i><b>{market.pair}</b><small className={market.change_24h_percent >= 0 ? 'positive' : 'negative'}>{market.change_24h_percent >= 0 ? '+' : ''}{market.change_24h_percent} %</small></span><span>{money(market.volume_24h)} USDT</span><span>{market.spread_percent.toFixed(3)} %</span><span>{market.volatility_24h_percent.toFixed(2)} %</span><span><strong>{market.score}</strong>/100</span><span><button className="ghost" onClick={() => onChoose(market.pair)}>Testovať</button></span></div>)}</div>}
     <footer><span>{scanner ? `${scanner.scanned} obchodovateľných párov skontrolovaných` : 'Načítavam verejné OKX trhy…'}</span><span>{scanner?.method || 'Likvidita · spread · volatilita'}</span><span>Výbery cez API: <b>ZAKÁZANÉ</b></span></footer>
   </section>;
 }
