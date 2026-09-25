@@ -34,6 +34,11 @@ from .tsmom_c_v1 import (
 )
 from .momentum_prescreen import pack_market_series, unpack_market_series, analyze_block, pooled_analysis
 from .paper_execution import smoke_cases as paper_execution_smoke_cases
+from .spec006_adapter import (
+    blind_bootstrap_category,
+    reference_bar_rpc_row,
+    replay_frozen_reference,
+)
 from .paper_ops import (
     canonical_book_payload,
     canonical_book_hash,
@@ -2570,6 +2575,169 @@ _TSMOM_B_V1_DATA = {
     "ZEC": "ZEC/USDT",
     "BTC": "BTC/USDT",
 }
+
+
+def _spec006_latest_closed_5m(now: datetime | None = None) -> tuple[int, int]:
+    current = now or datetime.now(UTC)
+    now_ms = int(current.timestamp() * 1000)
+    step = TIMEFRAME_MILLISECONDS["5m"]
+    close_ms = (now_ms // step) * step - 1
+    open_ms = close_ms - step + 1
+    return open_ms, close_ms
+
+
+async def _spec006_ingest_reference_candles(
+    candles: list[dict[str, Any]],
+    *,
+    batch_size: int = 250,
+) -> None:
+    rows = [
+        reference_bar_rpc_row(_TSMOM_B_V1_SPEC, "ZEC/USDT", candle)
+        for candle in candles
+    ]
+    for offset in range(0, len(rows), batch_size):
+        await supabase_rpc(
+            "paper_spec006_ingest_reference_bars",
+            {"p_rows": rows[offset:offset + batch_size]},
+        )
+
+
+async def _spec006_fetch_reference_through(end_ms: int) -> list[dict[str, Any]]:
+    eval_start_ms = int(_TSMOM_B_V1_EVAL_START.timestamp() * 1000)
+    warmup_ms = 24 * 60 * 60 * 1000
+    fetch_start = eval_start_ms - warmup_ms
+    step = TIMEFRAME_MILLISECONDS["5m"]
+    count = int((end_ms - fetch_start + 1) // step)
+    if count < 1 or count > 45000:
+        raise ValueError("spec006_reference_window_invalid")
+    candles = await load_okx_candles(
+        "ZEC/USDT",
+        "5m",
+        count,
+        fetch_start,
+        end_ms,
+    )
+    if not candles:
+        raise ValueError("spec006_reference_feed_empty")
+    return sorted(candles, key=lambda row: int(row["open_time"]))
+
+
+@app.post("/api/internal/paper/spec-006/bootstrap")
+async def internal_spec006_bootstrap(
+    x_paper_scheduler_token: str | None = Header(default=None, alias="X-Paper-Scheduler-Token"),
+):
+    """Blind-safe, reference-only bootstrap. Never creates/enables runtime B."""
+    require_durable_production_store()
+    _require_internal_secret(x_paper_scheduler_token, "PAPER_SCHEDULER_TOKEN")
+
+    binding = await _paper_runtime_binding(_TSMOM_B_V1_SPEC)
+    if binding and binding.get("enabled"):
+        return {"status": "already_enabled", "blind_safe": True, "live_trading": False}
+
+    shadows = await supabase_get(
+        "paper_strategy_shadow_state",
+        f"strategy_version_id=eq.{_TSMOM_B_V1_SPEC}&pair=eq.ZEC%2FUSDT&limit=1",
+    )
+    if shadows:
+        return {"status": "initialized", "blind_safe": True, "live_trading": False}
+
+    _, latest_close_ms = _spec006_latest_closed_5m()
+    eval_end_ms = min(
+        latest_close_ms,
+        int(_TSMOM_B_V1_EVAL_END.timestamp() * 1000),
+    )
+    eval_start_ms = int(_TSMOM_B_V1_EVAL_START.timestamp() * 1000)
+    if eval_end_ms < eval_start_ms:
+        return {"status": "not_started", "blind_safe": True, "live_trading": False}
+
+    candles = await _spec006_fetch_reference_through(eval_end_ms)
+    await _spec006_ingest_reference_candles(candles)
+    replay = replay_frozen_reference(
+        candles,
+        evaluation_start_ms=eval_start_ms,
+        evaluation_end_ms=eval_end_ms,
+    )
+
+    # Category is kept internal and intentionally contains no side/timestamp.
+    category = blind_bootstrap_category(replay)
+    if category == "SAFE_FLAT":
+        enable_commit = datetime.now(UTC)
+        cursor_ms = int(replay["cursor_open_time"])
+        await supabase_rpc(
+            "paper_spec006_initialize_flat_epoch",
+            {
+                "p_strategy_version_id": _TSMOM_B_V1_SPEC,
+                "p_pair": "ZEC/USDT",
+                "p_cursor_open_time": datetime.fromtimestamp(cursor_ms / 1000, UTC).isoformat(),
+                "p_enable_commit_time": enable_commit.isoformat(),
+            },
+        )
+
+    return {
+        "status": "processed",
+        "blind_safe": True,
+        "live_trading": False,
+        "runtime_binding_enabled": False,
+    }
+
+
+@app.post("/api/internal/paper/spec-006/reference-tick")
+async def internal_spec006_reference_tick(
+    x_paper_scheduler_token: str | None = Header(default=None, alias="X-Paper-Scheduler-Token"),
+):
+    """Ingest and sequentially commit only future reference bars for enabled B."""
+    require_durable_production_store()
+    _require_internal_secret(x_paper_scheduler_token, "PAPER_SCHEDULER_TOKEN")
+
+    binding = await _paper_runtime_binding(_TSMOM_B_V1_SPEC)
+    if not binding or not binding.get("enabled"):
+        return {"status": "disabled", "blind_safe": True, "live_trading": False}
+
+    shadows = await supabase_get(
+        "paper_strategy_shadow_state",
+        f"strategy_version_id=eq.{_TSMOM_B_V1_SPEC}&pair=eq.ZEC%2FUSDT&limit=1",
+    )
+    if not shadows:
+        raise HTTPException(503, "spec006_reference_not_initialized")
+    shadow = shadows[0]
+    if shadow.get("data_state") != "CONTIGUOUS":
+        return {"status": "invalid", "blind_safe": True, "live_trading": False}
+
+    cursor = datetime.fromisoformat(str(shadow["last_processed_5m_open_time"]).replace("Z", "+00:00"))
+    step_ms = TIMEFRAME_MILLISECONDS["5m"]
+    start_ms = int(cursor.timestamp() * 1000) + step_ms
+    _, latest_close_ms = _spec006_latest_closed_5m()
+    eval_end_ms = min(latest_close_ms, int(_TSMOM_B_V1_EVAL_END.timestamp() * 1000))
+    if start_ms + step_ms - 1 > eval_end_ms:
+        return {"status": "ok", "blind_safe": True, "live_trading": False}
+
+    count = int((eval_end_ms - start_ms + 1) // step_ms)
+    candles = await load_okx_candles(
+        "ZEC/USDT",
+        "5m",
+        min(45000, max(1, count)),
+        start_ms,
+        eval_end_ms,
+    )
+    await _spec006_ingest_reference_candles(candles)
+
+    commit = os.getenv("VERCEL_GIT_COMMIT_SHA", "unknown")
+    expected_open_ms = start_ms
+    while expected_open_ms + step_ms - 1 <= eval_end_ms:
+        result = await supabase_rpc(
+            "paper_spec006_commit_reference_bar",
+            {
+                "p_strategy_version_id": _TSMOM_B_V1_SPEC,
+                "p_pair": "ZEC/USDT",
+                "p_expected_open_time": datetime.fromtimestamp(expected_open_ms / 1000, UTC).isoformat(),
+                "p_software_commit": commit,
+            },
+        )
+        if (result or {}).get("data_state") == "INVALID" or (result or {}).get("reason") == "REFERENCE_INVALID":
+            break
+        expected_open_ms += step_ms
+
+    return {"status": "ok", "blind_safe": True, "live_trading": False}
 
 
 @app.get("/api/research/tsmom-b-v1/smoke")
