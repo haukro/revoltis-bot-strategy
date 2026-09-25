@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, asdict
 from hashlib import sha256
+import json
 from math import isfinite
 from typing import Any
 
@@ -158,6 +159,50 @@ def compute_reference_transition(*, history_through_current: list[dict[str, Any]
         state.trough_low = min(float(state.trough_low), l)
 
     return state, actions
+
+
+
+def reference_bar_hash(candle: dict[str, Any]) -> str:
+    payload = {
+        "open_time": int(candle["open_time"]),
+        "close_time": int(candle["close_time"]),
+        "open": str(candle["open"]),
+        "high": str(candle["high"]),
+        "low": str(candle["low"]),
+        "close": str(candle["close"]),
+    }
+    return sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def replay_bootstrap_state(
+    candles: list[dict[str, Any]],
+    *,
+    evaluation_start_ms: int,
+    cutoff_open_ms: int,
+    strategy_version_id: str = "TEST-SPEC-002",
+    pair: str = "ZEC/USDT",
+) -> ReferenceState:
+    if not candles:
+        raise ValueError("bootstrap_empty_candles")
+    state = ReferenceState()
+    found_cutoff = False
+    for index, bar in enumerate(candles):
+        open_time = int(bar["open_time"])
+        if open_time < evaluation_start_ms:
+            continue
+        if open_time > cutoff_open_ms:
+            break
+        state, _ = compute_reference_transition(
+            history_through_current=candles[: index + 1],
+            prior_state=state,
+            strategy_version_id=strategy_version_id,
+            pair=pair,
+        )
+        if open_time == cutoff_open_ms:
+            found_cutoff = True
+    if not found_cutoff:
+        raise ValueError("bootstrap_cutoff_missing")
+    return state
 
 
 def smoke_cases() -> dict[str, bool]:
