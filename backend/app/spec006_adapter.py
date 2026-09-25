@@ -94,16 +94,17 @@ def compute_reference_transition(*, history_through_current: list[dict[str, Any]
 
         if exit_price is not None:
             side = state.reference_position_state
+            exit_time = open_time if reason == "chandelier_stop_gap" else close_time
             actions.append({
                 "action_type": "EXIT_TO_FLAT",
                 "position_side": side,
-                "reference_decision_time_ms": close_time,
-                "required_execution_time_ms": close_time,
+                "reference_decision_time_ms": exit_time,
+                "required_execution_time_ms": exit_time,
                 "reference_price": exit_price,
                 "reason_code": reason,
                 "active_stop": active_stop,
                 "reference_atr": latest_atr,
-                "idempotency_key": action_key(strategy_version_id, pair, "EXIT_TO_FLAT", close_time, close_time, side, reason),
+                "idempotency_key": action_key(strategy_version_id, pair, "EXIT_TO_FLAT", exit_time, exit_time, side, reason),
             })
             state = ReferenceState()
 
