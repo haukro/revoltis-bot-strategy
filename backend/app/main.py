@@ -4829,7 +4829,7 @@ async def export_freqtrade(settings: StrategySettings):
     candidate = None
     for record in records:
         row = (present_optimizer_record(record) or {}).get("result") or {}
-        if lock and row.get("version_id") == lock["version_id"] and row.get("selection_policy_version") == 3 and row.get("qualified") and row.get("winner") and row.get("holdout_evaluated") and assess_candidate(row, row.get("locked_pairs", []))["qualified"]:
+        if lock and row.get("version_id") == lock["version_id"] and row.get("selection_policy_version") == 4 and row.get("qualified") and row.get("winner") and row.get("holdout_evaluated") and assess_candidate(row, row.get("locked_pairs", []))["qualified"]:
             candidate = row
             break
     if candidate is None:
