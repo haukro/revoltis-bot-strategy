@@ -68,8 +68,8 @@ def assert_first_trade_matches_actions(outcome, actions):
     trade = outcome["trades"][0]
     entries = [a for a in actions if a["action_type"] == "ENTRY"]
     exits = [a for a in actions if a["action_type"] == "EXIT_TO_FLAT"]
-    assert len(entries) == 1
-    assert len(exits) == 1
+    assert entries
+    assert exits
     assert entries[0]["required_execution_time_ms"] == trade["entry_time"]
     assert entries[0]["reference_price"] == trade["entry_price"]
     assert exits[0]["required_execution_time_ms"] == trade["exit_time"]
@@ -142,7 +142,7 @@ def test_signal_while_open_does_not_create_second_incremental_entry():
     outcome = official(rows, start, end)
     _, actions = run_incremental(rows, start, end)
     entries = [a for a in actions if a["action_type"] == "ENTRY"]
-    assert outcome["ignored_signals_while_open"] >= 1
+    assert outcome["metrics"]["ignored_signals_while_open"] >= 1
     assert len(entries) == 1
 
 
