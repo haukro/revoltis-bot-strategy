@@ -1,252 +1,213 @@
-"""Operational incremental reference helpers for locked IMPLEMENTATION-SPEC-006.
+"""Incremental frozen Strategy-B reference adapter for locked IMPLEMENTATION-SPEC-006.
 
-This module mirrors frozen TEST-SPEC-002 reference state only.
-It does not compute official performance, PASS/FAIL, or paper execution.
+Reference-plane only. No official scoring, PnL, live routing or runtime activation.
 """
 from __future__ import annotations
 
-import hashlib
+from dataclasses import dataclass, asdict
+from hashlib import sha256
 import json
-from dataclasses import dataclass
-from datetime import UTC, datetime
 from math import isfinite
 from typing import Any
 
-from .tsmom_b_v1 import (
-    ATR_MULTIPLE,
-    FIVE_MIN_MS,
-    ONE_HOUR_MS,
-    aggregate_1h_ohlc,
-    hourly_signals,
-    wilder_atr,
-)
+from .tsmom_b_v1 import ATR_MULTIPLE, FIVE_MIN_MS, aggregate_1h_ohlc, hourly_signals, wilder_atr
 
 
-@dataclass(frozen=True)
-class ReferenceAction:
-    action_type: str
-    position_side: str
-    reference_decision_time_ms: int
-    required_execution_time_ms: int
-    reference_price: float
-    reason_code: str
-    reference_atr: float | None
-    active_stop: float | None
+@dataclass
+class ReferenceState:
+    reference_position_state: str = "FLAT"
+    reference_signal_close_time: int | None = None
+    reference_entry_time: int | None = None
+    reference_entry_price: float | None = None
+    reference_entry_atr: float | None = None
+    active_stop: float | None = None
+    peak_high: float | None = None
+    trough_low: float | None = None
 
 
-def reference_bar_source_hash(
-    strategy_version_id: str,
-    pair: str,
-    candle: dict[str, Any],
-) -> str:
-    payload = [
-        strategy_version_id,
-        pair.upper(),
-        int(candle["open_time"]),
-        int(candle["close_time"]),
-        str(candle["open"]),
-        str(candle["high"]),
-        str(candle["low"]),
-        str(candle["close"]),
-    ]
-    return hashlib.sha256(
-        json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode()
-    ).hexdigest()
+def action_key(strategy_version_id: str, pair: str, action_type: str, reference_decision_time_ms: int, required_execution_time_ms: int, position_side: str, reason_code: str) -> str:
+    payload = "|".join(["STRATEGY_ACTION", strategy_version_id, pair, action_type, str(reference_decision_time_ms), str(required_execution_time_ms), position_side, reason_code])
+    return sha256(payload.encode()).hexdigest()
 
 
-def reference_bar_rpc_row(
-    strategy_version_id: str,
-    pair: str,
-    candle: dict[str, Any],
-) -> dict[str, Any]:
-    return {
-        "strategy_version_id": strategy_version_id,
-        "pair": pair.upper(),
-        "open_time": datetime.fromtimestamp(int(candle["open_time"]) / 1000, UTC).isoformat(),
-        "close_time": datetime.fromtimestamp(int(candle["close_time"]) / 1000, UTC).isoformat(),
+def _hour_close_before(open_time: int) -> int:
+    return (open_time // 3_600_000) * 3_600_000 - 1
+
+
+def _validate_bar(candle: dict[str, Any]) -> None:
+    values = [float(candle[k]) for k in ("open", "high", "low", "close")]
+    if any(not isfinite(v) or v <= 0 for v in values):
+        raise ValueError("invalid_5m_ohlc")
+    if int(candle["close_time"]) != int(candle["open_time"]) + FIVE_MIN_MS - 1:
+        raise ValueError("invalid_5m_close_time")
+
+
+def compute_reference_transition(*, history_through_current: list[dict[str, Any]], prior_state: ReferenceState, strategy_version_id: str, pair: str) -> tuple[ReferenceState, list[dict[str, Any]]]:
+    """Apply exactly one next 5m reference transition.
+
+    history_through_current must be contiguous and end with the bar being processed.
+    It may include arbitrary warmup history before the current bar.
+    """
+    if not history_through_current:
+        raise ValueError("empty_history")
+    current = history_through_current[-1]
+    _validate_bar(current)
+    if any(int(b["open_time"]) - int(a["open_time"]) != FIVE_MIN_MS for a, b in zip(history_through_current, history_through_current[1:])):
+        raise ValueError("non_contiguous_5m_history")
+
+    hourly = aggregate_1h_ohlc(history_through_current)
+    atr_by_close = wilder_atr(hourly)
+    signals = hourly_signals(hourly)
+
+    open_time = int(current["open_time"])
+    close_time = int(current["close_time"])
+    o, h, l = (float(current[k]) for k in ("open", "high", "low"))
+    available_hour_close = _hour_close_before(open_time)
+    signal_side = signals.get(available_hour_close) if open_time == available_hour_close + 1 else None
+
+    state = ReferenceState(**asdict(prior_state))
+    actions: list[dict[str, Any]] = []
+    had_position_at_bar_start = state.reference_position_state in ("LONG", "SHORT")
+
+    if had_position_at_bar_start:
+        latest_atr = atr_by_close.get(available_hour_close)
+        if latest_atr is not None:
+            if state.reference_position_state == "LONG":
+                candidate = float(state.peak_high) - ATR_MULTIPLE * latest_atr
+                state.active_stop = max(float(state.active_stop), candidate)
+            else:
+                candidate = float(state.trough_low) + ATR_MULTIPLE * latest_atr
+                state.active_stop = min(float(state.active_stop), candidate)
+
+        active_stop = float(state.active_stop)
+        exit_price: float | None = None
+        reason: str | None = None
+        if state.reference_position_state == "LONG":
+            if o < active_stop:
+                exit_price, reason = o, "chandelier_stop_gap"
+            elif l <= active_stop:
+                exit_price, reason = active_stop, "chandelier_stop"
+        else:
+            if o > active_stop:
+                exit_price, reason = o, "chandelier_stop_gap"
+            elif h >= active_stop:
+                exit_price, reason = active_stop, "chandelier_stop"
+
+        if exit_price is not None:
+            side = state.reference_position_state
+            exit_time = open_time if reason == "chandelier_stop_gap" else close_time
+            actions.append({
+                "action_type": "EXIT_TO_FLAT",
+                "position_side": side,
+                "reference_decision_time_ms": exit_time,
+                "required_execution_time_ms": exit_time,
+                "reference_price": exit_price,
+                "reason_code": reason,
+                "active_stop": active_stop,
+                "reference_atr": latest_atr,
+                "idempotency_key": action_key(strategy_version_id, pair, "EXIT_TO_FLAT", exit_time, exit_time, side, reason),
+            })
+            state = ReferenceState()
+
+    if signal_side is not None and not had_position_at_bar_start and state.reference_position_state == "FLAT":
+        atr = atr_by_close.get(available_hour_close)
+        if atr is None or not isfinite(atr) or atr <= 0:
+            raise ValueError("signal_without_valid_atr")
+        side = "LONG" if signal_side == "long" else "SHORT"
+        stop = o - ATR_MULTIPLE * atr if side == "LONG" else o + ATR_MULTIPLE * atr
+        state = ReferenceState(
+            reference_position_state=side,
+            reference_signal_close_time=available_hour_close,
+            reference_entry_time=open_time,
+            reference_entry_price=o,
+            reference_entry_atr=atr,
+            active_stop=stop,
+            peak_high=o,
+            trough_low=o,
+        )
+        entry = {
+            "action_type": "ENTRY",
+            "position_side": side,
+            "reference_decision_time_ms": available_hour_close,
+            "required_execution_time_ms": open_time,
+            "reference_price": o,
+            "reason_code": "BREAKOUT_LONG" if side == "LONG" else "BREAKOUT_SHORT",
+            "active_stop": stop,
+            "reference_atr": atr,
+        }
+        entry["idempotency_key"] = action_key(strategy_version_id, pair, "ENTRY", available_hour_close, open_time, side, entry["reason_code"])
+        actions.append(entry)
+
+        initial_hit = (side == "LONG" and l <= stop) or (side == "SHORT" and h >= stop)
+        if initial_hit:
+            exit_action = {
+                "action_type": "EXIT_TO_FLAT",
+                "position_side": side,
+                "reference_decision_time_ms": close_time,
+                "required_execution_time_ms": close_time,
+                "reference_price": stop,
+                "reason_code": "initial_stop",
+                "active_stop": stop,
+                "reference_atr": atr,
+            }
+            exit_action["idempotency_key"] = action_key(strategy_version_id, pair, "EXIT_TO_FLAT", close_time, close_time, side, "initial_stop")
+            actions.append(exit_action)
+            state = ReferenceState()
+
+    if state.reference_position_state in ("LONG", "SHORT"):
+        state.peak_high = max(float(state.peak_high), h)
+        state.trough_low = min(float(state.trough_low), l)
+
+    return state, actions
+
+
+
+def reference_bar_hash(candle: dict[str, Any]) -> str:
+    payload = {
+        "open_time": int(candle["open_time"]),
+        "close_time": int(candle["close_time"]),
         "open": str(candle["open"]),
         "high": str(candle["high"]),
         "low": str(candle["low"]),
         "close": str(candle["close"]),
-        "source_hash": reference_bar_source_hash(strategy_version_id, pair, candle),
     }
+    return sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def _hour_close_before(open_time: int) -> int:
-    return (open_time // ONE_HOUR_MS) * ONE_HOUR_MS - 1
-
-
-def replay_frozen_reference(
+def replay_bootstrap_state(
     candles: list[dict[str, Any]],
     *,
     evaluation_start_ms: int,
-    evaluation_end_ms: int,
-) -> dict[str, Any]:
-    """Replay frozen B reference mechanics without PnL or official scoring."""
+    cutoff_open_ms: int,
+    strategy_version_id: str = "TEST-SPEC-002",
+    pair: str = "ZEC/USDT",
+) -> ReferenceState:
     if not candles:
-        raise ValueError("empty_reference_feed")
-    ordered = sorted(candles, key=lambda row: int(row["open_time"]))
-    if any(
-        int(b["open_time"]) - int(a["open_time"]) != FIVE_MIN_MS
-        for a, b in zip(ordered, ordered[1:])
-    ):
-        raise ValueError("reference_5m_gap")
-
-    hourly = aggregate_1h_ohlc(ordered)
-    atr_by_close = wilder_atr(hourly)
-    signals = hourly_signals(hourly)
-    signal_times = {
-        ts: side
-        for ts, side in signals.items()
-        if evaluation_start_ms <= ts <= evaluation_end_ms
-    }
-
-    rows = [
-        row for row in ordered
-        if int(row["open_time"]) >= evaluation_start_ms
-        and int(row["close_time"]) <= evaluation_end_ms
-    ]
-    if not rows:
-        raise ValueError("empty_reference_window")
-    if int(rows[0]["open_time"]) != evaluation_start_ms:
-        raise ValueError("reference_start_mismatch")
-
-    position: dict[str, Any] | None = None
-    actions: list[ReferenceAction] = []
-
-    for candle in rows:
-        open_time = int(candle["open_time"])
-        close_time = int(candle["close_time"])
-        o = float(candle["open"])
-        h = float(candle["high"])
-        l = float(candle["low"])
-        close = float(candle["close"])
-        if any(not isfinite(value) or value <= 0 for value in (o, h, l, close)):
-            raise ValueError("invalid_reference_ohlc")
-
-        available_hour_close = _hour_close_before(open_time)
-        signal_side = (
-            signal_times.get(available_hour_close)
-            if open_time == available_hour_close + 1
-            else None
+        raise ValueError("bootstrap_empty_candles")
+    state = ReferenceState()
+    found_cutoff = False
+    for index, bar in enumerate(candles):
+        open_time = int(bar["open_time"])
+        if open_time < evaluation_start_ms:
+            continue
+        if open_time > cutoff_open_ms:
+            break
+        state, _ = compute_reference_transition(
+            history_through_current=candles[: index + 1],
+            prior_state=state,
+            strategy_version_id=strategy_version_id,
+            pair=pair,
         )
-        had_position_at_bar_start = position is not None
+        if open_time == cutoff_open_ms:
+            found_cutoff = True
+    if not found_cutoff:
+        raise ValueError("bootstrap_cutoff_missing")
+    return state
 
-        if position is not None:
-            latest_atr = atr_by_close.get(available_hour_close)
-            if latest_atr is not None:
-                if position["side"] == "LONG":
-                    candidate = position["peak_high"] - ATR_MULTIPLE * latest_atr
-                    position["stop"] = max(position["stop"], candidate)
-                else:
-                    candidate = position["trough_low"] + ATR_MULTIPLE * latest_atr
-                    position["stop"] = min(position["stop"], candidate)
 
-            active_stop = float(position["stop"])
-            exit_price: float | None = None
-            exit_time: int | None = None
-            reason: str | None = None
-            if position["side"] == "LONG":
-                if o < active_stop:
-                    exit_price, exit_time, reason = o, open_time, "chandelier_stop_gap"
-                elif l <= active_stop:
-                    exit_price, exit_time, reason = active_stop, close_time, "chandelier_stop"
-            else:
-                if o > active_stop:
-                    exit_price, exit_time, reason = o, open_time, "chandelier_stop_gap"
-                elif h >= active_stop:
-                    exit_price, exit_time, reason = active_stop, close_time, "chandelier_stop"
-
-            if exit_price is not None and exit_time is not None and reason is not None:
-                actions.append(ReferenceAction(
-                    "EXIT_TO_FLAT",
-                    position["side"],
-                    exit_time,
-                    exit_time,
-                    exit_price,
-                    reason,
-                    latest_atr,
-                    active_stop,
-                ))
-                position = None
-
-        if signal_side is not None and not had_position_at_bar_start and position is None:
-            atr = atr_by_close.get(available_hour_close)
-            if atr is None or not isfinite(atr) or atr <= 0:
-                raise ValueError("signal_without_valid_atr")
-            side = signal_side.upper()
-            stop = o - ATR_MULTIPLE * atr if side == "LONG" else o + ATR_MULTIPLE * atr
-            actions.append(ReferenceAction(
-                "ENTRY",
-                side,
-                available_hour_close,
-                open_time,
-                o,
-                "BREAKOUT_LONG" if side == "LONG" else "BREAKOUT_SHORT",
-                atr,
-                stop,
-            ))
-            position = {
-                "side": side,
-                "signal_close_time": available_hour_close,
-                "entry_time": open_time,
-                "entry_price": o,
-                "entry_atr": atr,
-                "stop": stop,
-                "peak_high": o,
-                "trough_low": o,
-            }
-
-            initial_hit = (
-                (side == "LONG" and l <= stop)
-                or (side == "SHORT" and h >= stop)
-            )
-            if initial_hit:
-                actions.append(ReferenceAction(
-                    "EXIT_TO_FLAT",
-                    side,
-                    close_time,
-                    close_time,
-                    stop,
-                    "initial_stop",
-                    atr,
-                    stop,
-                ))
-                position = None
-
-        if position is not None:
-            position["peak_high"] = max(float(position["peak_high"]), h)
-            position["trough_low"] = min(float(position["trough_low"]), l)
-
-    final_state: dict[str, Any] = {
-        "reference_position_state": "FLAT",
-        "reference_signal_close_time": None,
-        "reference_entry_time": None,
-        "reference_entry_price": None,
-        "reference_entry_atr": None,
-        "active_stop": None,
-        "peak_high": None,
-        "trough_low": None,
-    }
-    if position is not None:
-        final_state = {
-            "reference_position_state": position["side"],
-            "reference_signal_close_time": position["signal_close_time"],
-            "reference_entry_time": position["entry_time"],
-            "reference_entry_price": position["entry_price"],
-            "reference_entry_atr": position["entry_atr"],
-            "active_stop": position["stop"],
-            "peak_high": position["peak_high"],
-            "trough_low": position["trough_low"],
-        }
-
+def smoke_cases() -> dict[str, bool]:
+    key = action_key("TEST-SPEC-002", "ZEC/USDT", "ENTRY", 1, 2, "LONG", "BREAKOUT_LONG")
     return {
-        "actions": actions,
-        "state": final_state,
-        "cursor_open_time": int(rows[-1]["open_time"]),
-        "cursor_close_time": int(rows[-1]["close_time"]),
+        "action_key_stable": key == action_key("TEST-SPEC-002", "ZEC/USDT", "ENTRY", 1, 2, "LONG", "BREAKOUT_LONG"),
+        "action_key_type_sensitive": key != action_key("TEST-SPEC-002", "ZEC/USDT", "EXIT_TO_FLAT", 1, 2, "LONG", "BREAKOUT_LONG"),
     }
-
-
-def blind_bootstrap_category(replay: dict[str, Any]) -> str:
-    return "SAFE_FLAT" if replay["state"]["reference_position_state"] == "FLAT" else "WAIT_SAFE_BOUNDARY"
