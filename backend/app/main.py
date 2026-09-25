@@ -1358,7 +1358,7 @@ async def internal_paper_outbox_tick(
                     reservation = reservations[0] if reservations else None
                     if reservation and reservation.get("status") in ("RESERVED", "PARTIALLY_CONSUMED"):
                         if spec006_lifecycle:
-                            await supabase_rpc(
+                            order_result = await supabase_rpc(
                                 "paper_spec006_create_entry_order_from_approved_signal",
                                 {
                                     "p_signal_id": entity_id,
@@ -1366,6 +1366,19 @@ async def internal_paper_outbox_tick(
                                     "p_software_commit": commit,
                                 },
                             )
+                            if (order_result or {}).get("reason") in {
+                                "WAIT_OWNER_ENTRY_IN_FLIGHT",
+                                "WAIT_ENTRY_IN_FLIGHT",
+                                "INTEGRITY_CLAIM_RETRY",
+                            }:
+                                await _paper_ack(
+                                    outbox_id,
+                                    worker,
+                                    generation,
+                                    "SPEC006_ENTRY_ORDER_WAIT",
+                                )
+                                errors += 1
+                                continue
                         else:
                             await supabase_rpc(
                                 "paper_create_order_from_approved_signal",
