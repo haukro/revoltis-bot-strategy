@@ -4615,16 +4615,21 @@ async def finalize_optimizer(request: OptimizerFinalizeRequest):
     if existing:
         return present_optimizer_record(existing[0])
 
-    records: list[dict[str, Any]] = []
-    for job_id in source_job_ids:
-        stored = await supabase_get(
-            "optimizer_runs",
-            f"id=eq.{job_id}&limit=1",
-        )
-        if not stored:
-            raise HTTPException(404, f"Optimizer run {job_id} nebol nájdený.")
+    # Fetch all source runs in one PostgREST request instead of one request
+    # per coin. Large 90d optimizer payloads make repeated round trips much more
+    # likely to hit a transient Supabase read timeout.
+    source_filter = ",".join(source_job_ids)
+    records = await supabase_get(
+        "optimizer_runs",
+        f"id=in.({source_filter})&limit={len(source_job_ids)}",
+    )
+    records_by_id = {str(record.get("id")): record for record in records}
+    missing = [job_id for job_id in source_job_ids if job_id not in records_by_id]
+    if missing:
+        raise HTTPException(404, f"Optimizer run {missing[0]} nebol nájdený.")
 
-        record = stored[0]
+    records = [records_by_id[job_id] for job_id in source_job_ids]
+    for record in records:
         if record.get("status") != "completed":
             raise HTTPException(422, "Nie všetky optimizer runy sú dokončené.")
 
@@ -4638,7 +4643,6 @@ async def finalize_optimizer(request: OptimizerFinalizeRequest):
                 422,
                 "Každý zdrojový optimizer run musí patriť presne jednému coinu.",
             )
-        records.append(record)
 
     covered_pairs = [
         (record.get("request") or {}).get("pairs", [None])[0]
