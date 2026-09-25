@@ -35,6 +35,8 @@ from .tsmom_c_v1 import (
 from .momentum_prescreen import pack_market_series, unpack_market_series, analyze_block, pooled_analysis
 from .paper_execution import smoke_cases as paper_execution_smoke_cases
 from .spec006_adapter import (
+    ReferenceState as Spec006ReferenceState,
+    compute_reference_transition as spec006_compute_reference_transition,
     reference_bar_hash as spec006_reference_bar_hash,
     replay_bootstrap_state as spec006_replay_bootstrap_state,
     smoke_cases as spec006_adapter_smoke_cases,
@@ -545,6 +547,179 @@ async def internal_spec006_bootstrap(
         "runtime_b_enabled": False,
         "blind_safe": True,
     }
+
+
+@app.post("/api/internal/paper/spec-006/recover")
+async def internal_spec006_recover(
+    x_paper_scheduler_token: str | None = Header(default=None, alias="X-Paper-Scheduler-Token"),
+):
+    """Recover INVALID reference state without dispatching historical B actions."""
+    require_durable_production_store()
+    _require_internal_secret(x_paper_scheduler_token, "PAPER_SCHEDULER_TOKEN")
+
+    strategy_version_id = "TEST-SPEC-002"
+    pair = "ZEC/USDT"
+    rows = await supabase_get(
+        "paper_strategy_shadow_state",
+        f"strategy_version_id=eq.{strategy_version_id}&pair=eq.ZEC%2FUSDT&limit=1",
+    )
+    if not rows:
+        return {"status": "not_initialized", "blind_safe": True}
+    shadow = rows[0]
+    if shadow.get("data_state") != "INVALID":
+        return {"status": "not_invalid", "blind_safe": True}
+
+    def ms(value):
+        if value is None:
+            return None
+        return int(datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp() * 1000)
+
+    cursor_ms = ms(shadow["last_processed_5m_open_time"])
+    invalid_ms = ms(shadow["invalid_at_5m_open_time"])
+    if cursor_ms is None or invalid_ms is None:
+        return {"status": "integrity_blocked", "blind_safe": True}
+
+    step = TIMEFRAME_MILLISECONDS["5m"]
+    now = datetime.now(UTC)
+    now_ms = int(now.timestamp() * 1000)
+    cutoff_open_ms = (now_ms // step) * step - step
+    if cutoff_open_ms <= cursor_ms:
+        return {"status": "waiting_data", "blind_safe": True}
+
+    warmup_start_ms = cursor_ms - 30 * 3_600_000
+    count = int((cutoff_open_ms - warmup_start_ms) // step + 1)
+    candles = await load_okx_candles(
+        pair,
+        "5m",
+        min(45000, count),
+        warmup_start_ms,
+        cutoff_open_ms,
+    )
+    if (
+        not candles
+        or int(candles[-1]["open_time"]) != cutoff_open_ms
+        or not any(int(row["open_time"]) == invalid_ms for row in candles)
+        or any(
+            int(right["open_time"]) - int(left["open_time"]) != step
+            for left, right in zip(candles, candles[1:])
+        )
+    ):
+        return {"status": "waiting_data", "blind_safe": True}
+
+    payload_rows = [
+        {
+            "strategy_version_id": strategy_version_id,
+            "pair": pair,
+            "open_time": datetime.fromtimestamp(int(row["open_time"]) / 1000, UTC).isoformat(),
+            "close_time": datetime.fromtimestamp(int(row["close_time"]) / 1000, UTC).isoformat(),
+            "open": str(row["open"]),
+            "high": str(row["high"]),
+            "low": str(row["low"]),
+            "close": str(row["close"]),
+            "source_hash": spec006_reference_bar_hash(row),
+        }
+        for row in candles
+    ]
+    for start in range(0, len(payload_rows), 200):
+        await supabase_rpc(
+            "paper_spec006_ingest_reference_bars",
+            {"p_rows": payload_rows[start : start + 200]},
+        )
+
+    prior = Spec006ReferenceState(
+        reference_position_state=shadow["reference_position_state"],
+        reference_signal_close_time=ms(shadow.get("reference_signal_close_time")),
+        reference_entry_time=ms(shadow.get("reference_entry_time")),
+        reference_entry_price=float(shadow["reference_entry_price"]) if shadow.get("reference_entry_price") is not None else None,
+        reference_entry_atr=float(shadow["reference_entry_atr"]) if shadow.get("reference_entry_atr") is not None else None,
+        active_stop=float(shadow["active_stop"]) if shadow.get("active_stop") is not None else None,
+        peak_high=float(shadow["peak_high"]) if shadow.get("peak_high") is not None else None,
+        trough_low=float(shadow["trough_low"]) if shadow.get("trough_low") is not None else None,
+    )
+    state = prior
+    suppressed_actions = []
+    for index, bar in enumerate(candles):
+        open_ms = int(bar["open_time"])
+        if open_ms <= cursor_ms:
+            continue
+        if open_ms > cutoff_open_ms:
+            break
+        state, emitted = spec006_compute_reference_transition(
+            history_through_current=candles[: index + 1],
+            prior_state=state,
+            strategy_version_id=strategy_version_id,
+            pair=pair,
+        )
+        suppressed_actions.extend(emitted)
+
+    commit_time = datetime.now(UTC)
+    cutoff_iso = datetime.fromtimestamp(cutoff_open_ms / 1000, UTC).isoformat()
+    same_cycle = (
+        state.reference_position_state in {"LONG", "SHORT"}
+        and shadow.get("reference_entry_action_id")
+        and not suppressed_actions
+        and state.reference_position_state == prior.reference_position_state
+    )
+
+    if same_cycle:
+        state_payload = {
+            "reference_position_state": state.reference_position_state,
+            "reference_signal_close_time": datetime.fromtimestamp(state.reference_signal_close_time / 1000, UTC).isoformat() if state.reference_signal_close_time is not None else None,
+            "reference_entry_time": datetime.fromtimestamp(state.reference_entry_time / 1000, UTC).isoformat() if state.reference_entry_time is not None else None,
+            "reference_entry_price": state.reference_entry_price,
+            "reference_entry_atr": state.reference_entry_atr,
+            "active_stop": state.active_stop,
+            "peak_high": state.peak_high,
+            "trough_low": state.trough_low,
+        }
+        result = await supabase_rpc(
+            "paper_spec006_commit_recovery_same_cycle",
+            {
+                "p_strategy_version_id": strategy_version_id,
+                "p_pair": pair,
+                "p_expected_entry_action_id": shadow["reference_entry_action_id"],
+                "p_cutoff_open_time": cutoff_iso,
+                "p_enable_commit_time": commit_time.isoformat(),
+                "p_reference_state": state_payload,
+                "p_software_commit": os.getenv("VERCEL_GIT_COMMIT_SHA", "unknown"),
+            },
+        )
+        return {
+            "status": "recovered_ready" if (result or {}).get("resumed") else "recovery_wait",
+            "blind_safe": True,
+        }
+
+    if state.reference_position_state == "FLAT":
+        result = await supabase_rpc(
+            "paper_spec006_commit_recovery_flat",
+            {
+                "p_strategy_version_id": strategy_version_id,
+                "p_pair": pair,
+                "p_cutoff_open_time": cutoff_iso,
+                "p_enable_commit_time": commit_time.isoformat(),
+            },
+        )
+        if (result or {}).get("reason") == "RECOVERY_FLATTEN_REQUIRED":
+            binding = await _paper_runtime_binding(strategy_version_id)
+            if binding and binding.get("enabled"):
+                queued = await supabase_rpc(
+                    "paper_spec006_queue_exit_attempt",
+                    {
+                        "p_exit_intent_id": result["exit_intent_id"],
+                        "p_software_commit": os.getenv("VERCEL_GIT_COMMIT_SHA", "unknown"),
+                    },
+                )
+                return {
+                    "status": "recovery_flatten_running" if (queued or {}).get("queued") else "recovery_wait",
+                    "blind_safe": True,
+                }
+            return {"status": "recovery_wait", "blind_safe": True}
+        return {
+            "status": "recovered_ready" if (result or {}).get("resumed") else "recovery_wait",
+            "blind_safe": True,
+        }
+
+    return {"status": "waiting_safe_boundary", "blind_safe": True}
 
 
 @app.get("/api/paper/spec-006/smoke")
