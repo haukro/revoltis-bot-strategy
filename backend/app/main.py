@@ -494,6 +494,129 @@ async def paper_market_health():
     }
 
 
+@app.post("/api/internal/paper/spec-006/reference-tick")
+async def internal_spec006_reference_tick(
+    x_paper_scheduler_token: str | None = Header(default=None, alias="X-Paper-Scheduler-Token"),
+):
+    """Advance frozen-B reference state in exact 5m transactions when runtime B is enabled."""
+    require_durable_production_store()
+    _require_internal_secret(x_paper_scheduler_token, "PAPER_SCHEDULER_TOKEN")
+
+    strategy_version_id = "TEST-SPEC-002"
+    pair = "ZEC/USDT"
+    binding = await _paper_runtime_binding(strategy_version_id)
+    if not binding or not binding.get("enabled"):
+        return {"status": "disabled", "blind_safe": True, "runtime_b_enabled": False}
+
+    shadows = await supabase_get(
+        "paper_strategy_shadow_state",
+        f"strategy_version_id=eq.{strategy_version_id}&pair=eq.ZEC%2FUSDT&limit=1",
+    )
+    if not shadows:
+        return {"status": "not_initialized", "blind_safe": True, "runtime_b_enabled": True}
+    shadow = shadows[0]
+    if shadow.get("data_state") == "INVALID":
+        return {"status": "invalid", "blind_safe": True, "runtime_b_enabled": True}
+
+    step = TIMEFRAME_MILLISECONDS["5m"]
+    cursor_ms = int(
+        datetime.fromisoformat(
+            str(shadow["last_processed_5m_open_time"]).replace("Z", "+00:00")
+        ).timestamp()
+        * 1000
+    )
+    expected_ms = cursor_ms + step
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    latest_closed_open_ms = (now_ms // step) * step - step
+    if expected_ms > latest_closed_open_ms:
+        return {"status": "waiting", "blind_safe": True, "runtime_b_enabled": True}
+
+    end_ms = min(latest_closed_open_ms, expected_ms + 11 * step)
+    count = int((end_ms - expected_ms) // step + 1)
+    try:
+        candles = await load_okx_candles(
+            pair,
+            "5m",
+            count,
+            expected_ms,
+            end_ms,
+        )
+    except Exception:
+        return {"status": "data_unavailable", "blind_safe": True, "runtime_b_enabled": True}
+
+    by_open = {int(row["open_time"]): row for row in candles}
+    if expected_ms not in by_open:
+        if any(open_time > expected_ms for open_time in by_open):
+            result = await supabase_rpc(
+                "paper_spec006_commit_reference_bar",
+                {
+                    "p_strategy_version_id": strategy_version_id,
+                    "p_pair": pair,
+                    "p_expected_open_time": datetime.fromtimestamp(expected_ms / 1000, UTC).isoformat(),
+                    "p_software_commit": os.getenv("VERCEL_GIT_COMMIT_SHA", "unknown"),
+                },
+            )
+            return {
+                "status": "invalid" if (result or {}).get("data_state") == "INVALID" else "data_unavailable",
+                "blind_safe": True,
+                "runtime_b_enabled": True,
+            }
+        return {"status": "data_unavailable", "blind_safe": True, "runtime_b_enabled": True}
+
+    payload_rows = [
+        {
+            "strategy_version_id": strategy_version_id,
+            "pair": pair,
+            "open_time": datetime.fromtimestamp(int(row["open_time"]) / 1000, UTC).isoformat(),
+            "close_time": datetime.fromtimestamp(int(row["close_time"]) / 1000, UTC).isoformat(),
+            "open": str(row["open"]),
+            "high": str(row["high"]),
+            "low": str(row["low"]),
+            "close": str(row["close"]),
+            "source_hash": spec006_reference_bar_hash(row),
+        }
+        for row in candles
+    ]
+    await supabase_rpc("paper_spec006_ingest_reference_bars", {"p_rows": payload_rows})
+
+    status = "advanced"
+    for open_ms in range(expected_ms, end_ms + 1, step):
+        if open_ms not in by_open:
+            # A later exact key exists in the verified batch: this is a true gap.
+            if any(candidate > open_ms for candidate in by_open):
+                result = await supabase_rpc(
+                    "paper_spec006_commit_reference_bar",
+                    {
+                        "p_strategy_version_id": strategy_version_id,
+                        "p_pair": pair,
+                        "p_expected_open_time": datetime.fromtimestamp(open_ms / 1000, UTC).isoformat(),
+                        "p_software_commit": os.getenv("VERCEL_GIT_COMMIT_SHA", "unknown"),
+                    },
+                )
+                status = "invalid" if (result or {}).get("data_state") == "INVALID" else "data_unavailable"
+            else:
+                status = "data_unavailable"
+            break
+        result = await supabase_rpc(
+            "paper_spec006_commit_reference_bar",
+            {
+                "p_strategy_version_id": strategy_version_id,
+                "p_pair": pair,
+                "p_expected_open_time": datetime.fromtimestamp(open_ms / 1000, UTC).isoformat(),
+                "p_software_commit": os.getenv("VERCEL_GIT_COMMIT_SHA", "unknown"),
+            },
+        )
+        if (result or {}).get("data_state") == "INVALID" or (result or {}).get("reason") == "REFERENCE_INVALID":
+            status = "invalid"
+            break
+
+    return {
+        "status": status,
+        "blind_safe": True,
+        "runtime_b_enabled": True,
+    }
+
+
 @app.post("/api/internal/paper/spec-006/bootstrap")
 async def internal_spec006_bootstrap(
     x_paper_scheduler_token: str | None = Header(default=None, alias="X-Paper-Scheduler-Token"),
