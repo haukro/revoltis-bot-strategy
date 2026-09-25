@@ -25,6 +25,22 @@ def base_long_fixture():
     return rows
 
 
+def base_short_fixture():
+    rows = []
+    for hour in range(27):
+        for j in range(12):
+            ts = hour * ONE_HOUR_MS + j * FIVE_MIN_MS
+            if hour < 24:
+                rows.append(candle(ts, 100, 101, 99, 100))
+            elif hour == 24:
+                close = 98.0 if j == 11 else 100.0
+                low = 97.8 if j == 11 else 99.0
+                rows.append(candle(ts, 100, 100.5, low, close))
+            else:
+                rows.append(candle(ts, 97.5, 98.0, 96.5, 97.4))
+    return rows
+
+
 def run_incremental(rows, start_ms, end_ms):
     state = ReferenceState()
     actions = []
@@ -106,3 +122,25 @@ def test_action_idempotency_replay_is_stable():
     b_state, b = compute_reference_transition(history_through_current=history, prior_state=ReferenceState(), strategy_version_id="TEST-SPEC-002", pair="ZEC/USDT")
     assert a == b
     assert a_state == b_state
+
+
+def test_short_same_bar_initial_stop_matches_frozen_b():
+    rows = base_short_fixture()
+    entry_idx = next(i for i, r in enumerate(rows) if r["open_time"] == 25 * ONE_HOUR_MS)
+    rows[entry_idx] = candle(25 * ONE_HOUR_MS, 97.5, 105.0, 96.5, 99.0)
+    start, end = 24 * ONE_HOUR_MS, 27 * ONE_HOUR_MS - 1
+    outcome = official(rows, start, end)
+    _, actions = run_incremental(rows, start, end)
+    assert outcome["trades"][0]["side"] == "short"
+    assert outcome["trades"][0]["exit_reason"] == "initial_stop"
+    assert_first_trade_matches_actions(outcome, actions)
+
+
+def test_signal_while_open_does_not_create_second_incremental_entry():
+    rows = base_long_fixture()
+    start, end = 24 * ONE_HOUR_MS, 27 * ONE_HOUR_MS - 1
+    outcome = official(rows, start, end)
+    _, actions = run_incremental(rows, start, end)
+    entries = [a for a in actions if a["action_type"] == "ENTRY"]
+    assert outcome["ignored_signals_while_open"] >= 1
+    assert len(entries) == 1
