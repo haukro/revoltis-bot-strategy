@@ -319,11 +319,11 @@ Only `OPEN` or `PAUSED` EXIT intents fence new paper ENTRY creation or ENTRY fil
 
 ### 6.2 Satisfaction
 
-The intent target is:
+For `REFERENCE_EXIT`, the intent target is:
 
 **paper exposure for strategy_version_id + pair must become zero and the linked ENTRY lifecycle must no longer be capable of creating exposure.**
 
-`SATISFIED` requires all of the following:
+`REFERENCE_EXIT` may become `SATISFIED` only when all are true:
 
 1. current paper position quantity is zero / no active paper position exists
 2. the linked ENTRY lifecycle satisfies the section 5.2 safe-terminal/fenced predicate
@@ -332,7 +332,14 @@ The intent target is:
 5. the ENTRY reservation is unused/released/terminal
 6. delayed/retried ENTRY dispatch cannot later create an order or exposure
 
-A missing ENTRY lifecycle row is not terminal and therefore cannot satisfy an EXIT intent.
+A missing ENTRY lifecycle row is not terminal and therefore cannot satisfy a `REFERENCE_EXIT` intent.
+
+For `INVALID_RECOVERY`, there is intentionally no linked reference ENTRY lifecycle. It may become `SATISFIED` only when:
+
+1. current paper position quantity is zero
+2. its single recovery EXIT order has no in-flight attempt or unacknowledged fill
+3. no economic effect from that recovery order can still arrive
+4. recovery remains internally marked non-official and reference history is unchanged
 
 Reference state being FLAT is never sufficient to satisfy a paper intent.
 
@@ -678,9 +685,11 @@ If recovered reference is LONG/SHORT but paper is flat, opposite-side, same-side
 
 If verified replay at the cutoff leaves reference `FLAT` but paper quantity is still > 0, historical dispatch suppression must not wedge paper.
 
-Create one durable **operational recovery flatten**:
+Create/reuse one durable **operational recovery flatten**:
 
-- source/origin = `INVALID_RECOVERY`, not `REFERENCE_EXIT`
+- `intent_origin = INVALID_RECOVERY`, not `REFERENCE_EXIT`
+- canonical `recovery_key` from section 6 prevents duplicate recovery intents across workers/retries
+- `exit_action_id = NULL` and `linked_entry_action_id = NULL`
 - no new `EXIT_TO_FLAT` reference action
 - no rewrite of reference history
 - no official B action/metric/PnL attribution
@@ -860,7 +869,7 @@ Recovery:
 50. recovered LONG/SHORT may return same epoch to CONTIGUOUS only when recovered reference cycle identity is unchanged from pre-gap and paper is linked to that same ENTRY lifecycle
 51. replay that crosses EXIT then later same-side ENTRY must not accept the old same-side paper position as a match
 52. recovered LONG/SHORT + paper flat/opposite/wrong-cycle emits no delayed ENTRY/flip and remains INVALID
-53. recovered FLAT + paper open creates exactly one operational `INVALID_RECOVERY` flatten
+53. recovered FLAT + paper open creates/reuses exactly one operational `INVALID_RECOVERY` intent via unique recovery_key and with no reference action link
 54. recovery flatten is reduce-only/current-book/non-official and uses one order/many attempts
 55. recovery flatten completion can clear the wedge without fabricating a second reference EXIT
 56. new epoch at a future verified FLAT boundary remains available when coherence cannot otherwise be restored
