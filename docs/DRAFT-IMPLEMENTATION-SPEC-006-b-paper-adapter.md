@@ -413,7 +413,20 @@ ENTRY fill application acquires fence -> position -> order/fill/reservation rows
 Flatten processing acquires fence -> position -> order/fill/reservation rows.
 Recovery that reconciles both planes acquires fence -> shadow -> position -> order/fill/reservation rows.
 
-Kill-switch, stale-snapshot and `lease_generation` checks from SPEC-004/005 remain mandatory. They must not introduce a retained row lock that reverses the hierarchy above.
+Kill-switch, stale-snapshot and `lease_generation` checks from SPEC-004/005 remain mandatory.
+
+For SPEC-006 economic paths, existing SPEC-004/005 RPCs may be reused only if their actual SQL lock order conforms to this hierarchy. In particular, a B ENTRY/EXIT apply path must **not** delegate into a legacy RPC that first locks outbox/order and only later locks paper position.
+
+Implementation must therefore use a SPEC-006 fence-aware transactional RPC/path that:
+
+- acquires execution fence first
+- acquires shadow only when required by that path
+- acquires/establishes paper position next
+- only then locks outbox/order/attempt/fill/reservation/risk-state rows needed for the economic effect
+- performs the same current-lease, stale-snapshot, idempotency, reservation and ACK checks required by SPEC-004/005
+- produces the same strategy-neutral accounting semantics except for the explicitly specified reduce-only EXIT quantity rules
+
+A retained `kill_switch_state` row lock, if required, must be acquired only after the execution fence and must never be held by a path that later tries to acquire the execution fence. No SPEC-006 path may invert this order.
 
 ### 7.2 Reference 5m transaction
 
@@ -548,11 +561,12 @@ Processing sequence:
    - on resume, continue the same intent and same EXIT order; create that one EXIT order on first resume only if it does not yet exist
 5. if `RUNNING` or `HALT_NEW_ENTRIES`:
    - lock current paper position
-   - then lock/read linked ENTRY order/attempt/fill/reservation rows
-   - fence/terminalize remaining nonterminal ENTRY order so no more ENTRY quantity can apply
-   - invalidate/terminalize any fill-capable queued ENTRY dispatch through the durable lifecycle
+   - for `REFERENCE_EXIT`: then lock/read only the linked ENTRY lifecycle/order/attempt/fill/reservation rows
+   - for `INVALID_RECOVERY`: then enumerate and lock/read **all extant fill-capable ENTRY lifecycles/orders/attempts/reservations for the same strategy_version_id + pair**
+   - fence/terminalize every relevant nonterminal ENTRY path so no more ENTRY quantity can apply
+   - invalidate/terminalize every relevant fill-capable queued ENTRY dispatch through its durable lifecycle
    - release only unconsumed ENTRY reservation through the existing terminal path
-   - prove no in-flight ENTRY `BIND_FILL_ATTEMPT` / unacknowledged fill remains before any SATISFIED transition
+   - prove no relevant in-flight ENTRY `BIND_FILL_ATTEMPT` / unacknowledged fill remains before any SATISFIED transition
 6. re-read paper position under lock
 
 ### No paper position / qty zero
@@ -563,10 +577,12 @@ Only if the full section 6.2 satisfaction predicate is true:
 - audit `EXIT_NO_PAPER_POSITION` internally if no paper quantity ever existed
 - no EXIT order is required
 
-If lifecycle is missing, dispatch is still fill-capable, an ENTRY order/attempt/fill is still live, or reservation is not terminal:
+For `REFERENCE_EXIT`, if its linked lifecycle is missing, dispatch is still fill-capable, an ENTRY order/attempt/fill is still live, or reservation is not terminal:
 
 - keep intent OPEN/PAUSED
 - do not infer terminality from temporary qty=0
+
+For `INVALID_RECOVERY`, qty=0 is insufficient until **every** same-pair ENTRY lifecycle/order/attempt/reservation satisfies the section 6.2 recovery predicate.
 
 ### Paper position exists and a live flatten already owns it
 
@@ -774,7 +790,11 @@ This recovery intent uses the same reduce-only execution machinery but must rema
 
 While this recovery flatten is unresolved, reference processing remains INVALID.
 
-After the recovery flatten is safely complete, if replayed reference is FLAT and data is verified contiguous through the cutoff, the same epoch may return to CONTIGUOUS at that recovered cursor. A new epoch at a later verified FLAT boundary is also allowed when an integrity reset is needed, but it is not the only legal way to clear paper exposure left by a suppressed historical exit.
+If replayed reference is FLAT, data is verified contiguous through the cutoff, paper is already flat, and no fill-capable ENTRY path/live flatten remains, the same epoch may return directly to CONTIGUOUS at the recovered cursor without creating a recovery intent.
+
+After a recovery flatten is safely complete, the same rule applies: if replayed reference is FLAT and all paper exposure/late-entry capability is gone, the same epoch may return to CONTIGUOUS at that recovered cursor.
+
+A new epoch at a later verified FLAT boundary is also allowed when an integrity reset is needed, but it is not the only legal way to clear paper exposure left by a suppressed historical exit.
 
 ### 14.4 Future FLAT boundary / new epoch
 
@@ -892,75 +912,76 @@ Reference atomicity/idempotency:
 
 Lock order / race:
 15. all reference/ENTRY-fill/flatten/recovery paths obey fence -> shadow -> position -> order/fill/reservation ordering
-16. failure injection cannot produce lock-order inversion/deadlock
-17. EXIT intent commit first fences later ENTRY fill
-18. ENTRY fill commit first is observed and later flattened
+16. SPEC-006 B ENTRY/EXIT economic apply path does not call a legacy SQL path that locks outbox/order before paper position
+17. failure injection cannot produce lock-order inversion/deadlock
+18. EXIT intent commit first fences later ENTRY fill
+19. ENTRY fill commit first is observed and later flattened
 
 ENTRY lifecycle / same-bar:
-19. every reference ENTRY has a durable lifecycle row
-20. first economic ENTRY fill creates immutable paper-position ownership linked to that ENTRY action/order
-21. later fills reuse ownership; NEVER_CREATED_FENCED/no-fill ENTRY can never own a position
-22. same-bar ENTRY+EXIT persists lifecycle=`NEVER_CREATED_FENCED`
-23. same-bar ENTRY outbox retry permanently no-ops and never creates a delayed order
-24. missing lifecycle row is never treated as terminal
-25. no-position intent cannot SATISFY while ENTRY order is active
-26. no-position intent cannot SATISFY with in-flight `BIND_FILL_ATTEMPT`
-27. no-position intent cannot SATISFY with unacknowledged fill
-28. no-position intent cannot SATISFY with unreleased/active reservation
+20. every reference ENTRY has a durable lifecycle row
+21. first economic ENTRY fill creates immutable paper-position ownership linked to that ENTRY action/order
+22. later fills reuse ownership; NEVER_CREATED_FENCED/no-fill ENTRY can never own a position
+23. same-bar ENTRY+EXIT persists lifecycle=`NEVER_CREATED_FENCED`
+24. same-bar ENTRY outbox retry permanently no-ops and never creates a delayed order
+25. missing lifecycle row is never treated as terminal
+26. no-position intent cannot SATISFY while ENTRY order is active
+27. no-position intent cannot SATISFY with in-flight `BIND_FILL_ATTEMPT`
+28. no-position intent cannot SATISFY with unacknowledged fill
+29. no-position intent cannot SATISFY with unreleased/active reservation
 
 Fence scope / next cycles:
-29. prior `OPEN`/`PAUSED` flatten fences a new reference cycle paper ENTRY as `NEVER_CREATED_FENCED`
-30. that lagging new reference ENTRY is not CRITICAL solely because paper qty remains >0 under the live flatten
-31. paper qty >0 with **no** live flatten on new reference ENTRY => CRITICAL/no stack
-32. historical `SATISFIED` intent does not fence the next cycle
-33. historical `CRITICAL` intent does not act as perpetual fence; active-position/integrity guards still prevent stack/flip
-34. if a fenced newer reference cycle later emits EXIT while an older paper flatten is still live, the newer EXIT intent must not claim the older position
-35. two live intents from different reference cycles cannot create two EXIT orders against the same paper position
+30. prior `OPEN`/`PAUSED` flatten fences a new reference cycle paper ENTRY as `NEVER_CREATED_FENCED`
+31. that lagging new reference ENTRY is not CRITICAL solely because paper qty remains >0 under the live flatten
+32. paper qty >0 with **no** live flatten on new reference ENTRY => CRITICAL/no stack
+33. historical `SATISFIED` intent does not fence the next cycle
+34. historical `CRITICAL` intent does not act as perpetual fence; active-position/integrity guards still prevent stack/flip
+35. if a fenced newer reference cycle later emits EXIT while an older paper flatten is still live, the newer EXIT intent must not claim the older position
+36. two live intents from different reference cycles cannot create two EXIT orders against the same paper position
 
 Reduce-only / durable intent:
-36. one exit intent => at most one EXIT order enforced by schema unique constraint
-37. PAUSED resumes the same intent and same order; if order absent it is created once on first valid resume
-38. each attempt sizes from remaining locked base qty, not original `intended_quantity`
-39. each attempt has new attempt_seq + immutable book snapshot + current lease binding
-40. stale snapshot/lease failure creates no second order/economic effect
-41. partial EXIT uses same intent/order and leaves residual unsatisfied
-42. no over-close/no flip
-43. REFERENCE_EXIT side mismatch or INVALID_RECOVERY locked-reduce-side mismatch => CRITICAL/no order/no auto-SATISFIED
-44. reference FLAT alone never satisfies paper intent
+37. one exit intent => at most one EXIT order enforced by schema unique constraint
+38. PAUSED resumes the same intent and same order; if order absent it is created once on first valid resume
+39. each attempt sizes from remaining locked base qty, not original `intended_quantity`
+40. each attempt has new attempt_seq + immutable book snapshot + current lease binding
+41. stale snapshot/lease failure creates no second order/economic effect
+42. partial EXIT uses same intent/order and leaves residual unsatisfied
+43. no over-close/no flip
+44. REFERENCE_EXIT side mismatch or INVALID_RECOVERY locked-reduce-side mismatch => CRITICAL/no order/no auto-SATISFIED
+45. reference FLAT alone never satisfies paper intent
 
 Kill switch / INVALID separation:
-45. HALT_NEW_ENTRIES permits flatten-intent processing
-46. independent HALTED/RECOVERY_PENDING pauses the same intent
-47. `data_state=INVALID` by itself stops reference actions only
-48. an already OPEN/PAUSED flatten continues while reference is INVALID if global kill-switch permits
-49. true gap preserves reference_position_state and prior stop/extrema fields
-50. no interpolation/substitute/invented reference exit
+46. HALT_NEW_ENTRIES permits flatten-intent processing
+47. independent HALTED/RECOVERY_PENDING pauses the same intent
+48. `data_state=INVALID` by itself stops reference actions only
+49. an already OPEN/PAUSED flatten continues while reference is INVALID if global kill-switch permits
+50. true gap preserves reference_position_state and prior stop/extrema fields
+51. no interpolation/substitute/invented reference exit
 
 Recovery:
-51. replay uses exact contiguous data through missing key and persists reference state/cursor only
-52. replay emits no historical paper dispatch
-53. replay never copies official B output
-54. recovered LONG/SHORT may return same epoch to CONTIGUOUS only when recovered reference cycle identity is unchanged from pre-gap and paper is linked to that same ENTRY lifecycle
-55. replay that crosses EXIT then later same-side ENTRY must not accept the old same-side paper position as a match
-56. recovered LONG/SHORT + paper flat/opposite/wrong-cycle emits no delayed ENTRY/flip and remains INVALID
-57. recovered FLAT + paper open first defers to any existing live flatten that owns that position; otherwise it creates/reuses exactly one operational `INVALID_RECOVERY` intent via a gap-identity recovery_key that excludes recovery cutoff, with no reference action link
-58. recovery flatten is reduce-only/current-book/non-official and uses one order/many attempts; it cannot SATISFY until all old ENTRY lifecycles/orders/attempts on the pair are exposure-incapable
-59. recovery flatten completion can clear the wedge without fabricating a second reference EXIT
-60. new epoch at a future verified FLAT boundary remains available when coherence cannot otherwise be restored
+52. replay uses exact contiguous data through missing key and persists reference state/cursor only
+53. replay emits no historical paper dispatch
+54. replay never copies official B output
+55. recovered LONG/SHORT may return same epoch to CONTIGUOUS only when recovered reference cycle identity is unchanged from pre-gap and paper is linked to that same ENTRY lifecycle
+56. replay that crosses EXIT then later same-side ENTRY must not accept the old same-side paper position as a match
+57. recovered LONG/SHORT + paper flat/opposite/wrong-cycle emits no delayed ENTRY/flip and remains INVALID
+58. recovered FLAT + paper open first defers to any existing live flatten that owns that position; otherwise it creates/reuses exactly one operational `INVALID_RECOVERY` intent via a gap-identity recovery_key that excludes recovery cutoff, with no reference action link
+59. recovery flatten is reduce-only/current-book/non-official and uses one order/many attempts; it cannot SATISFY until all old ENTRY lifecycles/orders/attempts on the pair are exposure-incapable
+60. recovery flatten completion can clear the wedge without fabricating a second reference EXIT
+61. new epoch at a future verified FLAT boundary remains available when coherence cannot otherwise be restored
 
 Blind:
-61. no action/intent/order/fill/position rows or counts leak
-62. no internal fence code/idempotency key/linked id/pair/side/exact cursor leaks
-63. queue/worker/recon surfaces are category-only with B enabled
-64. logs redact B payloads, outbox bodies and constraint errors
-65. generic client errors reveal no B action timing/type
+62. no action/intent/order/fill/position rows or counts leak
+63. no internal fence code/idempotency key/linked id/pair/side/exact cursor leaks
+64. queue/worker/recon surfaces are category-only with B enabled
+65. logs redact B payloads, outbox bodies and constraint errors
+66. generic client errors reveal no B action timing/type
 
 Regression:
-66. TEST-SPEC-002 11/11 smoke unchanged
-67. SPEC-004 smoke unchanged
-68. SPEC-005 smoke unchanged
-69. no official B performance data/scoring touched
-70. TEST-SPEC-002 runtime binding remains DISABLED
+67. TEST-SPEC-002 11/11 smoke unchanged
+68. SPEC-004 smoke unchanged
+69. SPEC-005 smoke unchanged
+70. no official B performance data/scoring touched
+71. TEST-SPEC-002 runtime binding remains DISABLED
 ## 19. Implementation order after lock-gate approval
 
 1. shadow state + execution fence + actions + exit-intent schema
