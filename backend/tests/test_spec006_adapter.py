@@ -1,4 +1,4 @@
-from app.spec006_adapter import ReferenceState, compute_reference_transition
+from app.spec006_adapter import ReferenceState, compute_reference_transition, replay_bootstrap_state
 from app.tsmom_b_v1 import FIVE_MIN_MS, ONE_HOUR_MS, simulate_b_v1
 
 
@@ -144,3 +144,35 @@ def test_signal_while_open_does_not_create_second_incremental_entry():
     entries = [a for a in actions if a["action_type"] == "ENTRY"]
     assert outcome["ignored_signals_while_open"] >= 1
     assert len(entries) == 1
+
+
+def test_bootstrap_replay_returns_reference_state_without_dispatch_side_effects():
+    rows = base_long_fixture()
+    cutoff = 25 * ONE_HOUR_MS + 3 * FIVE_MIN_MS
+    state = replay_bootstrap_state(
+        rows,
+        evaluation_start_ms=24 * ONE_HOUR_MS,
+        cutoff_open_ms=cutoff,
+        strategy_version_id="TEST-SPEC-002",
+        pair="ZEC/USDT",
+    )
+    assert state.reference_position_state == "LONG"
+    assert state.reference_entry_time == 25 * ONE_HOUR_MS
+
+
+def test_bootstrap_requires_exact_cutoff_bar():
+    rows = base_long_fixture()
+    missing = 25 * ONE_HOUR_MS + 7 * FIVE_MIN_MS
+    rows = [row for row in rows if row["open_time"] != missing]
+    try:
+        replay_bootstrap_state(
+            rows,
+            evaluation_start_ms=24 * ONE_HOUR_MS,
+            cutoff_open_ms=missing,
+            strategy_version_id="TEST-SPEC-002",
+            pair="ZEC/USDT",
+        )
+    except ValueError as exc:
+        assert str(exc) in {"bootstrap_cutoff_missing", "non_contiguous_5m_history"}
+    else:
+        raise AssertionError("missing cutoff must fail closed")
