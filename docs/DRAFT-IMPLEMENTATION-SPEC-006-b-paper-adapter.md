@@ -835,7 +835,7 @@ No recovered historical B action is dispatched against a current book.
 Before TEST-SPEC-002 blind end, normal API/UI/client errors/logs must not expose:
 
 - action rows or action counts
-- action timestamps or exact cursor time
+- action timestamps, exact cursor time, exact bootstrap cutoff, or exact paper activation timestamp
 - ENTRY vs EXIT type
 - `ENTRY_FENCED_BY_EXIT_INTENT` or other B-specific lifecycle/error codes
 - idempotency keys
@@ -947,7 +947,7 @@ If bootstrap data has a true gap or parity/integrity check fails:
 
 Thus the paper adapter begins from a clean, verified FLAT boundary without rewriting or contaminating official B history.
 
-Paper activation time must be stored separately from the official fold start.
+Paper activation time must be stored separately from the official fold start and remain internal/blind-hidden until the blind period ends.
 
 Starting paper runtime later does not change official B.
 ## 18. Required tests
