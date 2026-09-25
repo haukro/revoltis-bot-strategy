@@ -5,7 +5,7 @@ import re
 import asyncio
 import math
 import secrets
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 from datetime import UTC, datetime, timedelta
 from statistics import median
 from typing import Any, Literal
@@ -4597,16 +4597,39 @@ async def finalize_optimizer(request: OptimizerFinalizeRequest):
             "Finálny výsledok musí obsahovať presne jeden beh pre každý coin locku.",
         )
 
-    records: list[dict[str, Any]] = []
-    for job_id in source_job_ids:
-        stored = await supabase_get(
-            "optimizer_runs",
-            f"id=eq.{job_id}&limit=1",
+    # Finalization is intentionally idempotent and uses a deterministic id.
+    # This avoids a broad "latest 100 optimizer_runs" read, which can time out
+    # once individual optimizer result payloads become large (for example 90d
+    # runs with trade tapes and replay snapshots).
+    source_key = sorted(source_job_ids)
+    aggregate_id = str(
+        uuid5(
+            NAMESPACE_URL,
+            f"revoltis-optimizer:{request.version_id}:{','.join(source_key)}",
         )
-        if not stored:
-            raise HTTPException(404, f"Optimizer run {job_id} nebol nájdený.")
+    )
+    existing = await supabase_get(
+        "optimizer_runs",
+        f"id=eq.{aggregate_id}&limit=1",
+    )
+    if existing:
+        return present_optimizer_record(existing[0])
 
-        record = stored[0]
+    # Fetch all source runs in one PostgREST request instead of one request
+    # per coin. Large 90d optimizer payloads make repeated round trips much more
+    # likely to hit a transient Supabase read timeout.
+    source_filter = ",".join(source_job_ids)
+    records = await supabase_get(
+        "optimizer_runs",
+        f"id=in.({source_filter})&limit={len(source_job_ids)}",
+    )
+    records_by_id = {str(record.get("id")): record for record in records}
+    missing = [job_id for job_id in source_job_ids if job_id not in records_by_id]
+    if missing:
+        raise HTTPException(404, f"Optimizer run {missing[0]} nebol nájdený.")
+
+    records = [records_by_id[job_id] for job_id in source_job_ids]
+    for record in records:
         if record.get("status") != "completed":
             raise HTTPException(422, "Nie všetky optimizer runy sú dokončené.")
 
@@ -4620,7 +4643,6 @@ async def finalize_optimizer(request: OptimizerFinalizeRequest):
                 422,
                 "Každý zdrojový optimizer run musí patriť presne jednému coinu.",
             )
-        records.append(record)
 
     covered_pairs = [
         (record.get("request") or {}).get("pairs", [None])[0]
@@ -4635,26 +4657,6 @@ async def finalize_optimizer(request: OptimizerFinalizeRequest):
             "Zdrojové optimizer runy nepokrývajú presne aktuálny lock.",
         )
 
-    recent = await supabase_get(
-        "optimizer_runs",
-        "order=finished_at.desc&limit=100",
-    )
-    source_key = sorted(source_job_ids)
-    existing = next(
-        (
-            row
-            for row in recent
-            if (row.get("request") or {}).get("kind") == "aggregate"
-            and (row.get("request") or {}).get("version_id") == request.version_id
-            and sorted(
-                (row.get("request") or {}).get("source_job_ids") or []
-            ) == source_key
-        ),
-        None,
-    )
-    if existing:
-        return present_optimizer_record(existing)
-
     combined = combine_optimizer_lock_results(
         [record["result"] for record in records],
         lock["pairs"],
@@ -4664,7 +4666,7 @@ async def finalize_optimizer(request: OptimizerFinalizeRequest):
 
     now = datetime.now(UTC).isoformat()
     aggregate_record = {
-        "id": str(uuid4()),
+        "id": aggregate_id,
         "status": "completed",
         "created_at": now,
         "finished_at": now,
@@ -4688,18 +4690,13 @@ async def optimizer_latest():
 
     stored = await supabase_get(
         "optimizer_runs",
-        "order=finished_at.desc&limit=100",
-    )
-    aggregate = next(
         (
-            row
-            for row in stored
-            if (row.get("request") or {}).get("kind") == "aggregate"
-            and (row.get("result") or {}).get("version_id") == lock["version_id"]
+            "request->>kind=eq.aggregate"
+            f"&result->>version_id=eq.{lock['version_id']}"
+            "&order=finished_at.desc&limit=1"
         ),
-        None,
     )
-    return present_optimizer_record(aggregate) if aggregate else None
+    return present_optimizer_record(stored[0]) if stored else None
 
 
 @app.get("/api/dashboard")
