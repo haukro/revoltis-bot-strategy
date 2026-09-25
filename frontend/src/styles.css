@@ -7,3 +7,54 @@
 @media(max-width:900px){.bot-control-head{flex-direction:column}.bot-status-grid{grid-template-columns:1fr 1fr}.scanner-table{overflow-x:auto}.bot-control footer{flex-wrap:wrap}}
 @media(max-width:520px){.bot-control{padding:16px}.bot-head-actions{width:100%;flex-wrap:wrap}.bot-head-actions button{flex:1}.bot-status-grid{grid-template-columns:1fr}.bot-control footer{flex-direction:column;gap:5px}}
 .universe-actions{display:flex;gap:8px;margin-top:18px}.universe-actions button{flex:1}.universe-proposal{margin-top:10px;padding:12px;border:1px solid #315348;border-radius:10px;background:#0d1d1b}.universe-proposal.no_pick{border-color:#6f4650;background:#24141a}.universe-proposal>b,.universe-proposal>p,.universe-proposal>small{display:block}.universe-proposal>p{margin:4px 0 9px;color:#8fa1b4;font-size:10px}.universe-proposal>span{display:grid;grid-template-columns:1fr auto;gap:2px 8px;padding:6px 0;border-top:1px solid #273b3a;font:500 10px 'DM Mono'}.universe-proposal>span small{grid-column:1/-1;color:#738799}.universe-proposal>span strong{color:#82edb6}.universe-proposal>small{margin-top:7px;color:#ff9dad;font-size:9px}
+
+
+/* NoFomo minimal UI */
+.nofomo-shell{max-width:1240px}
+.brand-logo{width:46px;height:46px;border-radius:14px;display:block;box-shadow:0 0 28px #28e7cf2c}
+.loading .brand-logo{margin:0 auto 12px}
+.minimal-topbar{position:sticky;top:0;z-index:20;padding:14px 0;background:#090d14e8;backdrop-filter:blur(18px)}
+.minimal-topbar .brand h1{font-size:22px;font-weight:800}
+.minimal-topbar .brand p{font:500 10px 'DM Mono';letter-spacing:1.4px;color:#78eab0}
+.minimal-hero{align-items:center;padding:34px 4px 24px}
+.minimal-hero h2{font-size:44px;margin:8px 0 10px}
+.minimal-hero p{font-size:14px}
+.hero-lock{min-width:280px;max-width:420px;padding:16px 18px;border-radius:14px;background:#0d151e;border:1px solid #26384a}
+.hero-lock span{display:block;font:500 9px 'DM Mono';letter-spacing:1px;color:#63e7aa}
+.hero-lock strong{display:block;margin-top:7px;font:500 12px 'DM Mono';line-height:1.6;color:#d4e3ec}
+.compact-market{margin-bottom:14px;padding:18px}
+.compact-market .market-chart{margin-top:8px}
+.compact-sim{display:grid;grid-template-columns:1fr auto auto;align-items:center;gap:16px;padding:16px 18px}
+.simple-sim-controls{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.toggle-chip{display:flex;gap:8px;align-items:center;padding:9px 11px;border:1px solid #2c3e50;border-radius:10px;background:#0c141d;font-size:12px;font-weight:700}
+.range-buttons{display:flex;gap:6px;flex-wrap:wrap}
+.range-buttons button{padding:8px 10px}
+.compact-metrics{margin-bottom:14px}
+.compact-metrics .metric{padding:14px}
+.compact-metrics .metric strong{font-size:19px}
+.minimal-optimizer{margin-top:14px;padding:20px}
+.minimal-optimizer .optimizer-head h3{font-size:22px}
+.simple-details{margin-top:14px;padding:0;overflow:hidden}
+.simple-details>summary{padding:18px 20px;border:0;font-size:14px}
+.simple-details[open]>summary{border-bottom:1px solid #263345}
+.simple-settings,.simple-results{padding:18px 20px}
+.simple-settings .coin-grid{grid-template-columns:repeat(5,1fr)}
+.simple-results{display:grid;gap:16px}
+.simple-results .chart-panel{min-height:210px}
+.simple-results .two-col{border-top:1px solid #253242;padding-top:14px}
+.simple-results h3{font-size:12px;margin:0 0 10px}
+.nofomo-shell .settings-info,.nofomo-shell .freqtrade-visual,.nofomo-shell .preset-section,.nofomo-shell .bot-control{display:none!important}
+.nofomo-shell .optimizer-note{font-size:10px;opacity:.72}
+.nofomo-shell .algorithm-result{margin-top:14px}
+.nofomo-shell .variant-diagnostics>p,.nofomo-shell .cost-model,.nofomo-shell .validation-counts{font-size:10px}
+@media(max-width:800px){
+  .compact-sim{grid-template-columns:1fr}
+  .minimal-hero{align-items:flex-start}
+  .hero-lock{min-width:0;width:100%}
+  .simple-settings .coin-grid{grid-template-columns:repeat(3,1fr)}
+}
+@media(max-width:520px){
+  .minimal-hero h2{font-size:34px}
+  .top-actions .mode{display:none}
+  .simple-settings .coin-grid{grid-template-columns:repeat(2,1fr)}
+}

@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="NoFomo">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0a2130"/>
+      <stop offset="1" stop-color="#07131d"/>
+    </linearGradient>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#b7ffd7"/>
+      <stop offset=".45" stop-color="#37f3a8"/>
+      <stop offset="1" stop-color="#22d8ef"/>
+    </linearGradient>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="9" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect x="20" y="20" width="472" height="472" rx="108" fill="url(#bg)" stroke="#2bf0dc" stroke-width="5"/>
+  <g filter="url(#glow)" fill="url(#g)">
+    <path d="M133 168c0-16 13-29 29-29h54c13 0 25 6 34 16l129 147v83h-40c-12 0-23-5-31-14L184 230v91h-51V168z"/>
+    <rect x="133" y="328" width="56" height="92" rx="16"/>
+    <rect x="323" y="137" width="60" height="117" rx="17"/>
+    <rect x="157" y="301" width="8" height="146" rx="4"/>
+    <rect x="349" y="105" width="8" height="184" rx="4"/>
+  </g>
+</svg>

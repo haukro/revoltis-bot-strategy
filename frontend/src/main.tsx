@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { normalizeOptimizerResult, combineOptimizerResults } from './optimizer-result';
-import OpsPanel from './ops-panel';
 import './styles.css';
 import './presets.css';
 import './market.css';
@@ -374,7 +373,7 @@ function App() {
   const selected = useMemo(() => (config?.selected_pairs || []) as string[], [config]);
   const availableCoins = useMemo(() => Array.from(new Set([...coins, ...selected, ...(activeUniverse?.pairs || []), ...(universeProposal?.picks || []).map((item: any) => item.pair)])), [selected, activeUniverse, universeProposal]);
   const universeLocked = Boolean(activeUniverse && Date.parse(activeUniverse.expires_at) > Date.now());
-  if (!config || !dashboard) return <main className="loading"><div className="brand-mark">R</div><h1>NoFomo</h1><p>{message || 'Pripravujem simuláciu…'}</p></main>;
+  if (!config || !dashboard) return <main className="loading"><img className="brand-logo" src="/icons/nofomo.svg" alt="" /><h1>NoFomo</h1><p>{message || 'Pripravujem simuláciu…'}</p></main>;
   const currentPair = marketPair || selected[0];
   const allVisibleTrades = simulation?.trades || dashboard.trades || [];
   const currentTrades = allVisibleTrades.filter((trade: any) => trade.pair === currentPair);
@@ -382,43 +381,101 @@ function App() {
   const metrics = simulation?.per_pair_metrics?.[currentPair] || calculatePairMetrics(currentTrades, currentInitialCapital);
   const currentEquityCurve = simulation?.per_pair_equity_curves?.[currentPair] || calculatePairCurve(currentTrades, currentInitialCapital);
   const currentCoverage = simulation?.data_coverage?.[currentPair];
-  return <main>
-    <header className="topbar"><div className="brand"><div className="brand-mark">R</div><div><h1>NoFomo</h1><p>testuj · porovnávaj · nepanikár</p></div></div><div className="top-actions"><span className="mode"><i />SIMULÁCIA</span><button className="install-app" onClick={installApp}>⇩ Inštalovať aplikáciu</button><button className="ghost" onClick={exportConfig} disabled={!optimizer?.result || !normalizeOptimizerResult(optimizer.result).qualified}>Export pre backtest</button><button onClick={save}>Uložiť</button></div></header>
-    <section className="hero"><div><span className="eyebrow">AKTÍVNY PRACOVNÝ PRIESTOR</span><h2>Dáta dnu.<br /><em>FOMO von.</em></h2><p>Testuj nápady na historických dátach, porovnávaj výsledky a nechaj emócie mimo obchodu.</p></div><div className="hero-status"><span>Stav synchronizácie</span><strong>{dashboard.last_sync ? 'Dáta prijaté' : 'Čaká na údaje'}</strong><small>{dashboard.last_sync?.received_at ? new Date(dashboard.last_sync.received_at).toLocaleString('sk-SK') : 'Zatiaľ bez simulovaných obchodov'}</small></div></section>
-    <OpsPanel />
-    <BotControlCenter scanner={scanner} error={scannerError} loading={scannerLoading} running={paperBotRunning} onRefresh={scanOkx} onToggle={togglePaperBot} onChoose={testScannerPair} dailyLoss={Math.min(5, Number(config.stop_loss_percent || 4))} stake={Number(config.stake_amount || 0)} preferredPairs={universeLocked ? (activeUniverse?.pairs || []) : []} />
-    <section className={`simulation-control status-${runStatus}`}>
-      <div className="run-state"><span className="state-dot" /><div><small>STAV SIMULÁCIE</small><strong>{runStatus === 'running' ? (historicalMode ? 'HISTORICKÝ TEST PREBIEHA' : 'PREBIEHA') : runStatus === 'completed' ? (historicalMode ? 'Historický test dokončený' : 'Čas simulácie uplynul – dokončená') : runStatus === 'stopped' ? 'Simulácia zastavená' : runStatus === 'failed' ? 'Simulácia zlyhala' : 'Simulácia nebeží'}</strong><p>{runStatus === 'running' ? (historicalMode ? 'Spracúvam zvolené historické sviečky zrýchlene.' : timeLimited ? `Aktívna do ${new Date(testEnd).toLocaleString('sk-SK')}. Stav zostane rozsvietený až do ukončenia.` : 'Stav zostáva aktívny, kým nestlačíš Zastaviť simuláciu.') : lastRun ? `Posledné vyhodnotenie: ${new Date(lastRun.finished_at).toLocaleString('sk-SK')}` : 'Spusti živú simuláciu alebo zapni historický test.'}</p></div></div>
-      <div className="run-actions">{isRunning ? <button className="stop-button" onClick={stopSimulation}>■ Zastaviť simuláciu</button> : <button className="run-button" onClick={runSimulation}>▶ Spustiť simuláciu</button>}</div>
-      <div className="run-mode" style={{ gridColumn: '1 / -1', display: 'flex', alignItems: 'center', gap: 12, padding: '14px 12px', border: `1px solid ${historicalMode ? '#5a9ee8' : '#304055'}`, borderRadius: 10, background: historicalMode ? '#12283d' : '#0d151e', boxShadow: historicalMode ? '0 0 0 3px #5a9ee822' : 'none' }}><label style={{ display: 'flex', alignItems: 'center', gap: 9, fontWeight: 700 }}><input type="checkbox" checked={historicalMode} onChange={event => { setHistoricalMode(event.target.checked); if (event.target.checked) setTimeLimited(false); }} disabled={isRunning} /><span>Historické dáta</span></label><p style={{ margin: 0, color: historicalMode ? '#c8e2ff' : '#a2b1c3', fontSize: 13 }}>{historicalMode ? 'Zapnuté – po spustení sa vykoná zrýchlený test spätne.' : 'Vypnuté – nové obchody vznikajú iba zo živých sviečok po spustení.'}</p></div>
-      {historicalMode && <div className="test-window"><div><strong style={{ color: '#c8e2ff' }}>Vyber obdobie spätne</strong></div><nav>{([1, 6, 24, 168, 336, 720] as const).map(hours => <button key={hours} className={historicalHours === hours ? 'active' : 'ghost'} onClick={() => setHistoricalHours(hours)} disabled={isRunning}>{historicalRangeLabels[hours]}</button>)}</nav></div>}
-      {!historicalMode && <div className="run-mode" style={{ gridColumn: '1 / -1', display: 'flex', alignItems: 'center', gap: 12, padding: '14px 12px', border: `1px solid ${timeLimited ? '#43c98a' : '#304055'}`, borderRadius: 10, background: timeLimited ? '#153326' : '#0d151e', boxShadow: timeLimited ? '0 0 0 3px #43c98a22' : 'none' }}><label style={{ display: 'flex', alignItems: 'center', gap: 9, fontWeight: 700 }}><input type="checkbox" checked={timeLimited} onChange={event => setTimeLimited(event.target.checked)} disabled={isRunning} /><span>Časovo limitovaná živá simulácia</span></label><p style={{ margin: 0, color: timeLimited ? '#bff6d8' : '#a2b1c3', fontSize: 13 }}>{timeLimited ? 'Zapnuté – živá simulácia bude prebiehať až do zvoleného dátumu a času.' : 'Vypnuté – živá simulácia beží až do manuálneho zastavenia.'}</p></div>}
-      {!historicalMode && timeLimited && <div className="test-window"><div><label>Spustenie<input type="datetime-local" value={testStart} onChange={event => setTestStart(event.target.value)} disabled={isRunning} /></label><label>Ukončenie<input type="datetime-local" value={testEnd} onChange={event => setTestEnd(event.target.value)} disabled={isRunning} /></label></div><nav><button className="ghost" onClick={() => setQuickRange(6)} disabled={isRunning}>6 h</button><button className="ghost" onClick={() => setQuickRange(24)} disabled={isRunning}>24 h</button><button className="ghost" onClick={() => setQuickRange(24 * 7)} disabled={isRunning}>7 dní</button><button className="ghost" onClick={() => setQuickRange(24 * 30)} disabled={isRunning}>30 dní</button></nav></div>}
+  return <main className="nofomo-shell">
+    <header className="topbar minimal-topbar">
+      <div className="brand">
+        <img className="brand-logo" src="/icons/nofomo.svg" alt="NoFomo" />
+        <div><h1>NoFomo</h1><p>DATA IN FOMO OUT</p></div>
+      </div>
+      <div className="top-actions">
+        <span className="mode"><i />SIMULÁCIA</span>
+        <button className="ghost" onClick={exportConfig} disabled={!optimizer?.result || !normalizeOptimizerResult(optimizer.result).qualified}>Export</button>
+        <button onClick={save}>Uložiť</button>
+      </div>
+    </header>
+
+    <section className="hero minimal-hero">
+      <div>
+        <span className="eyebrow">DATA IN FOMO OUT</span>
+        <h2>Testuj. Porovnávaj.<br /><em>Nepanikár.</em></h2>
+        <p>Jednoduchý pracovný priestor na testovanie stratégií bez zbytočného šumu.</p>
+      </div>
+      <div className="hero-lock">
+        <span>LOCK</span>
+        <strong>{activeUniverse?.pairs?.length ? activeUniverse.pairs.join(' · ') : 'bez aktívneho locku'}</strong>
+      </div>
     </section>
-    <section className="metric-grid"><Metric label={`Simulačný kapitál · ${currentPair}`} value={`${metrics.initial_capital} USDT`} hint="počiatočný stav" /><Metric label={`Realizovaný výsledok · ${currentPair}`} value={`${metrics.realized_profit >= 0 ? '+' : ''}${metrics.realized_profit} USDT`} hint="po uzatvorených obchodoch" positive={metrics.realized_profit >= 0} /><Metric label={`Úspešnosť · ${currentPair}`} value={`${metrics.win_rate} %`} hint={`${metrics.closed_trades} uzatvorených obchodov`} /><Metric label={`Max. drawdown · ${currentPair}`} value={`${metrics.max_drawdown_percent ?? 0} %`} hint="pokles od maxima" /></section>
-    <section className="preset-section"><div className="preset-heading"><div><span className="eyebrow">RÝCHLE NASTAVENIE</span><h3>Vyber profil stratégie</h3></div><p>Profil automaticky prenastaví obchodné hranice. Coiny a počiatočný kapitál ostanú zachované.</p></div><div className="preset-grid">{Object.entries(presets).map(([key, preset]) => <button key={key} className={`preset ${key} ${activePreset === key ? 'selected' : ''}`} onClick={() => applyPreset(key)}><span>{key === 'conservative' ? '◒' : key === 'growing' ? '↗' : '⚡'}</span><div><b>{preset.title}</b><small>{preset.description}</small></div><i>{activePreset === key ? 'Aktívna' : 'Použiť'}</i></button>)}</div></section>
-    <section className="optimizer-panel">
-      <div className="optimizer-head"><div><span className="eyebrow">AI OPTIMALIZAČNÝ AGENT</span><h3>Hľadanie najlepšej stratégie</h3><p>Agent otestuje uzamknutý zoznam coinov na hlavných intervaloch 5m a 15m. Tri walk-forward okná a záverečný holdout chránia pred prispôsobením minulosti.</p></div><button onClick={startOptimizer} disabled={optimizerRunning || universeSaving || dashboard?.persistence?.production_ready === false}>{optimizerRunning ? 'Agent pracuje…' : '✦ Spustiť AI optimalizáciu'}</button></div>
-      <div className="optimizer-options"><label>História<select value={optimizerDays} onChange={event => setOptimizerDays(Number(event.target.value) as 1 | 7 | 14 | 30 | 90)} disabled={optimizerRunning}><option value={1}>1 deň</option><option value={7}>7 dní</option><option value={14}>14 dní</option><option value={30}>30 dní</option><option value={90}>90 dní</option></select></label><label>Varianty na trh<select value={optimizerTrials} onChange={event => setOptimizerTrials(Number(event.target.value))} disabled={optimizerRunning}><option value={2}>2 · rýchle</option><option value={3}>3 · odporúčané</option><option value={5}>5 · dôkladné</option><option value={8}>8 · maximum</option></select></label><span>Výpočet hodnotí zisk, drawdown, počet obchodov, stabilitu a odhadované náklady.</span></div>
-      <p className="universe-lock">Verzia: {optimizer?.version_id || optimizer?.result?.version_id || activeUniverse?.version_id || '—'} · Lock: {(optimizer?.locked_pairs || optimizer?.result?.locked_pairs || activeUniverse?.pairs || []).join(', ') || 'nedostupný'}</p>
-      {dashboard?.persistence?.durable === false && <p className="diagnostics-missing" role="status">persistence_unavailable · Režim demo. Lock nemá trvalé uloženie v Supabase a po cold starte sa môže stratiť. Uloženie nového locku a nový job sú v produkcii pozastavené.</p>}
-      <p className="optimizer-note">Náklady pre nové výpočty: okx_global_regular · taker 0,10 % (maker 0,08 %) + half-spread + impact podľa páru. Sadzobník je výskumný predpoklad, nie overenie poplatkov tvojho účtu.</p>
+
+    <section className="panel market-panel compact-market">
+      <div className="section-title">
+        <span>LIVE</span>
+        <div><h3>Trh · {marketPair || currentPair}</h3><p>OKX spot · {config.timeframe}</p></div>
+        <select className="market-pair" value={marketPair} onChange={event => setMarketPair(event.target.value)}>{selected.map(pair => <option key={pair}>{pair}</option>)}</select>
+      </div>
+      <MarketChart market={market} error={marketError} />
+    </section>
+
+    <section className={`simulation-control compact-sim status-${runStatus}`}>
+      <div className="run-state">
+        <span className="state-dot" />
+        <div><small>SIMULÁCIA</small><strong>{runStatus === 'running' ? 'PREBIEHA' : runStatus === 'completed' ? 'DOKONČENÁ' : runStatus === 'failed' ? 'ZLYHALA' : 'PRIPRAVENÁ'}</strong></div>
+      </div>
+      <div className="simple-sim-controls">
+        <label className="toggle-chip"><input type="checkbox" checked={historicalMode} onChange={event => { setHistoricalMode(event.target.checked); if (event.target.checked) setTimeLimited(false); }} disabled={isRunning} /><span>Historický test</span></label>
+        {historicalMode && <nav className="range-buttons">{([24, 168, 336, 720] as const).map(hours => <button key={hours} className={historicalHours === hours ? 'active' : 'ghost'} onClick={() => setHistoricalHours(hours)} disabled={isRunning}>{historicalRangeLabels[hours]}</button>)}</nav>}
+      </div>
+      <div className="run-actions">{isRunning ? <button className="stop-button" onClick={stopSimulation}>Zastaviť</button> : <button className="run-button" onClick={runSimulation}>Spustiť test</button>}</div>
+    </section>
+
+    <section className="metric-grid compact-metrics">
+      <Metric label="Výsledok" value={`${metrics.realized_profit >= 0 ? '+' : ''}${metrics.realized_profit} USDT`} hint={`${metrics.closed_trades} obchodov`} positive={metrics.realized_profit >= 0} />
+      <Metric label="Win rate" value={`${metrics.win_rate} %`} hint={currentPair} />
+      <Metric label="Max DD" value={`${metrics.max_drawdown_percent ?? 0} %`} hint="pokles od maxima" />
+      <Metric label="Kapitál" value={`${metrics.initial_capital} USDT`} hint="simulačný" />
+    </section>
+
+    <section className="optimizer-panel minimal-optimizer">
+      <div className="optimizer-head">
+        <div><span className="eyebrow">AI OPTIMALIZÁCIA</span><h3>Nájdi robustnejší variant</h3><p>Policy v4 · 5× walk-forward OOS · záverečný holdout.</p></div>
+        <button onClick={startOptimizer} disabled={optimizerRunning || universeSaving || dashboard?.persistence?.production_ready === false}>{optimizerRunning ? 'Počítam…' : 'Spustiť optimalizáciu'}</button>
+      </div>
+      <div className="optimizer-options">
+        <label>História<select value={optimizerDays} onChange={event => setOptimizerDays(Number(event.target.value) as 1 | 7 | 14 | 30 | 90)} disabled={optimizerRunning}><option value={7}>7 dní</option><option value={14}>14 dní</option><option value={30}>30 dní</option><option value={90}>90 dní</option></select></label>
+        <label>Varianty<select value={optimizerTrials} onChange={event => setOptimizerTrials(Number(event.target.value))} disabled={optimizerRunning}><option value={3}>3 · rýchle</option><option value={5}>5 · dôkladné</option><option value={8}>8 · maximum</option></select></label>
+        <span>{(optimizer?.locked_pairs || optimizer?.result?.locked_pairs || activeUniverse?.pairs || []).join(' · ') || 'Lock nedostupný'}</span>
+      </div>
       {optimizer?.status === 'running' && <div className="optimizer-progress"><div><span style={{ width: `${optimizer.progress || 0}%` }} /></div><p>{optimizer.message} · {optimizer.progress || 0} %</p></div>}
       {optimizer?.status === 'failed' && <div className="optimizer-error">Optimalizácia zlyhala: {optimizer.message}</div>}
       {optimizer?.result && <AlgorithmResult result={optimizer.result} onCopy={copyAlgorithm} />}
-      <ReplayAvailabilityNotice availability={replayAvailability} />
-      <p className="optimizer-note">Optimalizácia negarantuje budúci zisk. Pred použitím reálnych peňazí musí výsledok prejsť novým backtestom, kontrolou skreslenia a dlhším dry-run testom.</p>
     </section>
-    <FreqtradeVisual
-  result={optimizer?.result || null}
-  activeVersionId={activeUniverse?.version_id || null}
-  activePairs={activeUniverse?.pairs || selected}
-  timeframe={String(config.timeframe)}
-/>
-    <section className="panel market-panel"><div className="section-title"><span>LIVE</span><div><h3>Aktuálne sviečky z burzy</h3><p>Verejné spot dáta OKX · bez API kľúča · {config.timeframe}</p></div><select className="market-pair" value={marketPair} onChange={event => setMarketPair(event.target.value)}>{selected.map(pair => <option key={pair}>{pair}</option>)}</select></div><MarketChart market={market} error={marketError} />{simulation && <div className="simulation-result"><b>Výsledok poslednej simulácie · {currentPair}</b><span>Hodnota portfólia: {metrics.portfolio_value} USDT</span><span>Zisk/strata: {metrics.realized_profit >= 0 ? '+' : ''}{metrics.realized_profit} USDT</span><span>Obchody: {metrics.closed_trades}</span><span>Drawdown: {metrics.max_drawdown_percent} %</span>{currentCoverage && <span className={currentCoverage.complete ? 'positive' : 'negative'}>Dáta: {currentCoverage.candles}/{currentCoverage.expected_candles} sviečok {currentCoverage.complete ? '✓' : '⚠'}</span>}</div>}</section>
-    <section className="workspace"><aside className="settings panel"><div className="section-title"><span>01</span><div><h3>Konfigurátor stratégie</h3><p>Vyber coiny a hranice simulácie.</p></div></div><div className="universe-actions"><button className="ghost" onClick={proposeUniverse} disabled={universeLoading || universeSaving || optimizerRunning || isRunning}>{universeLoading ? 'Vyhodnocujem OKX…' : 'Navrhnúť z OKX'}</button>{universeProposal?.status === 'ok' && <button onClick={acceptUniverse} disabled={universeSaving || optimizerRunning || isRunning}>{universeSaving ? 'Ukladám…' : 'Použiť návrh'}</button>}</div>{universeProposal && <div className={`universe-proposal ${universeProposal.status}`}><b>{universeProposal.status === 'ok' ? 'Návrh – zatiaľ nepoužitý' : 'Návrh nevytvorený'}</b><p>{universeProposal.message}</p>{universeProposal.picks?.map((item: any) => <span key={item.pair}>{item.pair} <strong>{item.score}/100</strong><small>spread {(item.spread_ratio * 100).toFixed(3)} % · ATR {(item.atr_ratio * 100).toFixed(2)} %</small></span>)}{universeProposal.data_quality?.incomplete_pairs?.length > 0 && <small>Neúplné dáta: {universeProposal.data_quality.incomplete_pairs.join(', ')}</small>}</div>}<p className="universe-lock" role="status">{universeLocked ? `Uložené a zamknuté: ${activeUniverse.pairs.join(', ')}. Návrh sa ukladá automaticky.` : 'Pre optimalizáciu použi a ulož návrh z OKX tlačidlom „Použiť návrh“.'}</p><h4>Vybrané coiny <small>{selected.length}</small></h4><div className="coin-grid">{availableCoins.map(coin => <label className={selected.includes(coin) ? 'coin active' : 'coin'} key={coin}><input type="checkbox" disabled={universeLocked || optimizerRunning || universeSaving} checked={selected.includes(coin)} onChange={event => update('selected_pairs', event.target.checked ? [...selected, coin] : selected.filter(item => item !== coin))} /><span>{coin.replace('/USDT', '')}</span><small>USDT</small></label>)}</div>{groups.map(([title, keys]) => <details key={title} open={title !== 'Rozšírené indikátory'}><summary>{title}<span>⌄</span></summary><div className="field-grid">{keys.map(key => <label key={key}>{fields[key]}{key === 'timeframe' ? <select value={String(config[key])} onChange={event => update(key, event.target.value)}>{['1m', '3m', '5m', '15m'].map(value => <option key={value}>{value}</option>)}</select> : <div className="number"><input type="number" value={Number(config[key])} step="0.01" onChange={event => update(key, Number(event.target.value))} /><span>{key.includes('percent') || key.includes('ratio') || key.includes('stop') || key.includes('trailing') || key.includes('rebound') ? '%' : key.includes('capital') || key.includes('amount') || key.includes('volume') ? 'USDT' : ''}</span></div>}</label>)}</div></details>)}</aside>
-      <div className="results"><section className="panel chart-panel"><div className="section-title"><span>02</span><div><h3>Výsledok simulácie · {currentPair}</h3><p>Kapitál vybraného coinu po uzatvorených obchodoch.</p></div><span className="saved-progress">Priebeh uložený</span></div><div className="chart-controls"><span>Časový raster:</span><button className={chartRange === 'hour' ? 'active' : 'ghost'} onClick={() => setChartRange('hour')}>Hodiny</button><button className={chartRange === 'day' ? 'active' : 'ghost'} onClick={() => setChartRange('day')}>Dni / 24 h</button><button className={chartRange === 'week' ? 'active' : 'ghost'} onClick={() => setChartRange('week')}>Týždne</button></div><EquityChart points={currentEquityCurve} range={chartRange} /></section><section className="two-col"><div className="panel"><h3>Dôvody nevstúpenia</h3><Rejections reasons={simulation?.rejections || dashboard.analytics?.rejections || {}} /></div><div className="panel"><h3>Simulované obchody · {currentPair}</h3><TradeList trades={currentTrades} /></div></section><section className="panel"><div className="section-title"><span>03</span><div><h3>Verzie a backtesty</h3><p>Ulož parametre pred každým backtestom.</p></div><button className="ghost push" onClick={saveVersion}>Nová verzia</button></div><VersionList versions={versions} /><div className="compare"><h4>Porovnanie backtestov</h4><select value={left} onChange={event => setLeft(event.target.value)}><option value="">Prvý backtest</option>{backtests.map(item => <option key={item.id} value={item.id}>{item.id.slice(0, 8)} · {item.timerange}</option>)}</select><span>vs</span><select value={right} onChange={event => setRight(event.target.value)}><option value="">Druhý backtest</option>{backtests.map(item => <option key={item.id} value={item.id}>{item.id.slice(0, 8)} · {item.timerange}</option>)}</select><button onClick={compare}>Porovnať</button></div>{comparison && <Comparison data={comparison} />}</section></div>
-    </section><section className="settings-info"><div className="info-heading"><span className="eyebrow">INFO</span><h3>Vysvetlenie nastavení stratégie</h3><p>Otvor bod, ktorý chceš upraviť. Nájdeš tu význam parametra, jeho vplyv aj spôsob fungovania v simulácii.</p></div><div className="info-grid">{Object.entries(settingInfo).map(([key, info]) => <details key={key}><summary>{fields[key] || 'Vybrané coiny'}<span>+</span></summary><div><p><b>Na čo slúži:</b> {info.purpose}</p><p><b>Čo ovplyvní:</b> {info.effect}</p><p><b>Ako funguje:</b> {info.mechanism}</p></div></details>)}</div></section><p className="message">{message}</p>
+
+    <details className="panel simple-details">
+      <summary>Nastavenia stratégie <span>⌄</span></summary>
+      <div className="settings simple-settings">
+        <div className="universe-actions"><button className="ghost" onClick={proposeUniverse} disabled={universeLoading || universeSaving || optimizerRunning || isRunning}>{universeLoading ? 'Vyhodnocujem…' : 'Navrhnúť coiny z OKX'}</button>{universeProposal?.status === 'ok' && <button onClick={acceptUniverse} disabled={universeSaving || optimizerRunning || isRunning}>{universeSaving ? 'Ukladám…' : 'Použiť návrh'}</button>}</div>
+        {universeProposal && <div className={`universe-proposal ${universeProposal.status}`}><b>{universeProposal.status === 'ok' ? 'Návrh' : 'Návrh nevytvorený'}</b><p>{universeProposal.message}</p>{universeProposal.picks?.map((item: any) => <span key={item.pair}>{item.pair} <strong>{item.score}/100</strong></span>)}</div>}
+        <h4>Coiny <small>{selected.length}</small></h4>
+        <div className="coin-grid">{availableCoins.map(coin => <label className={selected.includes(coin) ? 'coin active' : 'coin'} key={coin}><input type="checkbox" disabled={universeLocked || optimizerRunning || universeSaving} checked={selected.includes(coin)} onChange={event => update('selected_pairs', event.target.checked ? [...selected, coin] : selected.filter(item => item !== coin))} /><span>{coin.replace('/USDT', '')}</span></label>)}</div>
+        {groups.map(([title, keys]) => <details key={title}><summary>{title}<span>⌄</span></summary><div className="field-grid">{keys.map(key => <label key={key}>{fields[key]}{key === 'timeframe' ? <select value={String(config[key])} onChange={event => update(key, event.target.value)}>{['1m', '3m', '5m', '15m'].map(value => <option key={value}>{value}</option>)}</select> : <div className="number"><input type="number" value={Number(config[key])} step="0.01" onChange={event => update(key, Number(event.target.value))} /><span>{key.includes('percent') || key.includes('ratio') || key.includes('stop') || key.includes('trailing') || key.includes('rebound') ? '%' : key.includes('capital') || key.includes('amount') || key.includes('volume') ? 'USDT' : ''}</span></div>}</label>)}</div></details>)}
+      </div>
+    </details>
+
+    <details className="panel simple-details">
+      <summary>Výsledky a história <span>⌄</span></summary>
+      <div className="results simple-results">
+        <section className="chart-panel">
+          <div className="section-title"><span>EQ</span><div><h3>Equity · {currentPair}</h3></div></div>
+          <EquityChart points={currentEquityCurve} range={chartRange} />
+        </section>
+        <section className="two-col">
+          <div><h3>Posledné obchody</h3><TradeList trades={currentTrades} /></div>
+          <div><h3>Verzie</h3><VersionList versions={versions} /></div>
+        </section>
+        <button className="ghost" onClick={saveVersion}>Uložiť novú verziu</button>
+      </div>
+    </details>
+
+    <p className="message">{message}</p>
   </main>;
 }
 function BotControlCenter({ scanner, error, loading, running, onRefresh, onToggle, onChoose, dailyLoss, stake, preferredPairs }: { scanner: any, error: string, loading: boolean, running: boolean, onRefresh: () => void, onToggle: () => void, onChoose: (pair: string) => void, dailyLoss: number, stake: number, preferredPairs: string[] }) {
