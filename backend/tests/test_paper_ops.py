@@ -2,6 +2,7 @@ from app.paper_ops import (
     canonical_book_hash,
     canonical_book_payload,
     walk_canonical_quote_notional,
+    walk_canonical_base_quantity,
     quote_fee_amount,
     remaining_quote_notional,
     smoke_cases,
@@ -98,3 +99,25 @@ def test_decimal_book_walk_partial_and_complete():
 def test_execution_money_helpers_match_db_precision():
     assert remaining_quote_notional("50", "20.123456789012") == "29.876543210988"
     assert quote_fee_amount("50", "0.001") == "0.05"
+
+
+def test_base_quantity_exit_walk_is_exact_and_reduce_oriented():
+    result = walk_canonical_base_quantity(
+        side="SELL",
+        base_quantity="0.5",
+        bids=[["100", "0.2"], ["99", "1"]],
+        asks=[["101", "1"]],
+    )
+    assert result["complete"] is True
+    assert result["filled_base_quantity"] == "0.5"
+    assert result["filled_quote_notional"] == "49.7"
+    assert result["levels_used"] == 2
+
+    partial = walk_canonical_base_quantity(
+        side="BUY",
+        base_quantity="2",
+        bids=[["99", "10"]],
+        asks=[["100", "0.5"]],
+    )
+    assert partial["complete"] is False
+    assert partial["filled_base_quantity"] == "0.5"
