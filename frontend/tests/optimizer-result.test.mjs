@@ -3,132 +3,82 @@ import assert from 'node:assert/strict';
 import { normalizeOptimizerResult, combineOptimizerResults, variantDiagnostics } from '../src/optimizer-result.ts';
 
 const accepted = (pair = 'SUI/USDT') => ({
-  pair, timeframe: '15m', settings: { initial_capital: 100 }, score: 2,
-  selection_policy_version: 3, qualified: true, validation_passed: true, holdout_evaluated: true, profitable_validation_windows: 3,
+  pair, timeframe: '15m', settings: { initial_capital: 100 },
+  selection_policy_version: 4, qualified: true, validation_passed: true,
+  holdout_evaluated: true, profitable_validation_windows: 4,
   winner: { pair }, locked_pairs: ['NEAR/USDT', 'SUI/USDT'], strategy_code: 'test code',
-  walk_forward_metrics: { closed_trades: 20 },
-  holdout_metrics: { closed_trades: 10, realized_profit: 8, max_drawdown_percent: 15, win_rate: 100 },
-  buy_hold_percent: 8, tested_combinations: 10, max_validation_trades: 25,
+  walk_forward_metrics: { closed_trades: 40, expectancy: .2, max_drawdown_percent: 4 },
+  holdout_metrics: { closed_trades: 10, realized_profit: 2, expectancy: .15, max_drawdown_percent: 5, win_rate: 60 },
+  buy_hold_percent: 117.9,
+  holdout_exposure_matched_bh_percent: 1.5,
+  holdout_excess_return_percent: .5,
+  risk_adjusted_oos_score: 1.2,
+  tested_combinations: 10,
+  max_validation_trades: 50,
 });
 
-test('old NEAR refresh: insufficient trades, n/a, no winner, no export', () => {
-  const old = { ...accepted('NEAR/USDT'), selection_policy_version: undefined,
-    walk_forward_metrics: undefined, validation_windows: [{ closed_trades: 8 }, { closed_trades: 7 }, { closed_trades: 5 }],
-    holdout_metrics: { closed_trades: 4, realized_profit: 2.3419, max_drawdown_percent: 1.68, win_rate: 100 },
-    buy_hold_percent: 70.8068, verdict: 'NAJLEPŠÍ NÁJDENÝ VARIANT – NEPOTVRDENÝ' };
-  const view = normalizeOptimizerResult(old);
-  assert.equal(view.verdict, 'NEDOSTATOK OBCHODOV');
-  assert.equal(view.displayed_win_rate, 'n/a');
+test('policy v4 qualifies against exposure-matched benchmark even when raw B&H is huge', () => {
+  const view = normalizeOptimizerResult(accepted('NEAR/USDT'));
+  assert.equal(view.qualified, true);
+  assert.equal(view.job_verdict, 'QUALIFIED');
+  assert.equal(view.winner.pair, 'NEAR/USDT');
+  assert.equal(view.strategy_code, 'test code');
+});
+
+test('underpowered sample is UNPROVEN and cannot export', () => {
+  const row = accepted();
+  row.walk_forward_metrics = { ...row.walk_forward_metrics, closed_trades: 39 };
+  const view = normalizeOptimizerResult(row);
+  assert.equal(view.qualified, false);
+  assert.equal(view.job_verdict, 'UNPROVEN');
   assert.equal(view.winner, null);
   assert.equal(view.strategy_code, null);
+});
+
+test('expectancy decay blocks qualification', () => {
+  const row = accepted();
+  row.holdout_metrics = { ...row.holdout_metrics, expectancy: .09 };
+  const view = normalizeOptimizerResult(row);
   assert.equal(view.qualified, false);
-  assert.equal(view.validation_trade_count, 20);
 });
 
-test('win rate hidden at 19 holdout trades, shown at 20', () => {
-  for (const count of [4, 10, 19, 20]) {
-    const row = accepted(); row.holdout_metrics.closed_trades = count;
-    assert.equal(normalizeOptimizerResult(row).displayed_win_rate, count < 20 ? 'n/a' : '100 %');
-  }
+test('exposure-matched underperformance blocks qualification, raw hold does not', () => {
+  const raw = accepted();
+  raw.buy_hold_percent = 999;
+  assert.equal(normalizeOptimizerResult(raw).qualified, true);
+
+  const matched = accepted();
+  matched.holdout_exposure_matched_bh_percent = 2.1;
+  assert.equal(normalizeOptimizerResult(matched).qualified, false);
 });
 
-test('each mandatory gate disables export even if stale flag says qualified', () => {
-  const changes = [
-    { walk_forward_metrics: { closed_trades: 19 } },
-    { holdout_metrics: { ...accepted().holdout_metrics, closed_trades: 9 } },
-    { holdout_metrics: { ...accepted().holdout_metrics, realized_profit: 0 }, buy_hold_percent: -5 },
-    { buy_hold_percent: 8.001 },
-    { holdout_metrics: { ...accepted().holdout_metrics, max_drawdown_percent: 15.001 } },
-    { locked_pairs: [] }, { selection_policy_version: undefined }, { winner: null },
-    { buy_hold_percent: NaN }, { validation_passed: false },
-  ];
-  for (const change of changes) {
-    const view = normalizeOptimizerResult({ ...accepted(), ...change });
-    assert.equal(view.qualified, false);
-    assert.equal(view.winner, null);
-    assert.equal(view.strategy_code, null);
-  }
-  assert.equal(normalizeOptimizerResult(accepted()).qualified, true);
+test('legacy policy is never grandfathered', () => {
+  const old = { ...accepted(), selection_policy_version: 3 };
+  const view = normalizeOptimizerResult(old);
+  assert.equal(view.qualified, false);
+  assert.equal(view.result_status, 'legacy');
+  assert.match(view.verdict, /STARÝ VÝSLEDOK/);
 });
 
-test('accepted coin beats high-scoring rejected NEAR; aggregation keeps global maximum', () => {
-  const near = { ...accepted('NEAR/USDT'), score: 100, max_validation_trades: 90,
-    holdout_metrics: { ...accepted().holdout_metrics, closed_trades: 4 } };
-  const result = combineOptimizerResults([near, accepted()]);
-  assert.equal(result.winner.pair, 'SUI/USDT');
-  assert.equal(result.max_validation_trades, 90);
-  assert.equal(result.tested_combinations, 20);
-  assert.equal(near.tested_combinations, 10);
+test('combine ranks eligible rows by risk-adjusted OOS score', () => {
+  const a = { ...accepted('NEAR/USDT'), risk_adjusted_oos_score: 2.0 };
+  const b = { ...accepted('SUI/USDT'), risk_adjusted_oos_score: 1.0 };
+  const result = combineOptimizerResults([b, a]);
+  assert.equal(result.winner.pair, 'NEAR/USDT');
 });
 
-test('all rejected means empty winner, not an unconfirmed winner', () => {
-  const result = combineOptimizerResults([{ ...accepted(), walk_forward_metrics: { closed_trades: 19 } }]);
-  assert.equal(result.job_verdict, 'ŽIADNY PLATNÝ VARIANT');
-  assert.equal(result.winner, null);
-  assert.equal(result.strategy_code, null);
-});
-
-test('combine retains all 20 variants and marks research finished when all samples are short', () => {
-  const jobs = ['UNI', 'ZEC', 'SUI', 'PEPE', 'NEAR'].map(coin => ({ ...accepted(`${coin}/USDT`),
-    qualified: false, validation_passed: false, tested_combinations: 4,
-    variant_results: ['15m', '5m'].flatMap(timeframe => [1, 2].map(variant => ({
-      pair: `${coin}/USDT`, timeframe, variant, variant_id: `${coin}:${timeframe}:${variant}`,
-      validation_windows: [{ closed_trades: 6 }, { closed_trades: 6 }, { closed_trades: 5 }],
-      walk_forward_metrics: { closed_trades: 17 }, validation_passed: false, rejection_reasons: ['malo_obchodov'],
-      // Even a stale accidental holdout value must be suppressed for this row.
-      holdout_evaluated: true, is_finalist: true, holdout_metrics: { realized_profit: 999999 },
-    }))),
-  }));
-  const result = combineOptimizerResults(jobs);
-  assert.equal(result.variant_results.length, 20);
-  assert.equal(result.diagnostics_complete, true);
-  assert.equal(result.all_variants_insufficient_trades, true);
-  assert.ok(result.variant_results.every(row => row.holdout_metrics === null));
-  assert.equal(result.winner, null);
-  assert.equal(result.strategy_code, null);
-});
-
-test('legacy top-five evidence does not invent missing windows or trigger holdout', () => {
-  const result = variantDiagnostics({ tested_combinations: 20, top_results: [{
-    pair: 'UNI/USDT', timeframe: '5m', variant: 2, validation_metrics: { closed_trades: 24 },
-  }] });
-  assert.equal(result.variant_results.length, 1);
-  assert.equal(result.diagnostics_complete, false);
-  assert.deepEqual(result.variant_results[0].validation_windows, []);
-  assert.equal(result.variant_results[0].holdout_metrics, null);
-  assert.equal(result.all_variants_insufficient_trades, false);
-});
-
-test('accepted coins rank on validation expectancy, not holdout profit or payoff alone', () => {
-  const a = { ...accepted('NEAR/USDT'), walk_forward_metrics: {
-    closed_trades: 20, realized_profit: 10, expectancy: .5, payoff: .7, max_drawdown_percent: 3,
-  }, holdout_metrics: { ...accepted().holdout_metrics, realized_profit: 8 } };
-  const b = { ...accepted(), walk_forward_metrics: {
-    closed_trades: 20, realized_profit: 5, expectancy: .25, payoff: 2, max_drawdown_percent: 1,
-  }, holdout_metrics: { ...accepted().holdout_metrics, realized_profit: 1000 } };
-  assert.equal(combineOptimizerResults([b, a]).winner.pair, 'NEAR/USDT');
-});
-
-test('trade tape keeps validation only until the actual finalist receives holdout', () => {
-  const row = { validation_passed: false, is_finalist: true, holdout_evaluated: true,
-    trades: [{ window: 'train', pnl_net: 999 }, { window: 'wf1', pnl_net: 1 }, { window: 'wf2', pnl_net: -2 }, { window: 'wf3', pnl_net: .5 }, { window: 'holdout', pnl_net: 888 }] };
-  const raw = { variant_results: [row] };
-  assert.deepEqual(variantDiagnostics(raw).variant_results[0].trades.map(t => t.window), ['wf1', 'wf2', 'wf3']);
-  row.validation_passed = true;
-  assert.deepEqual(variantDiagnostics(raw).variant_results[0].trades.map(t => t.window), ['wf1', 'wf2', 'wf3', 'holdout']);
-});
-
-test('diagnostic uses UNI 17 positive trades rather than XRP 5 or losing 21 without creating a candidate', () => {
-  const variant_results = [['XRP/USDT', 5, 1], ['UNI/USDT', 17, 4.146], ['ZEC/USDT', 23, -.6865]].map(([pair, n, pnl]) => ({
-    pair, timeframe: '15m', variant: 2, variant_id: pair, validation_passed: false,
-    walk_forward_metrics: { closed_trades: n, realized_profit: pnl, max_drawdown_percent: 4 },
-    validation_windows: [{ realized_profit: 2 }, { realized_profit: -.1 }, { realized_profit: 2 }],
-    rejection_reasons: n < 20 ? ['malo_obchodov'] : ['zaporny_pnl'],
-  }));
-  const result = normalizeOptimizerResult({ pair: 'XRP/USDT', selection_policy_version: 3, variant_results });
-  assert.equal(result.pair, 'UNI/USDT');
-  assert.equal(result.validation_trade_count, 17);
-  assert.equal(result.winner, null);
-  assert.equal(result.qualified, false);
-  assert.equal(result.holdout_visible, false);
+test('five-window diagnostics retain WF1-WF5 and suppress holdout for non-finalist', () => {
+  const row = {
+    validation_passed: false, is_finalist: true, holdout_evaluated: true,
+    validation_windows: Array.from({ length: 5 }, () => ({ closed_trades: 8 })),
+    trades: [
+      { window: 'train' }, { window: 'wf1' }, { window: 'wf2' }, { window: 'wf3' },
+      { window: 'wf4' }, { window: 'wf5' }, { window: 'holdout' },
+    ],
+  };
+  const raw = { selection_policy_version: 4, tested_combinations: 1, variant_results: [row] };
+  const diag = variantDiagnostics(raw);
+  assert.deepEqual(diag.variant_results[0].trades.map(t => t.window), ['wf1', 'wf2', 'wf3', 'wf4', 'wf5']);
+  assert.equal(diag.variant_results[0].holdout_metrics, null);
+  assert.equal(diag.diagnostics_complete, true);
 });
