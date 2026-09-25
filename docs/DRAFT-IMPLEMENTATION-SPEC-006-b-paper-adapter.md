@@ -895,7 +895,7 @@ Regression:
 64. SPEC-005 smoke unchanged
 65. no official B performance data/scoring touched
 66. TEST-SPEC-002 runtime binding remains DISABLED
-## 19. Implementation order after second review lock
+## 19. Implementation order after lock-gate approval
 
 1. shadow state + execution fence + actions + exit-intent schema
 2. atomic reference-transition RPC
