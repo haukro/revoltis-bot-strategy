@@ -40,6 +40,7 @@ from .paper_ops import (
     walk_canonical_quote_notional,
     quote_fee_amount,
     remaining_quote_notional,
+    walk_canonical_base_quantity,
     smoke_cases as paper_ops_smoke_cases,
 )
 from .rebound_experiment import (
