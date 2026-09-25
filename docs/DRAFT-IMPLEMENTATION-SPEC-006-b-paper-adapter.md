@@ -868,7 +868,7 @@ SPEC-006 must never:
 
 Official verdict remains one batch replay at fold end.
 
-## 17. Runtime activation boundary
+## 17. Runtime activation boundary and first bootstrap
 
 Do not enable TEST-SPEC-002 runtime binding until all are true:
 
@@ -876,6 +876,7 @@ Do not enable TEST-SPEC-002 runtime binding until all are true:
 - SPEC-006 locked
 - reference transition transaction implemented
 - explicit ENTRY lifecycle / `NEVER_CREATED_FENCED` implemented
+- paper-position ENTRY ownership implemented
 - live-intent fence scoped only to OPEN/PAUSED
 - global lock hierarchy implemented
 - durable exit intents implemented
@@ -886,6 +887,43 @@ Do not enable TEST-SPEC-002 runtime binding until all are true:
 - blind category-only surfaces/log redaction implemented
 - all required tests pass
 - existing SPEC-004/005 validations remain clean
+
+### 17.1 Initial bootstrap is not an ENTRY
+
+Because paper runtime may be enabled after the official TEST-SPEC-002 fold has already started, the adapter must not assume reference `FLAT` at activation time and must not emit delayed historical paper trades.
+
+Before creating/enabling the first runtime binding:
+
+1. keep runtime binding DISABLED
+2. require paper state for this strategy_version + pair to be flat with no nonterminal ENTRY/EXIT order, no active lifecycle capable of exposure, and no OPEN/PAUSED flatten intent
+3. fetch a verified contiguous exact 5m series from the frozen forward-fold start (or an earlier frozen-B warmup checkpoint sufficient to reproduce the same state) through an activation cutoff
+4. replay the frozen incremental B logic internally only
+5. emit no `paper_strategy_actions`, paper orders, fills, or dispatch for historical bootstrap bars
+6. do not call official scoring/PASS/FAIL and do not copy official B result output
+7. expose no bootstrap position/side/entry/stop/cursor details on blind surfaces
+
+If bootstrap replay at the cutoff is `FLAT`:
+
+- create the first `adapter_epoch_id`
+- persist shadow = CONTIGUOUS + FLAT at that verified cursor
+- set paper activation time separately
+- enable runtime dispatch only for the **next future expected 5m** after the committed bootstrap cursor
+
+If bootstrap replay at the cutoff is `LONG` or `SHORT`:
+
+- do not synthesize or delay an ENTRY
+- keep runtime binding DISABLED
+- continue internal contiguous frozen-B bootstrap replay until the first verified future reference FLAT boundary
+- initialize the first epoch at that FLAT boundary
+- enable dispatch only for subsequent 5m bars
+
+If bootstrap data has a true gap or parity/integrity check fails:
+
+- do not create/enable the runtime binding
+- do not guess state
+- remain operationally unbound until contiguous state can be verified
+
+Thus the paper adapter begins from a clean, verified FLAT boundary without rewriting or contaminating official B history.
 
 Paper activation time must be stored separately from the official fold start.
 
@@ -976,12 +1014,19 @@ Blind:
 65. logs redact B payloads, outbox bodies and constraint errors
 66. generic client errors reveal no B action timing/type
 
+Activation bootstrap:
+67. bootstrap replay emits no historical paper action/order/fill/dispatch
+68. bootstrap ending FLAT + paper flat initializes first epoch and dispatch starts only on next future 5m
+69. bootstrap ending LONG/SHORT keeps binding disabled until a verified future FLAT boundary; no delayed ENTRY
+70. bootstrap gap/integrity failure leaves runtime binding disabled
+71. bootstrap never calls official scoring or copies official B output
+
 Regression:
-67. TEST-SPEC-002 11/11 smoke unchanged
-68. SPEC-004 smoke unchanged
-69. SPEC-005 smoke unchanged
-70. no official B performance data/scoring touched
-71. TEST-SPEC-002 runtime binding remains DISABLED
+72. TEST-SPEC-002 11/11 smoke unchanged
+73. SPEC-004 smoke unchanged
+74. SPEC-005 smoke unchanged
+75. no official B performance data/scoring touched
+76. TEST-SPEC-002 runtime binding remains DISABLED
 ## 19. Implementation order after lock-gate approval
 
 1. shadow state + execution fence + actions + exit-intent schema
