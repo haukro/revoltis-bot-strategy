@@ -294,11 +294,14 @@ Fields:
 
 - id uuid PK
 - adapter_epoch_id
-- exit_action_id uuid unique references `paper_strategy_actions(id)`
-- linked_entry_action_id uuid references `paper_strategy_actions(id)`
+- intent_origin `REFERENCE_EXIT | INVALID_RECOVERY`
+- exit_action_id uuid nullable references `paper_strategy_actions(id)`
+- linked_entry_action_id uuid nullable references `paper_strategy_actions(id)`
+- recovery_key text nullable
 - strategy_version_id
 - pair
-- reference_position_side LONG | SHORT
+- reference_position_side LONG | SHORT nullable
+- locked_reduce_side BUY | SELL
 - status OPEN | PAUSED | SATISFIED | CRITICAL
 - paper_exit_order_id uuid nullable
 - last_error_code nullable
@@ -307,11 +310,25 @@ Fields:
 - updated_at
 - satisfied_at nullable
 
-One EXIT_TO_FLAT action creates exactly one paper_exit_intent.
+Constraints:
+
+- partial unique: `UNIQUE(exit_action_id) WHERE exit_action_id IS NOT NULL`
+- partial unique: `UNIQUE(recovery_key) WHERE recovery_key IS NOT NULL`
+- `intent_origin='REFERENCE_EXIT'` requires non-null `exit_action_id`, `linked_entry_action_id`, and `reference_position_side`; `recovery_key` must be null
+- `intent_origin='INVALID_RECOVERY'` requires `exit_action_id IS NULL`, `linked_entry_action_id IS NULL`, and non-null canonical `recovery_key`
+- `locked_reduce_side` is immutable after intent creation and must reduce the paper side observed under the execution fence + position lock
+
+One EXIT_TO_FLAT action creates exactly one `REFERENCE_EXIT` paper_exit_intent.
+
+One INVALID recovery incident may create at most one `INVALID_RECOVERY` intent using:
+
+`recovery_key = SHA256("INVALID_RECOVERY|" + adapter_epoch_id + "|" + strategy_version_id + "|" + pair + "|" + invalid_at_5m_open_time_utc_ms + "|" + recovery_cutoff_utc_ms)`
+
+Duplicate recovery workers must collide on that key and reuse the same intent.
 
 ### 6.1 Fence scope
 
-Only `OPEN` or `PAUSED` EXIT intents fence new paper ENTRY creation or ENTRY fill application.
+Only `OPEN` or `PAUSED` flatten intents, regardless of `intent_origin`, fence new paper ENTRY creation or ENTRY fill application.
 
 `SATISFIED` and `CRITICAL` intents are historical/non-live for fence lookup and must not permanently block a later reference cycle on the same `strategy_version_id + pair`.
 
@@ -699,7 +716,7 @@ Create/reuse one durable **operational recovery flatten**:
 - no new `EXIT_TO_FLAT` reference action
 - no rewrite of reference history
 - no official B action/metric/PnL attribution
-- current paper side determines the reduce-only side: paper LONG -> SELL, paper SHORT -> BUY
+- current paper side observed under fence + position lock determines immutable `locked_reduce_side`: paper LONG -> SELL, paper SHORT -> BUY
 - current locked paper base qty determines each attempt size
 - current immutable book snapshot per attempt
 - same lease/stale-snapshot/`BIND_FILL_ATTEMPT` rules as normal EXIT
