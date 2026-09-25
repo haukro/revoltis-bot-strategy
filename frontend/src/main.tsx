@@ -493,13 +493,15 @@ function AlgorithmResult({ result, onCopy }: { result: any, onCopy: () => void }
       <p>{view.method} · {view.tested_combinations} otestovaných kombinácií</p>
       <p>{view.qualified ? view.verdict : 'Parametre sa vyberajú vo validácii. Neúspešný holdout nespustí hľadanie náhradníka.'}</p>
     </div><button onClick={onCopy} disabled={!view.qualified || !view.strategy_code}>Kopírovať algoritmus</button></div>
-    <p className="validation-counts">Validačné obchody: {view.validation_trade_count}/20 · Holdout: {view.holdout_visible ? `${m.closed_trades || 0}/10` : '— (nevyhodnotený)'} · Maximum validačných obchodov zo skúšaných variantov: {view.max_validation_trades ?? 'nezaznamenané'}</p>
+    <p className="validation-counts">Validačné obchody: {view.validation_trade_count}/40 · Holdout: {view.holdout_visible ? `${m.closed_trades || 0}/10` : '— (nevyhodnotený)'} · Policy v4 · 5× WF OOS</p>
     <div className="result-metrics">
       <div><span>Čistý zisk/strata holdoutu</span><b>{m.realized_profit ?? '—'} USDT</b><small>{view.holdout_profit_percent ?? '—'} % kapitálu</small></div>
       <div><span>Max. drawdown / limit 15 %</span><b>{m.max_drawdown_percent ?? '—'} %</b></div>
       <div><span>Obchody holdoutu / minimum 10</span><b>{view.holdout_visible ? m.closed_trades || 0 : '—'}</b></div>
       <div><span>Úspešnosť (od 20 obchodov)</span><b>{view.displayed_win_rate}</b></div>
-      <div><span>Hold rovnakého coinu a obdobia</span><b>{view.buy_hold_percent ?? '—'} %</b></div>
+      <div><span>Raw B&amp;H rovnakého obdobia</span><b>{view.buy_hold_percent ?? '—'} %</b></div>
+      <div><span>Exposure-matched B&amp;H</span><b>{view.holdout_exposure_matched_bh_percent ?? '—'} %</b></div>
+      <div><span>Excess return vs matched hold</span><b>{view.holdout_excess_return_percent ?? '—'} p. b.</b></div>
     </div>
     {view.holdout_visible && <p className="validation-counts">Holdout po nákladoch: priemerná výhra {m.avg_win ?? 'n/a'} USDT · priemerná strata {m.avg_loss ?? 'n/a'} USDT · payoff {m.closed_trades >= 10 ? m.payoff ?? 'n/a' : 'n/a'} · expectancy {m.expectancy ?? 'n/a'} USDT/obchod.</p>}
     {!!Object.keys(view.cost_profiles || {}).length && <details><summary>Náklady podľa páru · {view.fee_schedule}<span>⌄</span></summary><ul className="list">{Object.entries(view.cost_profiles).map(([pair, value]) => { const c = value as any; const pct = (n: number) => `${(n * 100).toFixed(4)} %`; return <li key={pair}><span>{pair} · {c.role}<small>fee {pct(c.fee_rate)} · half-spread {pct(c.half_spread)} · impact nákup {pct(c.buy_impact)} / predaj {pct(c.sell_impact)}</small><small>Aktuálny snapshot knihy {c.book_ts}; nejde o historické L2. {c.thin_L1 ? 'thin_L1' : ''}</small></span></li>; })}</ul></details>}
@@ -507,7 +509,7 @@ function AlgorithmResult({ result, onCopy }: { result: any, onCopy: () => void }
     <CurrentTradeAuditPanel view={view} />
     <TradeTapePanel view={view} />
     {!!view.per_coin_results?.length && <details><summary>Vyhodnotenie po coinoch <span>⌄</span></summary><ul className="list">
-      {view.per_coin_results.map((row: any) => <li key={row.pair}><span>{row.pair} · {row.timeframe}<small>Validácia: {row.walk_forward_metrics?.closed_trades ?? 0}/20 · Holdout: {row.validation_passed && row.holdout_metrics ? `${row.holdout_metrics.closed_trades}/10` : '—'}</small></span><b>{row.verdict}</b></li>)}
+      {view.per_coin_results.map((row: any) => <li key={row.pair}><span>{row.pair} · {row.timeframe}<small>Validácia: {row.walk_forward_metrics?.closed_trades ?? 0}/40 · Holdout: {row.validation_passed && row.holdout_metrics ? `${row.holdout_metrics.closed_trades}/10` : '—'}</small></span><b>{row.verdict}</b></li>)}
     </ul></details>}
     <details><summary>{view.qualified ? 'Výsledné nastavenia' : 'Diagnostické nastavenia — nepoužiť'} <span>⌄</span></summary>
       <div className="parameter-grid">{parameterKeys.map(key => <div key={key}><span>{fields[key]}</span><b>{String(view.settings?.[key] ?? '—')}</b></div>)}</div>
@@ -522,23 +524,22 @@ function VariantTable({ view }: { view: any }) {
   const payoff = (metrics: any, minimum: number) => Number(metrics?.closed_trades) >= minimum && metrics?.payoff != null ? number(metrics.payoff) : 'n/a';
   return <section className="variant-diagnostics" aria-label="Všetky skúšané varianty">
     <h4>Všetky skúšané varianty <small>{rows.length}/{view.tested_combinations ?? '—'}</small></h4>
-    <p>Jeden riadok = coin, interval a variant. Zisk aj ziskové okná sú po nákladoch. Nestabilita znamená menej ako 2 z 3 ziskových WF okien.</p>
+    <p>Jeden riadok = coin, interval a variant. Policy v4 používa 5 chronologických OOS WF okien; minimálne 3 z 5 musia byť ziskové.</p>
     <p>Na holdout ide iba jeden finalista za coin vybraný vo validácii. Ostatné riadky majú „—“. Neúspešný holdout nemá náhradníka.</p>
-    <p>Poradie určuje expectancy validácie, potom payoff a nižší DD. Payoff vo WF oknách je iba opisný. Pod 20 validačnými obchodmi sa payoff nerankuje a úspešnosť je n/a. Bez stratových obchodov je payoff n/a.</p>
+    <p>Poradie určuje jeden risk-adjusted OOS score: exposure-matched excess return / max(DD, 1 %). Pod 40 validačnými obchodmi sa variant nepovažuje za potvrdený.</p>
     <p>Expectancy je priemerný čistý výsledok na uzavretý obchod vrátane nulových obchodov. „slaby_pomer“ pri holdout payoff pod 0,8 je upozornenie, nemení verdikt.</p>
     {!view.diagnostics_complete && <p className="diagnostics-missing" role="status">Starší alebo neúplný záznam neobsahuje všetky varianty a WF okná. Chýbajúce údaje sú „—“; nič sa dodatočne nepočíta ani nespúšťa.</p>}
-    {view.all_variants_insufficient_trades && <p className="diagnostics-stop" role="status">Všetky varianty majú menej ako 20 validačných obchodov. Výskum tejto sady na tomto zámku sa končí.</p>}
+    {view.all_variants_insufficient_trades && <p className="diagnostics-stop" role="status">Všetky varianty majú menej ako 40 validačných obchodov. Stav je UNPROVEN; bez automatického retry.</p>}
     {rows.length > 0 && <div className="variant-table-scroll" tabIndex={0} role="region" aria-label="Tabuľka variantov, posúvaj vodorovne">
       <table className="variant-table">
         <caption>Všetky zaznamenané kombinácie; WF bunky uvádzajú obchody a čisté PnL v USDT. Vs hold je rozdiel výnosu v percentuálnych bodoch.</caption>
-        <thead><tr><th scope="col">Coin</th><th scope="col">Interval</th><th scope="col">ID variantu</th><th scope="col">WF1</th><th scope="col">WF2</th><th scope="col">WF3</th><th scope="col">Validácia / 20</th><th scope="col">PnL validácie USDT</th><th scope="col">Max. DD validácie %</th><th scope="col">Ziskové okná / 3</th><th scope="col">Úspešnosť validácie</th><th scope="col">Priem. výhra validácie USDT</th><th scope="col">Priem. strata validácie USDT</th><th scope="col">Payoff validácie</th><th scope="col">Expectancy validácie USDT/obchod</th><th scope="col">Holdout / 10</th><th scope="col">PnL holdoutu USDT</th><th scope="col">DD holdoutu %</th><th scope="col">Vs hold p. b.</th><th scope="col">Priem. výhra holdoutu USDT</th><th scope="col">Priem. strata holdoutu USDT</th><th scope="col">Payoff holdoutu</th><th scope="col">Expectancy holdoutu USDT/obchod</th><th scope="col">Dôvod vyradenia / stav</th></tr></thead>
+        <thead><tr><th scope="col">Coin</th><th scope="col">Interval</th><th scope="col">ID variantu</th><th scope="col">WF1</th><th scope="col">WF2</th><th scope="col">WF3</th><th scope="col">WF4</th><th scope="col">WF5</th><th scope="col">Validácia / 40</th><th scope="col">PnL validácie USDT</th><th scope="col">Max. DD validácie %</th><th scope="col">Ziskové okná / 5</th><th scope="col">Risk-adjusted OOS score</th><th scope="col">Úspešnosť validácie</th><th scope="col">Expectancy validácie USDT/obchod</th><th scope="col">Holdout / 10</th><th scope="col">PnL holdoutu USDT</th><th scope="col">DD holdoutu %</th><th scope="col">Expozícia %</th><th scope="col">Raw B&amp;H %</th><th scope="col">Exposure-matched B&amp;H %</th><th scope="col">Excess return p. b.</th><th scope="col">Expectancy holdoutu USDT/obchod</th><th scope="col">Dôvod vyradenia / stav</th></tr></thead>
         <tbody>{rows.map((row: any) => <tr key={row.variant_id || `${row.pair}:${row.timeframe}:${row.variant}`}>
           <th scope="row">{row.pair}</th><td>{row.timeframe}</td><td title={row.variant_id}>v{row.variant ?? '—'}</td>
-          {[0, 1, 2].map(index => <td key={index}>{number(row.validation_windows?.[index]?.closed_trades, 0)}<small>{number(row.validation_windows?.[index]?.realized_profit, 4)} USDT</small><small>Payoff {payoff(row.validation_windows?.[index], 1)}</small></td>)}
-          <td>{number(row.walk_forward_metrics?.closed_trades, 0)}/20</td><td>{number(row.walk_forward_metrics?.realized_profit, 4)}</td><td>{number(row.walk_forward_metrics?.max_drawdown_percent)}</td><td>{number(row.profitable_validation_windows, 0)}/3</td>
-          <td>{Number(row.walk_forward_metrics?.closed_trades) >= 20 ? `${number(row.walk_forward_metrics?.win_rate)} %` : 'n/a'}</td><td>{number(row.walk_forward_metrics?.avg_win, 4)}</td><td>{number(row.walk_forward_metrics?.avg_loss, 4)}</td><td>{payoff(row.walk_forward_metrics, 20)}</td><td>{number(row.walk_forward_metrics?.expectancy, 4)}</td>
-          <td>{row.holdout_evaluated ? `${number(row.holdout_metrics?.closed_trades, 0)}/10` : '—'}</td><td>{number(row.holdout_metrics?.realized_profit, 4)}</td><td>{number(row.holdout_metrics?.max_drawdown_percent)}</td><td>{number(row.vs_hold_percentage_points, 4)}</td>
-          <td>{number(row.holdout_metrics?.avg_win, 4)}</td><td>{number(row.holdout_metrics?.avg_loss, 4)}</td><td>{row.holdout_evaluated ? payoff(row.holdout_metrics, 10) : '—'}</td><td>{number(row.holdout_metrics?.expectancy, 4)}</td>
+          {[0, 1, 2, 3, 4].map(index => <td key={index}>{number(row.validation_windows?.[index]?.closed_trades, 0)}<small>{number(row.validation_windows?.[index]?.realized_profit, 4)} USDT</small></td>)}
+          <td>{number(row.walk_forward_metrics?.closed_trades, 0)}/40</td><td>{number(row.walk_forward_metrics?.realized_profit, 4)}</td><td>{number(row.walk_forward_metrics?.max_drawdown_percent)}</td><td>{number(row.profitable_validation_windows, 0)}/5</td><td>{number(row.risk_adjusted_oos_score, 4)}</td>
+          <td>{Number(row.walk_forward_metrics?.closed_trades) >= 40 ? `${number(row.walk_forward_metrics?.win_rate)} %` : 'n/a'}</td><td>{number(row.walk_forward_metrics?.expectancy, 4)}</td>
+          <td>{row.holdout_evaluated ? `${number(row.holdout_metrics?.closed_trades, 0)}/10` : '—'}</td><td>{number(row.holdout_metrics?.realized_profit, 4)}</td><td>{number(row.holdout_metrics?.max_drawdown_percent)}</td><td>{number(row.holdout_exposure_percent, 2)}</td><td>{number(row.buy_hold_percent, 4)}</td><td>{number(row.holdout_exposure_matched_bh_percent, 4)}</td><td>{number(row.holdout_excess_return_percent, 4)}</td><td>{number(row.holdout_metrics?.expectancy, 4)}</td>
           <td className="variant-reasons">{row.rejection_reasons?.length ? row.rejection_reasons.join(' · ') : row.legacy ? 'Nezaznamenané' : row.status === 'accepted' ? 'Holdout prijatý' : 'Validácia prešla; nevybraný na holdout'}{row.rejection_phase && <small>{row.rejection_phase === 'holdout' ? 'Vyradený na holdoute' : 'Vyradený vo validácii'}</small>}{row.payoff_warning && <small>Payoff: {row.payoff_warning} (značka)</small>}</td>
         </tr>)}</tbody>
       </table>
@@ -557,11 +558,11 @@ function ReplayAvailabilityNotice({ availability }: { availability: any }) {
 }
 function CurrentTradeAuditPanel({ view }: { view: any }) {
   const trades = Array.isArray(view.trades)
-    ? view.trades.filter((trade: any) => ['wf1', 'wf2', 'wf3', 'holdout'].includes(trade.window))
+    ? view.trades.filter((trade: any) => ['wf1', 'wf2', 'wf3', 'wf4', 'wf5', 'holdout'].includes(trade.window))
     : [];
   if (!trades.length) return null;
 
-  const validation = trades.filter((trade: any) => ['wf1', 'wf2', 'wf3'].includes(trade.window));
+  const validation = trades.filter((trade: any) => ['wf1', 'wf2', 'wf3', 'wf4', 'wf5'].includes(trade.window));
   const holdout = trades.filter((trade: any) => trade.window === 'holdout');
   const wins = trades.filter((trade: any) => Number(trade.pnl_net) > 0);
   const losses = trades.filter((trade: any) => Number(trade.pnl_net) < 0);
@@ -633,7 +634,7 @@ function TradeTapePanel({ view }: { view: any }) {
     <p>MAE je najnižšia a MFE najvyššia zmena ceny od vstupu v %. Sú pred nákladmi; PnL je po nákladoch uložených v danom reporte; historický UNI/ZEC replay zachováva 0,15 % na každej strane. Vstupná sviečka sa do extrémov nepočíta, pretože vstup je na jej close.</p>
     <p>SL sa spúšťa podľa close, nie samotného wicku. „SL pred trailingom“ znamená, že na rovnakom close platili obe výstupné podmienky a prednosť dostal SL. Poradie high/low v sviečke nepoznáme.</p>
     {rows.map((row: any) => {
-      const trades = (row.trades || []).filter((trade: any) => ['wf1', 'wf2', 'wf3'].includes(trade.window));
+      const trades = (row.trades || []).filter((trade: any) => ['wf1', 'wf2', 'wf3', 'wf4', 'wf5'].includes(trade.window));
       const complete = row.trade_tape_version === 1 && trades.length === row.walk_forward_metrics.closed_trades;
       const wins = trades.filter((t: any) => t.pnl_net > 0), losses = trades.filter((t: any) => t.pnl_net < 0);
       const avg = (items: any[], key: string) => items.length && items.every(t => t[key] != null) ? items.reduce((sum, t) => sum + Number(t[key]), 0) / items.length : null;
