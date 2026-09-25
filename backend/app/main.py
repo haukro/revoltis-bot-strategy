@@ -331,6 +331,10 @@ async def _paper_active_ops_policy() -> dict[str, Any]:
 
 
 async def _paper_runtime_binding(strategy_version_id: str) -> dict[str, Any] | None:
+    # Preview/local demo mode has no internal paper tables in LocalStore.
+    # Treat missing durable persistence as an unbound runtime, never as enabled.
+    if not persistence_status()["durable"]:
+        return None
     rows = await supabase_get(
         "paper_strategy_runtime_bindings",
         f"strategy_version_id=eq.{strategy_version_id}&limit=1",
