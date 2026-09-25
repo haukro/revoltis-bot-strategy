@@ -820,10 +820,28 @@ async def internal_paper_outbox_tick(
                 if not signals:
                     raise ValueError("signal_not_found")
                 signal = signals[0]
+                spec006_lifecycle = await supabase_get(
+                    "paper_entry_lifecycles",
+                    f"paper_signal_id=eq.{entity_id}&limit=1",
+                )
                 binding = await _paper_runtime_binding(signal["strategy_version_id"])
                 if not binding or not binding.get("enabled"):
-                    await _paper_ack(outbox_id, worker, generation, "RUNTIME_BINDING_DISABLED")
-                    errors += 1
+                    if spec006_lifecycle:
+                        await supabase_rpc(
+                            "paper_spec006_fence_entry_lifecycle",
+                            {
+                                "p_entry_action_id": spec006_lifecycle[0]["entry_action_id"],
+                                "p_reason": "RUNTIME_BINDING_DISABLED",
+                                "p_worker_id": worker,
+                                "p_software_commit": commit,
+                            },
+                        )
+                        ack = await _paper_ack(outbox_id, worker, generation, None)
+                        if (ack or {}).get("acknowledged"):
+                            processed += 1
+                    else:
+                        await _paper_ack(outbox_id, worker, generation, "RUNTIME_BINDING_DISABLED")
+                        errors += 1
                     continue
 
                 risk = await supabase_rpc(
@@ -843,10 +861,6 @@ async def internal_paper_outbox_tick(
                     )
                     reservation = reservations[0] if reservations else None
                     if reservation and reservation.get("status") in ("RESERVED", "PARTIALLY_CONSUMED"):
-                        spec006_lifecycle = await supabase_get(
-                            "paper_entry_lifecycles",
-                            f"paper_signal_id=eq.{entity_id}&limit=1",
-                        )
                         if spec006_lifecycle:
                             await supabase_rpc(
                                 "paper_spec006_create_entry_order_from_approved_signal",
@@ -921,6 +935,16 @@ async def internal_paper_outbox_tick(
                 risk_policy = policies[0]
                 fee_rate = risk_policy.get("fee_rate")
                 if fee_rate is None:
+                    if is_spec006 and order["intent_type"] == "EXIT":
+                        # Durable flatten intent must survive configuration faults.
+                        await _paper_ack(
+                            outbox_id,
+                            worker,
+                            generation,
+                            "EXECUTION_POLICY_UNAVAILABLE",
+                        )
+                        errors += 1
+                        continue
                     await supabase_rpc(
                         "paper_terminalize_order",
                         {
