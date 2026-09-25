@@ -650,8 +650,10 @@ async def internal_spec006_bootstrap(
     now = datetime.now(UTC)
     now_ms = int(now.timestamp() * 1000)
     cutoff_open_ms = (now_ms // step) * step - step
-    evaluation_start_ms = int(datetime(2026, 9, 24, 12, 0, tzinfo=UTC).timestamp() * 1000)
-    warmup_start_ms = evaluation_start_ms - 30 * 3_600_000
+    evaluation_start_ms = int(_TSMOM_B_V1_EVAL_START.timestamp() * 1000)
+    # Frozen TEST-SPEC-002 ZEC input uses exactly 24h pre-fold warmup.
+    # Extra Wilder-ATR history would change early reference ATR values.
+    warmup_start_ms = evaluation_start_ms - 24 * 3_600_000
     count = int((cutoff_open_ms - warmup_start_ms) // step + 1)
 
     candles = await load_okx_candles(
@@ -763,7 +765,10 @@ async def internal_spec006_recover(
     if cutoff_open_ms <= cursor_ms:
         return {"status": "waiting_data", "blind_safe": True}
 
-    warmup_start_ms = cursor_ms - 30 * 3_600_000
+    evaluation_start_ms = int(_TSMOM_B_V1_EVAL_START.timestamp() * 1000)
+    # Recovery must rebuild ATR/signals from the same frozen ZEC warmup origin,
+    # not from a rolling local window; Wilder ATR is path-dependent.
+    warmup_start_ms = evaluation_start_ms - 24 * 3_600_000
     count = int((cutoff_open_ms - warmup_start_ms) // step + 1)
     candles = await load_okx_candles(
         pair,
