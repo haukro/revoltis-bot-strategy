@@ -4570,7 +4570,9 @@ def combine_optimizer_lock_results(
     combined["qualified"] = qualified
     combined["winner"] = selected.get("winner") if qualified else None
     combined["strategy_code"] = selected.get("strategy_code") if qualified else None
-    combined["job_verdict"] = "KANDIDÁT" if qualified else "ŽIADNY PLATNÝ VARIANT"
+    combined["job_verdict"] = "QUALIFIED" if qualified else (
+        "UNPROVEN" if any((row.get("result_status") == "unproven") for row in rows) else "REJECTED"
+    )
     return combined
 
 
