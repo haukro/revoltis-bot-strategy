@@ -374,7 +374,7 @@ function App() {
   const selected = useMemo(() => (config?.selected_pairs || []) as string[], [config]);
   const availableCoins = useMemo(() => Array.from(new Set([...coins, ...selected, ...(activeUniverse?.pairs || []), ...(universeProposal?.picks || []).map((item: any) => item.pair)])), [selected, activeUniverse, universeProposal]);
   const universeLocked = Boolean(activeUniverse && Date.parse(activeUniverse.expires_at) > Date.now());
-  if (!config || !dashboard) return <main className="loading"><div className="brand-mark">R</div><h1>Revoltis Bot Strategy</h1><p>{message || 'Pripravujem simuláciu…'}</p></main>;
+  if (!config || !dashboard) return <main className="loading"><div className="brand-mark">R</div><h1>NoFomo</h1><p>{message || 'Pripravujem simuláciu…'}</p></main>;
   const currentPair = marketPair || selected[0];
   const allVisibleTrades = simulation?.trades || dashboard.trades || [];
   const currentTrades = allVisibleTrades.filter((trade: any) => trade.pair === currentPair);
@@ -383,8 +383,8 @@ function App() {
   const currentEquityCurve = simulation?.per_pair_equity_curves?.[currentPair] || calculatePairCurve(currentTrades, currentInitialCapital);
   const currentCoverage = simulation?.data_coverage?.[currentPair];
   return <main>
-    <header className="topbar"><div className="brand"><div className="brand-mark">R</div><div><h1>Revoltis <b>Bot Strategy</b></h1><p>Navrhuj · testuj · porovnávaj</p></div></div><div className="top-actions"><span className="mode"><i />SIMULÁCIA</span><button className="install-app" onClick={installApp}>⇩ Inštalovať aplikáciu</button><button className="ghost" onClick={exportConfig} disabled={!optimizer?.result || !normalizeOptimizerResult(optimizer.result).qualified}>Export pre backtest</button><button onClick={save}>Uložiť</button></div></header>
-    <section className="hero"><div><span className="eyebrow">AKTÍVNY PRACOVNÝ PRIESTOR</span><h2>Stratégia pre pohyb trhu,<br /><em>nie pre domnienky.</em></h2><p>Každá úprava parametrov ostáva v bezpečnom dry-run režime. Pred ďalším krokom ju porovnaj s historickým výsledkom.</p></div><div className="hero-status"><span>Stav synchronizácie</span><strong>{dashboard.last_sync ? 'Dáta prijaté' : 'Čaká na údaje'}</strong><small>{dashboard.last_sync?.received_at ? new Date(dashboard.last_sync.received_at).toLocaleString('sk-SK') : 'Zatiaľ bez simulovaných obchodov'}</small></div></section>
+    <header className="topbar"><div className="brand"><div className="brand-mark">R</div><div><h1>NoFomo</h1><p>testuj · porovnávaj · nepanikár</p></div></div><div className="top-actions"><span className="mode"><i />SIMULÁCIA</span><button className="install-app" onClick={installApp}>⇩ Inštalovať aplikáciu</button><button className="ghost" onClick={exportConfig} disabled={!optimizer?.result || !normalizeOptimizerResult(optimizer.result).qualified}>Export pre backtest</button><button onClick={save}>Uložiť</button></div></header>
+    <section className="hero"><div><span className="eyebrow">AKTÍVNY PRACOVNÝ PRIESTOR</span><h2>Dáta dnu.<br /><em>FOMO von.</em></h2><p>Testuj nápady na historických dátach, porovnávaj výsledky a nechaj emócie mimo obchodu.</p></div><div className="hero-status"><span>Stav synchronizácie</span><strong>{dashboard.last_sync ? 'Dáta prijaté' : 'Čaká na údaje'}</strong><small>{dashboard.last_sync?.received_at ? new Date(dashboard.last_sync.received_at).toLocaleString('sk-SK') : 'Zatiaľ bez simulovaných obchodov'}</small></div></section>
     <OpsPanel />
     <BotControlCenter scanner={scanner} error={scannerError} loading={scannerLoading} running={paperBotRunning} onRefresh={scanOkx} onToggle={togglePaperBot} onChoose={testScannerPair} dailyLoss={Math.min(5, Number(config.stop_loss_percent || 4))} stake={Number(config.stake_amount || 0)} preferredPairs={universeLocked ? (activeUniverse?.pairs || []) : []} />
     <section className={`simulation-control status-${runStatus}`}>
