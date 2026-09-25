@@ -34,10 +34,18 @@ from .tsmom_c_v1 import (
 )
 from .momentum_prescreen import pack_market_series, unpack_market_series, analyze_block, pooled_analysis
 from .paper_execution import smoke_cases as paper_execution_smoke_cases
+from .spec006_adapter import (
+    ReferenceState as Spec006ReferenceState,
+    compute_reference_transition as spec006_compute_reference_transition,
+    reference_bar_hash as spec006_reference_bar_hash,
+    replay_bootstrap_state as spec006_replay_bootstrap_state,
+    smoke_cases as spec006_adapter_smoke_cases,
+)
 from .paper_ops import (
     canonical_book_payload,
     canonical_book_hash,
     walk_canonical_quote_notional,
+    walk_canonical_base_quantity,
     quote_fee_amount,
     remaining_quote_notional,
     smoke_cases as paper_ops_smoke_cases,
@@ -323,11 +331,50 @@ async def _paper_active_ops_policy() -> dict[str, Any]:
 
 
 async def _paper_runtime_binding(strategy_version_id: str) -> dict[str, Any] | None:
+    # Preview/local demo mode has no internal paper tables in LocalStore.
+    # Treat missing durable persistence as an unbound runtime, never as enabled.
+    if not persistence_status()["durable"]:
+        return None
     rows = await supabase_get(
         "paper_strategy_runtime_bindings",
         f"strategy_version_id=eq.{strategy_version_id}&limit=1",
     )
     return rows[0] if rows else None
+
+
+async def _spec006_blind_runtime_active() -> bool:
+    binding = await _paper_runtime_binding("TEST-SPEC-002")
+    return bool(binding and binding.get("enabled"))
+
+
+def _blind_worker_category(workers: list[dict[str, Any]]) -> str:
+    rank = {"FRESH": 0, "LATE": 1, "STALE": 2, "NEVER": 2, "UNCONFIGURED": 2}
+    worst = "FRESH"
+    for row in workers or []:
+        category = str(row.get("last_success_age_category") or "STALE")
+        if rank.get(category, 2) > rank.get(worst, 0):
+            worst = "STALE" if category in {"NEVER", "UNCONFIGURED"} else category
+    return worst
+
+
+def _blind_reconciliation_category(reconciliation: dict[str, Any]) -> str:
+    latest = reconciliation.get("latest") or {}
+    if latest.get("audit_integrity_passed") is False or latest.get("status") == "FAILED":
+        return "CRITICAL"
+    severities = {
+        str(row.get("severity") or "").upper()
+        for row in (reconciliation.get("open_issue_counts") or [])
+    }
+    if "CRITICAL" in severities:
+        return "CRITICAL"
+    if severities & {"WARNING", "FAILED", "ERROR"} or latest.get("status") == "WARNING":
+        return "WARNING"
+    return "PASS"
+
+
+def _blind_market_category(counts: dict[str, Any]) -> str:
+    degraded = sum(int(counts.get(key, 0) or 0) for key in ("STALE", "DEGRADED", "HALTED"))
+    return "DEGRADED" if degraded else "HEALTHY"
 
 
 async def _fetch_okx_execution_book(pair: str, depth: int) -> dict[str, Any]:
@@ -405,6 +452,18 @@ async def paper_system_health():
     require_durable_production_store()
     rows = await supabase_get("kill_switch_state", "account_key=eq.paper-default&limit=1")
     state = rows[0] if rows else None
+    if await _spec006_blind_runtime_active():
+        shadow = await supabase_get(
+            "paper_strategy_shadow_state",
+            "strategy_version_id=eq.TEST-SPEC-002&pair=eq.ZEC%2FUSDT&select=data_state&limit=1",
+        )
+        return {
+            "status": "ok" if state else "degraded",
+            "adapter_health": "INVALID" if shadow and shadow[0].get("data_state") == "INVALID" else "HEALTHY",
+            "kill_switch": {"state": (state or {}).get("state")},
+            "live_trading": False,
+            "blind_safe": True,
+        }
     return {
         "status": "ok" if state else "degraded",
         "persistence": persistence_status(),
@@ -424,15 +483,442 @@ async def paper_market_health():
     require_durable_production_store()
     snapshot = await _paper_ops_snapshot()
     counts = snapshot.get("market_health_counts", {})
-    degraded = sum(
-        int(counts.get(key, 0) or 0)
-        for key in ("STALE", "DEGRADED", "HALTED")
-    )
+    if await _spec006_blind_runtime_active():
+        return {
+            "market": _blind_market_category(counts),
+            "blind_safe": True,
+            "live_trading": False,
+        }
+    degraded = sum(int(counts.get(key, 0) or 0) for key in ("STALE", "DEGRADED", "HALTED"))
     return {
         "status": "degraded" if degraded else "ok",
         "status_counts": counts,
         "blind_safe": True,
         "live_trading": False,
+    }
+
+
+@app.post("/api/internal/paper/spec-006/reference-tick")
+async def internal_spec006_reference_tick(
+    x_paper_scheduler_token: str | None = Header(default=None, alias="X-Paper-Scheduler-Token"),
+):
+    """Advance frozen-B reference state in exact 5m transactions when runtime B is enabled."""
+    require_durable_production_store()
+    _require_internal_secret(x_paper_scheduler_token, "PAPER_SCHEDULER_TOKEN")
+
+    strategy_version_id = "TEST-SPEC-002"
+    pair = "ZEC/USDT"
+    binding = await _paper_runtime_binding(strategy_version_id)
+    if not binding or not binding.get("enabled"):
+        return {"status": "disabled", "blind_safe": True, "runtime_b_enabled": False}
+
+    shadows = await supabase_get(
+        "paper_strategy_shadow_state",
+        f"strategy_version_id=eq.{strategy_version_id}&pair=eq.ZEC%2FUSDT&limit=1",
+    )
+    if not shadows:
+        return {"status": "not_initialized", "blind_safe": True, "runtime_b_enabled": True}
+    shadow = shadows[0]
+    if shadow.get("data_state") == "INVALID":
+        return {"status": "invalid", "blind_safe": True, "runtime_b_enabled": True}
+
+    step = TIMEFRAME_MILLISECONDS["5m"]
+    cursor_ms = int(
+        datetime.fromisoformat(
+            str(shadow["last_processed_5m_open_time"]).replace("Z", "+00:00")
+        ).timestamp()
+        * 1000
+    )
+    expected_ms = cursor_ms + step
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    latest_closed_open_ms = (now_ms // step) * step - step
+    if expected_ms > latest_closed_open_ms:
+        return {"status": "waiting", "blind_safe": True, "runtime_b_enabled": True}
+
+    end_ms = min(latest_closed_open_ms, expected_ms + 11 * step)
+    count = int((end_ms - expected_ms) // step + 1)
+    try:
+        candles = await load_okx_candles(
+            pair,
+            "5m",
+            count,
+            expected_ms,
+            end_ms,
+        )
+    except Exception:
+        return {"status": "data_unavailable", "blind_safe": True, "runtime_b_enabled": True}
+
+    by_open = {int(row["open_time"]): row for row in candles}
+    if expected_ms not in by_open:
+        if any(open_time > expected_ms for open_time in by_open):
+            result = await supabase_rpc(
+                "paper_spec006_commit_reference_bar",
+                {
+                    "p_strategy_version_id": strategy_version_id,
+                    "p_pair": pair,
+                    "p_expected_open_time": datetime.fromtimestamp(expected_ms / 1000, UTC).isoformat(),
+                    "p_software_commit": os.getenv("VERCEL_GIT_COMMIT_SHA", "unknown"),
+                },
+            )
+            return {
+                "status": "invalid" if (result or {}).get("data_state") == "INVALID" else "data_unavailable",
+                "blind_safe": True,
+                "runtime_b_enabled": True,
+            }
+        return {"status": "data_unavailable", "blind_safe": True, "runtime_b_enabled": True}
+
+    payload_rows = [
+        {
+            "strategy_version_id": strategy_version_id,
+            "pair": pair,
+            "open_time": datetime.fromtimestamp(int(row["open_time"]) / 1000, UTC).isoformat(),
+            "close_time": datetime.fromtimestamp(int(row["close_time"]) / 1000, UTC).isoformat(),
+            "open": str(row["open"]),
+            "high": str(row["high"]),
+            "low": str(row["low"]),
+            "close": str(row["close"]),
+            "source_hash": spec006_reference_bar_hash(row),
+        }
+        for row in candles
+    ]
+    await supabase_rpc("paper_spec006_ingest_reference_bars", {"p_rows": payload_rows})
+
+    status = "advanced"
+    for open_ms in range(expected_ms, end_ms + 1, step):
+        if open_ms not in by_open:
+            # A later exact key exists in the verified batch: this is a true gap.
+            if any(candidate > open_ms for candidate in by_open):
+                result = await supabase_rpc(
+                    "paper_spec006_commit_reference_bar",
+                    {
+                        "p_strategy_version_id": strategy_version_id,
+                        "p_pair": pair,
+                        "p_expected_open_time": datetime.fromtimestamp(open_ms / 1000, UTC).isoformat(),
+                        "p_software_commit": os.getenv("VERCEL_GIT_COMMIT_SHA", "unknown"),
+                    },
+                )
+                status = "invalid" if (result or {}).get("data_state") == "INVALID" else "data_unavailable"
+            else:
+                status = "data_unavailable"
+            break
+        result = await supabase_rpc(
+            "paper_spec006_commit_reference_bar",
+            {
+                "p_strategy_version_id": strategy_version_id,
+                "p_pair": pair,
+                "p_expected_open_time": datetime.fromtimestamp(open_ms / 1000, UTC).isoformat(),
+                "p_software_commit": os.getenv("VERCEL_GIT_COMMIT_SHA", "unknown"),
+            },
+        )
+        if (result or {}).get("data_state") == "INVALID" or (result or {}).get("reason") == "REFERENCE_INVALID":
+            status = "invalid"
+            break
+
+    return {
+        "status": status,
+        "blind_safe": True,
+        "runtime_b_enabled": True,
+    }
+
+
+@app.post("/api/internal/paper/spec-006/bootstrap")
+async def internal_spec006_bootstrap(
+    x_paper_scheduler_token: str | None = Header(default=None, alias="X-Paper-Scheduler-Token"),
+):
+    """Build blind internal reference state only; never enables runtime B."""
+    require_durable_production_store()
+    _require_internal_secret(x_paper_scheduler_token, "PAPER_SCHEDULER_TOKEN")
+
+    strategy_version_id = "TEST-SPEC-002"
+    pair = "ZEC/USDT"
+    existing_binding = await _paper_runtime_binding(strategy_version_id)
+    if existing_binding and existing_binding.get("enabled"):
+        raise HTTPException(409, "spec006_runtime_already_enabled")
+
+    shadow = await supabase_get(
+        "paper_strategy_shadow_state",
+        f"strategy_version_id=eq.{strategy_version_id}&pair=eq.ZEC%2FUSDT&limit=1",
+    )
+    if shadow:
+        return {
+            "status": "already_initialized",
+            "runtime_b_enabled": False,
+            "blind_safe": True,
+        }
+
+    step = TIMEFRAME_MILLISECONDS["5m"]
+    now = datetime.now(UTC)
+    now_ms = int(now.timestamp() * 1000)
+    cutoff_open_ms = (now_ms // step) * step - step
+    evaluation_start_ms = int(_TSMOM_B_V1_EVAL_START.timestamp() * 1000)
+    # Frozen TEST-SPEC-002 ZEC input uses exactly 24h pre-fold warmup.
+    # Extra Wilder-ATR history would change early reference ATR values.
+    warmup_start_ms = evaluation_start_ms - 24 * 3_600_000
+    count = int((cutoff_open_ms - warmup_start_ms) // step + 1)
+
+    candles = await load_okx_candles(
+        pair,
+        "5m",
+        min(45000, count),
+        warmup_start_ms,
+        cutoff_open_ms,
+    )
+    if (
+        not candles
+        or int(candles[-1]["open_time"]) != cutoff_open_ms
+        or not any(int(row["open_time"]) == evaluation_start_ms for row in candles)
+        or any(
+            int(right["open_time"]) - int(left["open_time"]) != step
+            for left, right in zip(candles, candles[1:])
+        )
+    ):
+        return {
+            "status": "data_not_contiguous",
+            "runtime_b_enabled": False,
+            "blind_safe": True,
+        }
+
+    rows = [
+        {
+            "strategy_version_id": strategy_version_id,
+            "pair": pair,
+            "open_time": datetime.fromtimestamp(int(row["open_time"]) / 1000, UTC).isoformat(),
+            "close_time": datetime.fromtimestamp(int(row["close_time"]) / 1000, UTC).isoformat(),
+            "open": str(row["open"]),
+            "high": str(row["high"]),
+            "low": str(row["low"]),
+            "close": str(row["close"]),
+            "source_hash": spec006_reference_bar_hash(row),
+        }
+        for row in candles
+    ]
+    for start in range(0, len(rows), 200):
+        await supabase_rpc(
+            "paper_spec006_ingest_reference_bars",
+            {"p_rows": rows[start : start + 200]},
+        )
+
+    state = spec006_replay_bootstrap_state(
+        candles,
+        evaluation_start_ms=evaluation_start_ms,
+        cutoff_open_ms=cutoff_open_ms,
+        strategy_version_id=strategy_version_id,
+        pair=pair,
+    )
+    if state.reference_position_state != "FLAT":
+        return {
+            "status": "waiting_safe_boundary",
+            "runtime_b_enabled": False,
+            "blind_safe": True,
+        }
+
+    initialized = await supabase_rpc(
+        "paper_spec006_initialize_flat_epoch",
+        {
+            "p_strategy_version_id": strategy_version_id,
+            "p_pair": pair,
+            "p_cursor_open_time": datetime.fromtimestamp(cutoff_open_ms / 1000, UTC).isoformat(),
+            "p_enable_commit_time": now.isoformat(),
+        },
+    )
+    return {
+        "status": "ready_for_binding" if (initialized or {}).get("initialized") else "already_initialized",
+        "runtime_b_enabled": False,
+        "blind_safe": True,
+    }
+
+
+@app.post("/api/internal/paper/spec-006/recover")
+async def internal_spec006_recover(
+    x_paper_scheduler_token: str | None = Header(default=None, alias="X-Paper-Scheduler-Token"),
+):
+    """Recover INVALID reference state without dispatching historical B actions."""
+    require_durable_production_store()
+    _require_internal_secret(x_paper_scheduler_token, "PAPER_SCHEDULER_TOKEN")
+
+    strategy_version_id = "TEST-SPEC-002"
+    pair = "ZEC/USDT"
+    rows = await supabase_get(
+        "paper_strategy_shadow_state",
+        f"strategy_version_id=eq.{strategy_version_id}&pair=eq.ZEC%2FUSDT&limit=1",
+    )
+    if not rows:
+        return {"status": "not_initialized", "blind_safe": True}
+    shadow = rows[0]
+    if shadow.get("data_state") != "INVALID":
+        return {"status": "not_invalid", "blind_safe": True}
+
+    def ms(value):
+        if value is None:
+            return None
+        return int(datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp() * 1000)
+
+    cursor_ms = ms(shadow["last_processed_5m_open_time"])
+    invalid_ms = ms(shadow["invalid_at_5m_open_time"])
+    if cursor_ms is None or invalid_ms is None:
+        return {"status": "integrity_blocked", "blind_safe": True}
+
+    step = TIMEFRAME_MILLISECONDS["5m"]
+    now = datetime.now(UTC)
+    now_ms = int(now.timestamp() * 1000)
+    cutoff_open_ms = (now_ms // step) * step - step
+    if cutoff_open_ms <= cursor_ms:
+        return {"status": "waiting_data", "blind_safe": True}
+
+    evaluation_start_ms = int(_TSMOM_B_V1_EVAL_START.timestamp() * 1000)
+    # Recovery must rebuild ATR/signals from the same frozen ZEC warmup origin,
+    # not from a rolling local window; Wilder ATR is path-dependent.
+    warmup_start_ms = evaluation_start_ms - 24 * 3_600_000
+    count = int((cutoff_open_ms - warmup_start_ms) // step + 1)
+    candles = await load_okx_candles(
+        pair,
+        "5m",
+        min(45000, count),
+        warmup_start_ms,
+        cutoff_open_ms,
+    )
+    if (
+        not candles
+        or int(candles[-1]["open_time"]) != cutoff_open_ms
+        or not any(int(row["open_time"]) == invalid_ms for row in candles)
+        or any(
+            int(right["open_time"]) - int(left["open_time"]) != step
+            for left, right in zip(candles, candles[1:])
+        )
+    ):
+        return {"status": "waiting_data", "blind_safe": True}
+
+    payload_rows = [
+        {
+            "strategy_version_id": strategy_version_id,
+            "pair": pair,
+            "open_time": datetime.fromtimestamp(int(row["open_time"]) / 1000, UTC).isoformat(),
+            "close_time": datetime.fromtimestamp(int(row["close_time"]) / 1000, UTC).isoformat(),
+            "open": str(row["open"]),
+            "high": str(row["high"]),
+            "low": str(row["low"]),
+            "close": str(row["close"]),
+            "source_hash": spec006_reference_bar_hash(row),
+        }
+        for row in candles
+    ]
+    for start in range(0, len(payload_rows), 200):
+        await supabase_rpc(
+            "paper_spec006_ingest_reference_bars",
+            {"p_rows": payload_rows[start : start + 200]},
+        )
+
+    prior = Spec006ReferenceState(
+        reference_position_state=shadow["reference_position_state"],
+        reference_signal_close_time=ms(shadow.get("reference_signal_close_time")),
+        reference_entry_time=ms(shadow.get("reference_entry_time")),
+        reference_entry_price=float(shadow["reference_entry_price"]) if shadow.get("reference_entry_price") is not None else None,
+        reference_entry_atr=float(shadow["reference_entry_atr"]) if shadow.get("reference_entry_atr") is not None else None,
+        active_stop=float(shadow["active_stop"]) if shadow.get("active_stop") is not None else None,
+        peak_high=float(shadow["peak_high"]) if shadow.get("peak_high") is not None else None,
+        trough_low=float(shadow["trough_low"]) if shadow.get("trough_low") is not None else None,
+    )
+    state = prior
+    suppressed_actions = []
+    for index, bar in enumerate(candles):
+        open_ms = int(bar["open_time"])
+        if open_ms <= cursor_ms:
+            continue
+        if open_ms > cutoff_open_ms:
+            break
+        state, emitted = spec006_compute_reference_transition(
+            history_through_current=candles[: index + 1],
+            prior_state=state,
+            strategy_version_id=strategy_version_id,
+            pair=pair,
+        )
+        suppressed_actions.extend(emitted)
+
+    commit_time = datetime.now(UTC)
+    cutoff_iso = datetime.fromtimestamp(cutoff_open_ms / 1000, UTC).isoformat()
+    same_cycle = (
+        state.reference_position_state in {"LONG", "SHORT"}
+        and shadow.get("reference_entry_action_id")
+        and not suppressed_actions
+        and state.reference_position_state == prior.reference_position_state
+    )
+
+    if same_cycle:
+        state_payload = {
+            "reference_position_state": state.reference_position_state,
+            "reference_signal_close_time": datetime.fromtimestamp(state.reference_signal_close_time / 1000, UTC).isoformat() if state.reference_signal_close_time is not None else None,
+            "reference_entry_time": datetime.fromtimestamp(state.reference_entry_time / 1000, UTC).isoformat() if state.reference_entry_time is not None else None,
+            "reference_entry_price": state.reference_entry_price,
+            "reference_entry_atr": state.reference_entry_atr,
+            "active_stop": state.active_stop,
+            "peak_high": state.peak_high,
+            "trough_low": state.trough_low,
+        }
+        result = await supabase_rpc(
+            "paper_spec006_commit_recovery_same_cycle",
+            {
+                "p_strategy_version_id": strategy_version_id,
+                "p_pair": pair,
+                "p_expected_entry_action_id": shadow["reference_entry_action_id"],
+                "p_cutoff_open_time": cutoff_iso,
+                "p_enable_commit_time": commit_time.isoformat(),
+                "p_reference_state": state_payload,
+                "p_software_commit": os.getenv("VERCEL_GIT_COMMIT_SHA", "unknown"),
+            },
+        )
+        return {
+            "status": "recovered_ready" if (result or {}).get("resumed") else "recovery_wait",
+            "blind_safe": True,
+        }
+
+    if state.reference_position_state == "FLAT":
+        result = await supabase_rpc(
+            "paper_spec006_commit_recovery_flat",
+            {
+                "p_strategy_version_id": strategy_version_id,
+                "p_pair": pair,
+                "p_cutoff_open_time": cutoff_iso,
+                "p_enable_commit_time": commit_time.isoformat(),
+            },
+        )
+        if (result or {}).get("reason") == "RECOVERY_FLATTEN_REQUIRED":
+            binding = await _paper_runtime_binding(strategy_version_id)
+            if binding:
+                queued = await supabase_rpc(
+                    "paper_spec006_queue_exit_attempt",
+                    {
+                        "p_exit_intent_id": result["exit_intent_id"],
+                        "p_software_commit": os.getenv("VERCEL_GIT_COMMIT_SHA", "unknown"),
+                    },
+                )
+                return {
+                    "status": "recovery_flatten_running" if (queued or {}).get("queued") else "recovery_wait",
+                    "blind_safe": True,
+                }
+            return {"status": "recovery_wait", "blind_safe": True}
+        return {
+            "status": "recovered_ready" if (result or {}).get("resumed") else "recovery_wait",
+            "blind_safe": True,
+        }
+
+    return {"status": "waiting_safe_boundary", "blind_safe": True}
+
+
+@app.get("/api/paper/spec-006/smoke")
+async def paper_spec_006_smoke():
+    """Synthetic/blind-safe checks for the locked SPEC-006 reference adapter only."""
+    checks = spec006_adapter_smoke_cases()
+    binding = await _paper_runtime_binding("TEST-SPEC-002")
+    runtime_enabled = bool(binding and binding.get("enabled"))
+    return {
+        "status": "passed" if all(checks.values()) and not runtime_enabled else "failed",
+        "checks": checks,
+        "runtime_b_enabled": runtime_enabled,
+        "live_trading": False,
+        "alpha_logic_touched": False,
+        "official_b_scoring_touched": False,
+        "blind_safe": True,
+        "spec": "IMPLEMENTATION-SPEC-006",
     }
 
 
@@ -454,6 +940,13 @@ async def paper_spec_005_smoke():
 async def paper_queue_health():
     require_durable_production_store()
     snapshot = await _paper_ops_snapshot()
+    if await _spec006_blind_runtime_active():
+        backlog = int((snapshot.get("queue") or {}).get("current_backlog") or 0)
+        return {
+            "queue": "DEGRADED" if backlog else "HEALTHY",
+            "blind_safe": True,
+            "live_trading": False,
+        }
     return {
         "queue": snapshot.get("queue", {}),
         "blind_safe": True,
@@ -465,6 +958,12 @@ async def paper_queue_health():
 async def paper_worker_health():
     require_durable_production_store()
     snapshot = await _paper_ops_snapshot()
+    if await _spec006_blind_runtime_active():
+        return {
+            "worker": _blind_worker_category(snapshot.get("workers", [])),
+            "blind_safe": True,
+            "live_trading": False,
+        }
     return {
         "workers": snapshot.get("workers", []),
         "blind_safe": True,
@@ -476,6 +975,12 @@ async def paper_worker_health():
 async def paper_reconciliation_health():
     require_durable_production_store()
     snapshot = await _paper_ops_snapshot()
+    if await _spec006_blind_runtime_active():
+        return {
+            "reconciliation": _blind_reconciliation_category(snapshot.get("reconciliation", {})),
+            "blind_safe": True,
+            "live_trading": False,
+        }
     return {
         "reconciliation": snapshot.get("reconciliation", {}),
         "blind_safe": True,
@@ -488,6 +993,12 @@ async def paper_audit_health():
     require_durable_production_store()
     snapshot = await _paper_ops_snapshot()
     reconciliation = snapshot.get("reconciliation", {})
+    if await _spec006_blind_runtime_active():
+        return {
+            "audit": _blind_reconciliation_category(reconciliation),
+            "blind_safe": True,
+            "live_trading": False,
+        }
     latest = reconciliation.get("latest", {}) if isinstance(reconciliation, dict) else {}
     return {
         "audit_integrity_passed": latest.get("audit_integrity_passed"),
@@ -500,8 +1011,15 @@ async def paper_audit_health():
 async def paper_kill_switch_status():
     require_durable_production_store()
     snapshot = await _paper_ops_snapshot()
+    kill_switch = snapshot.get("kill_switch", {})
+    if await _spec006_blind_runtime_active():
+        return {
+            "kill_switch": {"state": kill_switch.get("state")},
+            "blind_safe": True,
+            "live_trading": False,
+        }
     return {
-        "kill_switch": snapshot.get("kill_switch", {}),
+        "kill_switch": kill_switch,
         "blind_safe": True,
         "live_trading": False,
     }
@@ -745,15 +1263,116 @@ async def internal_paper_outbox_tick(
         event_type = item["event_type"]
         entity_id = item["entity_id"]
         try:
+            if event_type == "STRATEGY_ACTION_DISPATCH":
+                actions = await supabase_get("paper_strategy_actions", f"id=eq.{entity_id}&limit=1")
+                if not actions:
+                    raise ValueError("strategy_action_not_found")
+                action = actions[0]
+
+                if action["action_type"] == "ENTRY":
+                    binding = await _paper_runtime_binding(action["strategy_version_id"])
+                    if not binding or not binding.get("enabled"):
+                        # Never leave a queued historical ENTRY retryable for a later re-enable.
+                        await supabase_rpc(
+                            "paper_spec006_fence_entry_lifecycle",
+                            {
+                                "p_entry_action_id": entity_id,
+                                "p_reason": "RUNTIME_BINDING_DISABLED",
+                                "p_worker_id": worker,
+                                "p_software_commit": commit,
+                            },
+                        )
+                        ack = await _paper_ack(outbox_id, worker, generation, None)
+                        if (ack or {}).get("acknowledged"):
+                            processed += 1
+                        continue
+
+                    dispatched = await supabase_rpc(
+                        "paper_spec006_dispatch_entry_action",
+                        {
+                            "p_action_id": entity_id,
+                            "p_intended_notional": 50,
+                            "p_blind_test_id": "TEST-SPEC-002-forward-2026",
+                            "p_worker_id": worker,
+                            "p_software_commit": commit,
+                        },
+                    )
+                    reason = (dispatched or {}).get("reason")
+                    if reason in {"WAIT_ENTRY_IN_FLIGHT"}:
+                        await _paper_ack(outbox_id, worker, generation, "SPEC006_ENTRY_WAIT")
+                        errors += 1
+                        continue
+                elif action["action_type"] == "EXIT_TO_FLAT":
+                    intents = await supabase_get(
+                        "paper_exit_intents",
+                        f"exit_action_id=eq.{entity_id}&limit=1",
+                    )
+                    if not intents:
+                        raise ValueError("exit_intent_not_found")
+                    queued = await supabase_rpc(
+                        "paper_spec006_queue_exit_attempt",
+                        {
+                            "p_exit_intent_id": intents[0]["id"],
+                            "p_software_commit": commit,
+                        },
+                    )
+                    reason = (queued or {}).get("reason")
+                    if reason in {
+                        "WAIT_ENTRY_IN_FLIGHT",
+                        "WAIT_ENTRY_LIFECYCLES",
+                        "WAIT_OTHER_OWNER",
+                        "PAUSED_KILL_SWITCH",
+                    }:
+                        await _paper_ack(outbox_id, worker, generation, "SPEC006_EXIT_WAIT")
+                        errors += 1
+                        continue
+                else:
+                    raise ValueError("unsupported_strategy_action")
+
+                ack = await _paper_ack(outbox_id, worker, generation, None)
+                if (ack or {}).get("acknowledged"):
+                    processed += 1
+                continue
+
             if event_type == "RISK_EVALUATE":
                 signals = await supabase_get("paper_signals", f"id=eq.{entity_id}&limit=1")
                 if not signals:
                     raise ValueError("signal_not_found")
                 signal = signals[0]
+                spec006_lifecycles = await supabase_get(
+                    "paper_entry_lifecycles",
+                    f"paper_signal_id=eq.{entity_id}&limit=1",
+                )
+                spec006_lifecycle = spec006_lifecycles[0] if spec006_lifecycles else None
+
                 binding = await _paper_runtime_binding(signal["strategy_version_id"])
                 if not binding or not binding.get("enabled"):
-                    await _paper_ack(outbox_id, worker, generation, "RUNTIME_BINDING_DISABLED")
-                    errors += 1
+                    if spec006_lifecycle:
+                        await supabase_rpc(
+                            "paper_spec006_fence_entry_lifecycle",
+                            {
+                                "p_entry_action_id": spec006_lifecycle["entry_action_id"],
+                                "p_reason": "RUNTIME_BINDING_DISABLED",
+                                "p_worker_id": worker,
+                                "p_software_commit": commit,
+                            },
+                        )
+                        ack = await _paper_ack(outbox_id, worker, generation, None)
+                        if (ack or {}).get("acknowledged"):
+                            processed += 1
+                    else:
+                        await _paper_ack(outbox_id, worker, generation, "RUNTIME_BINDING_DISABLED")
+                        errors += 1
+                    continue
+                if spec006_lifecycle and spec006_lifecycle.get("status") in {
+                    "TERMINAL_FILLED",
+                    "TERMINAL_NO_FILL",
+                    "NEVER_CREATED_FENCED",
+                    "TERMINAL_REJECTED",
+                }:
+                    ack = await _paper_ack(outbox_id, worker, generation, None)
+                    if (ack or {}).get("acknowledged"):
+                        processed += 1
                     continue
 
                 risk = await supabase_rpc(
@@ -773,17 +1392,40 @@ async def internal_paper_outbox_tick(
                     )
                     reservation = reservations[0] if reservations else None
                     if reservation and reservation.get("status") in ("RESERVED", "PARTIALLY_CONSUMED"):
-                        await supabase_rpc(
-                            "paper_create_order_from_approved_signal",
-                            {
-                                "p_signal_id": entity_id,
-                                "p_side": "BUY" if signal["side"] == "LONG" else "SELL",
-                                "p_intent_type": "ENTRY",
-                                "p_order_type": "MARKET",
-                                "p_worker_id": worker,
-                                "p_software_commit": commit,
-                            },
-                        )
+                        if spec006_lifecycle:
+                            order_result = await supabase_rpc(
+                                "paper_spec006_create_entry_order_from_approved_signal",
+                                {
+                                    "p_signal_id": entity_id,
+                                    "p_worker_id": worker,
+                                    "p_software_commit": commit,
+                                },
+                            )
+                            if (order_result or {}).get("reason") in {
+                                "WAIT_OWNER_ENTRY_IN_FLIGHT",
+                                "WAIT_ENTRY_IN_FLIGHT",
+                                "INTEGRITY_CLAIM_RETRY",
+                            }:
+                                await _paper_ack(
+                                    outbox_id,
+                                    worker,
+                                    generation,
+                                    "SPEC006_ENTRY_ORDER_WAIT",
+                                )
+                                errors += 1
+                                continue
+                        else:
+                            await supabase_rpc(
+                                "paper_create_order_from_approved_signal",
+                                {
+                                    "p_signal_id": entity_id,
+                                    "p_side": "BUY" if signal["side"] == "LONG" else "SELL",
+                                    "p_intent_type": "ENTRY",
+                                    "p_order_type": "MARKET",
+                                    "p_worker_id": worker,
+                                    "p_software_commit": commit,
+                                },
+                            )
                 ack = await _paper_ack(outbox_id, worker, generation, None)
                 if (ack or {}).get("acknowledged"):
                     processed += 1
@@ -795,23 +1437,57 @@ async def internal_paper_outbox_tick(
                     raise ValueError("order_not_found")
                 order = orders[0]
 
-                reservations = await supabase_get(
-                    "risk_reservations",
-                    f"signal_id=eq.{order['signal_id']}&limit=1",
+                spec006_entries = await supabase_get(
+                    "paper_entry_lifecycles",
+                    f"paper_entry_order_id=eq.{entity_id}&limit=1",
                 )
-                if not reservations:
-                    raise ValueError("risk_reservation_not_found")
-                reservation = reservations[0]
+                is_spec006 = bool(spec006_entries) or bool(order.get("exit_intent_id"))
+
+                reservation = None
+                if order["intent_type"] == "ENTRY":
+                    reservations = await supabase_get(
+                        "risk_reservations",
+                        f"signal_id=eq.{order['signal_id']}&limit=1",
+                    )
+                    if not reservations:
+                        raise ValueError("risk_reservation_not_found")
+                    reservation = reservations[0]
+                    policy_id = reservation["policy_version_id"]
+                elif is_spec006 and order["intent_type"] == "EXIT":
+                    binding = await _paper_runtime_binding(order["strategy_version_id"])
+                    if not binding:
+                        await _paper_ack(outbox_id, worker, generation, "EXECUTION_POLICY_UNAVAILABLE")
+                        errors += 1
+                        continue
+                    policy_id = binding["risk_policy_version_id"]
+                else:
+                    reservations = await supabase_get(
+                        "risk_reservations",
+                        f"signal_id=eq.{order['signal_id']}&limit=1",
+                    )
+                    if not reservations:
+                        raise ValueError("risk_reservation_not_found")
+                    reservation = reservations[0]
+                    policy_id = reservation["policy_version_id"]
 
                 policies = await supabase_get(
                     "risk_policy_versions",
-                    f"id=eq.{reservation['policy_version_id']}&limit=1",
+                    f"id=eq.{policy_id}&limit=1",
                 )
                 if not policies:
                     raise ValueError("risk_policy_not_found")
                 risk_policy = policies[0]
                 fee_rate = risk_policy.get("fee_rate")
                 if fee_rate is None:
+                    if is_spec006 and order["intent_type"] == "EXIT":
+                        await _paper_ack(
+                            outbox_id,
+                            worker,
+                            generation,
+                            "EXECUTION_POLICY_UNAVAILABLE",
+                        )
+                        errors += 1
+                        continue
                     await supabase_rpc(
                         "paper_terminalize_order",
                         {
@@ -844,21 +1520,21 @@ async def internal_paper_outbox_tick(
                     },
                 )
                 attempt_seq = int((item.get("payload") or {}).get("attempt_seq") or 1)
+                bind_rpc = "paper_spec006_bind_execution_attempt" if is_spec006 else "paper_bind_execution_attempt"
                 bound = await supabase_rpc(
-                    "paper_bind_execution_attempt",
+                    bind_rpc,
                     {
                         "p_outbox_id": outbox_id,
                         "p_lease_generation": generation,
                         "p_order_id": entity_id,
                         "p_market_snapshot_id": snapshot["id"],
-                        "p_policy_version_id": reservation["policy_version_id"],
+                        "p_policy_version_id": policy_id,
                         "p_attempt_seq": attempt_seq,
                         "p_worker_id": worker,
                         "p_software_commit": commit,
                     },
                 )
                 if not (bound or {}).get("execution_attempt_id"):
-                    # Lease lost or event became terminal while fetching market data.
                     continue
 
                 bound_snapshot_id = bound.get("market_snapshot_id") or snapshot["id"]
@@ -878,27 +1554,49 @@ async def internal_paper_outbox_tick(
                     asks = fetched["asks"]
                     provider_ts_ms = int(fetched["provider_ts_ms"])
 
-                remaining_notional = remaining_quote_notional(
-                    order["intended_notional"],
-                    order.get("filled_notional") or 0,
-                )
-                if remaining_notional == "0":
-                    await _paper_ack(outbox_id, worker, generation, None)
-                    processed += 1
-                    continue
+                if is_spec006 and order["intent_type"] == "EXIT":
+                    remaining_base = (item.get("payload") or {}).get("remaining_base_qty")
+                    if remaining_base is None:
+                        await _paper_ack(
+                            outbox_id,
+                            worker,
+                            generation,
+                            "SPEC006_EXIT_MISSING_LOCKED_BASE_QTY",
+                        )
+                        errors += 1
+                        continue
+                    fill = walk_canonical_base_quantity(
+                        side=order["side"],
+                        base_quantity=remaining_base,
+                        bids=bids,
+                        asks=asks,
+                    )
+                else:
+                    remaining_notional = remaining_quote_notional(
+                        order["intended_notional"],
+                        order.get("filled_notional") or 0,
+                    )
+                    if remaining_notional == "0":
+                        await _paper_ack(outbox_id, worker, generation, None)
+                        processed += 1
+                        continue
+                    fill = walk_canonical_quote_notional(
+                        side=order["side"],
+                        quote_notional=remaining_notional,
+                        bids=bids,
+                        asks=asks,
+                    )
 
-                fill = walk_canonical_quote_notional(
-                    side=order["side"],
-                    quote_notional=remaining_notional,
-                    bids=bids,
-                    asks=asks,
-                )
                 if fill["filled_quote_notional"] == "0":
                     await _paper_ack(outbox_id, worker, generation, "NO_EXECUTABLE_DEPTH")
                     errors += 1
                     continue
 
-                if not fill["complete"] and not risk_policy.get("partial_fill_allowed"):
+                if (
+                    order["intent_type"] == "ENTRY"
+                    and not fill["complete"]
+                    and not risk_policy.get("partial_fill_allowed")
+                ):
                     await supabase_rpc(
                         "paper_terminalize_order",
                         {
@@ -922,8 +1620,9 @@ async def internal_paper_outbox_tick(
                 fee_amount = quote_fee_amount(fill["filled_quote_notional"], fee_rate)
                 filled_at = datetime.fromtimestamp(provider_ts_ms / 1000, UTC).isoformat()
 
+                apply_rpc = "paper_spec006_apply_fill" if is_spec006 else "paper_apply_fill"
                 applied = await supabase_rpc(
-                    "paper_apply_fill",
+                    apply_rpc,
                     {
                         "p_outbox_id": outbox_id,
                         "p_lease_generation": generation,
@@ -945,6 +1644,14 @@ async def internal_paper_outbox_tick(
                     ack = await _paper_ack(outbox_id, worker, generation, None)
                     if (ack or {}).get("acknowledged"):
                         processed += 1
+                elif is_spec006:
+                    await _paper_ack(
+                        outbox_id,
+                        worker,
+                        generation,
+                        "SPEC006_APPLY_DEFERRED",
+                    )
+                    errors += 1
                 continue
 
             # Unknown events are released for retry and surfaced as worker errors.

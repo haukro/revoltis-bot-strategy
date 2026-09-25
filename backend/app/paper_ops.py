@@ -249,6 +249,90 @@ def walk_canonical_quote_notional(
         "complete": complete,
     }
 
+
+def walk_canonical_base_quantity(
+    *,
+    side: str,
+    base_quantity: Any,
+    bids: Iterable[Iterable[Any]],
+    asks: Iterable[Iterable[Any]],
+) -> dict[str, Any]:
+    """Walk a canonical immutable book for an exact base quantity.
+
+    SELL consumes bids. BUY consumes asks. Used by SPEC-006 reduce-only EXIT.
+    """
+    if side not in ("BUY", "SELL"):
+        raise ValueError("invalid_side")
+    try:
+        requested = Decimal(str(base_quantity))
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise ValueError("invalid_base_quantity") from exc
+    if not requested.is_finite() or requested <= 0:
+        raise ValueError("invalid_base_quantity")
+
+    nb = _normalize_levels(bids, descending=True)
+    na = _normalize_levels(asks, descending=False)
+    best_bid = Decimal(nb[0][0])
+    best_ask = Decimal(na[0][0])
+    if best_bid >= best_ask:
+        raise ValueError("crossed_or_locked_book")
+
+    levels = na if side == "BUY" else nb
+    best = best_ask if side == "BUY" else best_bid
+    remaining = requested
+    base_filled = Decimal("0")
+    quote_filled = Decimal("0")
+    levels_used = 0
+
+    for price_s, qty_s in levels:
+        if remaining <= 0:
+            break
+        price = Decimal(price_s)
+        available_base = Decimal(qty_s)
+        take_base = min(remaining, available_base)
+        base_filled += take_base
+        quote_filled += take_base * price
+        remaining -= take_base
+        levels_used += 1
+
+    complete = remaining <= Decimal("0")
+    if base_filled <= 0:
+        return {
+            "side": side,
+            "requested_base_quantity": _execution_decimal(requested),
+            "filled_base_quantity": "0",
+            "filled_quote_notional": "0",
+            "vwap": None,
+            "best_price": _execution_decimal(best),
+            "spread_bps": None,
+            "impact_bps": None,
+            "levels_used": 0,
+            "complete": False,
+        }
+
+    vwap = quote_filled / base_filled
+    mid = (best_bid + best_ask) / Decimal("2")
+    spread_bps = (best_ask - best_bid) / mid * Decimal("10000")
+    impact_bps = (
+        (vwap / best - Decimal("1")) * Decimal("10000")
+        if side == "BUY"
+        else (Decimal("1") - vwap / best) * Decimal("10000")
+    )
+
+    return {
+        "side": side,
+        "requested_base_quantity": _execution_decimal(requested),
+        "filled_base_quantity": _execution_decimal(base_filled),
+        "filled_quote_notional": _execution_decimal(quote_filled),
+        "vwap": _execution_decimal(vwap),
+        "best_price": _execution_decimal(best),
+        "spread_bps": _execution_decimal(spread_bps),
+        "impact_bps": _execution_decimal(impact_bps),
+        "levels_used": levels_used,
+        "complete": complete,
+    }
+
+
 def blind_worker_projection(row: dict[str, Any], age_category: str) -> dict[str, Any]:
     """Blind-safe worker projection: no lifetime throughput counters."""
     return {
@@ -341,6 +425,12 @@ def smoke_cases() -> dict[str, bool]:
         bids=[["99.9", "10"]],
         asks=[["100", "0.2"], ["100.5", "1"]],
     )
+    base_walk = walk_canonical_base_quantity(
+        side="SELL",
+        base_quantity="0.5",
+        bids=[["100", "0.2"], ["99", "1"]],
+        asks=[["101", "1"]],
+    )
 
     return {
         "canonical_format_equivalent": a == b,
@@ -353,4 +443,7 @@ def smoke_cases() -> dict[str, bool]:
         "crossed_book_rejected": crossed_rejected,
         "decimal_book_walk_complete": exact_walk["complete"] is True,
         "decimal_book_walk_uses_depth": exact_walk["levels_used"] == 2,
+        "base_qty_walk_complete": base_walk["complete"] is True,
+        "base_qty_walk_exact_quantity": base_walk["filled_base_quantity"] == "0.5",
+        "base_qty_walk_uses_depth": base_walk["levels_used"] == 2,
     }
