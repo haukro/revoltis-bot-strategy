@@ -1,6 +1,6 @@
 # IMPLEMENTATION-SPEC-006 — Frozen Strategy-B Paper Adapter + Durable Reduce-Only Flatten
 
-Status: **DRAFT V2 PATCHED AFTER SECOND GROK REVIEW — LOCK-GATE RE-REVIEW REQUIRED — NOT LOCKED, NOT IMPLEMENTED**
+Status: **DRAFT V3 HARDENED AFTER LOCK-GATE REVIEW — INDEPENDENT RE-REVIEW REQUIRED — NOT LOCKED, NOT IMPLEMENTED**
 
 Purpose: connect frozen TEST-SPEC-002 to the existing SPEC-004/005 paper execution stack without changing alpha logic, official verdict logic, or blind-test secrecy.
 
