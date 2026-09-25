@@ -77,7 +77,7 @@ function App() {
   const [chartRange, setChartRange] = useState<'hour' | 'day' | 'week'>('day');
   const [optimizer, setOptimizer] = useState<any>(null);
   const [replayAvailability, setReplayAvailability] = useState<any>(null);
-  const [optimizerDays, setOptimizerDays] = useState<1 | 7 | 14 | 30>(7);
+  const [optimizerDays, setOptimizerDays] = useState<1 | 7 | 14 | 30 | 90>(7);
   const [optimizerTrials, setOptimizerTrials] = useState(3);
   const [optimizerRunning, setOptimizerRunning] = useState(false);
   const [installPrompt, setInstallPrompt] = useState<any>(null);
