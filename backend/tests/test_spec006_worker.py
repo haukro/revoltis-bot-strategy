@@ -97,3 +97,80 @@ def test_spec006_fill_worker_never_calls_legacy_apply():
     assert "paper_spec006_apply_fill" in rpc_names
     assert "paper_apply_fill" not in rpc_names
     assert "paper_bind_execution_attempt" not in rpc_names
+
+
+
+def test_spec006_risk_order_wait_releases_outbox_for_retry():
+    signal_id = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"
+    outbox_id = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb"
+    reservation_id = "cccccccc-3333-4333-8333-cccccccccccc"
+    policy_id = "dddddddd-4444-4444-8444-dddddddddddd"
+
+    claimed = [{
+        "id": outbox_id,
+        "lease_generation": 7,
+        "event_type": "RISK_EVALUATE",
+        "entity_id": signal_id,
+        "payload": {},
+    }]
+    signal = {
+        "id": signal_id,
+        "strategy_version_id": "TEST-SPEC-002",
+        "pair": "ZEC/USDT",
+        "side": "LONG",
+    }
+    lifecycle = {
+        "entry_action_id": "eeeeeeee-5555-4555-8555-eeeeeeeeeeee",
+        "paper_signal_id": signal_id,
+        "status": "PENDING_DISPATCH",
+    }
+    reservation = {
+        "id": reservation_id,
+        "signal_id": signal_id,
+        "policy_version_id": policy_id,
+        "status": "RESERVED",
+    }
+
+    async def fake_get(table, query=""):
+        if table == "paper_signals":
+            return [signal]
+        if table == "paper_entry_lifecycles":
+            return [lifecycle]
+        if table == "risk_reservations":
+            return [reservation]
+        return []
+
+    rpc_names = []
+
+    async def fake_rpc(name, payload):
+        rpc_names.append(name)
+        if name == "paper_claim_outbox":
+            return claimed
+        if name == "paper_record_worker_heartbeat":
+            return {"ok": True}
+        if name == "paper_reserve_risk":
+            return {"decision": "APPROVED"}
+        if name == "paper_spec006_create_entry_order_from_approved_signal":
+            return {"created": False, "reason": "WAIT_OWNER_ENTRY_IN_FLIGHT"}
+        raise AssertionError(f"unexpected RPC: {name}")
+
+    ack_calls = []
+
+    async def fake_ack(outbox_id_arg, worker, generation, error=None):
+        ack_calls.append((outbox_id_arg, generation, error))
+        return {"acknowledged": error is None}
+
+    with patch("app.main.require_durable_production_store"), \
+         patch("app.main._require_internal_secret"), \
+         patch("app.main._paper_active_ops_policy", new=AsyncMock(return_value={"max_worker_batch": 10, "market_book_depth": 20})), \
+         patch("app.main._paper_runtime_binding", new=AsyncMock(return_value={"enabled": True, "risk_policy_version_id": policy_id})), \
+         patch("app.main.supabase_get", new=AsyncMock(side_effect=fake_get)), \
+         patch("app.main.supabase_rpc", new=AsyncMock(side_effect=fake_rpc)), \
+         patch("app.main._paper_ack", new=AsyncMock(side_effect=fake_ack)), \
+         patch.dict("os.environ", {"PAPER_OUTBOX_LEASE_SECONDS": "30"}):
+        result = asyncio.run(internal_paper_outbox_tick("test-token"))
+
+    assert "paper_spec006_create_entry_order_from_approved_signal" in rpc_names
+    assert ack_calls == [(outbox_id, 7, "SPEC006_ENTRY_ORDER_WAIT")]
+    assert result["processed"] == 0
+    assert result["errors"] == 1
