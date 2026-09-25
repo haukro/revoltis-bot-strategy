@@ -1,6 +1,6 @@
 # IMPLEMENTATION-SPEC-006 — Frozen Strategy-B Paper Adapter + Durable Reduce-Only Flatten
 
-Status: **DRAFT V4 PATCHED AFTER GROK LOCK-GATE — INDEPENDENT RE-REVIEW REQUIRED — NOT LOCKED, NOT IMPLEMENTED**
+Status: **DRAFT V6 PATCHED AFTER GROK V5 LOCK-GATE — INDEPENDENT RE-REVIEW REQUIRED — NOT LOCKED, NOT IMPLEMENTED**
 
 Purpose: connect frozen TEST-SPEC-002 to the existing SPEC-004/005 paper execution stack without changing alpha logic, official verdict logic, or blind-test secrecy.
 
@@ -309,6 +309,7 @@ Rules:
 - every later paper ENTRY cycle for the same `strategy_version_id + pair` must insert a **new** `paper_positions.id`
 - that new position id must receive a new immutable `paper_position_entry_ownership` row for the new `entry_action_id` / ENTRY order
 - no SPEC-006 RPC may “reopen” or recycle a historical CLOSED row
+- implementation must add a DB transition guard/trigger that rejects any `paper_positions.status` transition from `CLOSED` back to `OPENING|OPEN|EXIT_PENDING|CLOSING`, including calls from non-006 RPCs
 
 Thus one paper position id corresponds to one paper exposure cycle only.
 
@@ -323,10 +324,11 @@ Fields:
 
 - id uuid PK
 - adapter_epoch_id
-- intent_origin `REFERENCE_EXIT | INVALID_RECOVERY`
+- intent_origin `REFERENCE_EXIT | INVALID_RECOVERY | INTEGRITY_CRITICAL`
 - exit_action_id uuid nullable references `paper_strategy_actions(id)`
 - linked_entry_action_id uuid nullable references `paper_strategy_actions(id)`
 - recovery_key text nullable
+- integrity_key text nullable
 - claimed_position_id uuid nullable references `paper_positions(id)`
 - strategy_version_id
 - pair
@@ -344,11 +346,14 @@ Constraints:
 
 - partial unique: `UNIQUE(exit_action_id) WHERE exit_action_id IS NOT NULL`
 - partial unique: `UNIQUE(recovery_key) WHERE recovery_key IS NOT NULL`
+- partial unique: `UNIQUE(integrity_key) WHERE integrity_key IS NOT NULL`
 - partial unique position claim: only one intent with status `OPEN | PAUSED | CRITICAL` may reference the same non-null `claimed_position_id`
 - `intent_origin='REFERENCE_EXIT'` requires non-null `exit_action_id`, `linked_entry_action_id`, and `reference_position_side`; `recovery_key` must be null
-- `intent_origin='INVALID_RECOVERY'` requires `exit_action_id IS NULL`, `linked_entry_action_id IS NULL`, and non-null canonical `recovery_key`
+- `intent_origin='INVALID_RECOVERY'` requires `exit_action_id IS NULL`, `linked_entry_action_id IS NULL`, non-null canonical `recovery_key`, and `integrity_key IS NULL`
+- `intent_origin='INTEGRITY_CRITICAL'` requires `exit_action_id IS NULL`, `recovery_key IS NULL`, non-null `integrity_key`, non-null `claimed_position_id`, and `status='CRITICAL'`; it creates no EXIT order automatically
 - for `REFERENCE_EXIT`, `locked_reduce_side` is immutable and derived from `reference_position_side`: LONG -> SELL, SHORT -> BUY
 - for `INVALID_RECOVERY`, `locked_reduce_side` is immutable and derived from the actual paper side observed under execution-fence + position lock
+- for `INTEGRITY_CRITICAL`, `locked_reduce_side` may be recorded from the claimed paper side for audit/recovery planning but must never auto-create an order while status remains CRITICAL
 
 One EXIT_TO_FLAT action creates exactly one `REFERENCE_EXIT` paper_exit_intent.
 
@@ -360,12 +365,19 @@ The recovery cutoff is deliberately **not** part of the key. Different workers/r
 
 Duplicate recovery workers must therefore collide on the same gap key and reuse the same intent/order.
 
+For orphan/cross-cycle paper exposure discovered by §9.1, use one canonical integrity owner:
+
+`integrity_key = SHA256("INTEGRITY_CRITICAL|" + strategy_version_id + "|" + pair + "|" + claimed_position_id)`
+
+Two §9.1 workers observing the same live paper position must collide on this key / `claimed_position_id` unique claim and reuse the same CRITICAL intent.
+
 ### 6.1 Position claim invariant
 
 Before any flatten intent may create or continue an EXIT order against non-zero paper exposure, it must atomically claim the locked current `paper_positions.id` in `claimed_position_id`.
 
 - `REFERENCE_EXIT` may claim only a position whose `paper_position_entry_ownership.entry_action_id == linked_entry_action_id`
 - `INVALID_RECOVERY` may claim the current position only when no other OPEN/PAUSED/CRITICAL intent already claims it
+- `INTEGRITY_CRITICAL` must atomically claim the live paper position in the same fence -> position transaction that creates/reuses the integrity intent
 - a claim conflict creates no second order and no economic effect
 - OPEN/PAUSED claim conflict with the true owner => wait/retry the current intent
 - a transition to `CRITICAL` while paper quantity is non-zero may commit only if that same transaction already owns or atomically acquires `claimed_position_id` for the live paper position
@@ -528,12 +540,19 @@ If any live `OPEN`/`PAUSED` EXIT intent exists, including a prior reference cycl
 
 Historical `SATISFIED` or `CRITICAL` EXIT intents are ignored by this fence lookup.
 
-If no live flatten intent exists but a paper position is already active:
+If no `OPEN`/`PAUSED` flatten intent exists but a paper position is already active:
 
 - do not create a second paper ENTRY
-- emit CRITICAL operational inconsistency
+- under the already-held execution fence, lock the active paper position
+- inspect `paper_position_entry_ownership` and existing OPEN/PAUSED/CRITICAL claims
+- if an existing OPEN/PAUSED/CRITICAL intent already claims that exact `paper_positions.id`, preserve/reuse that owner and create no second intent/order
+- otherwise create/reuse exactly one `INTEGRITY_CRITICAL` intent using the canonical `integrity_key` from §6, atomically setting `claimed_position_id` to the locked active position in the same transaction
+- the integrity intent status is `CRITICAL`; it creates **no automatic EXIT order**
+- the new reference ENTRY lifecycle is terminalized/fenced so it cannot later create exposure
 - do not flip or stack exposure
 - reference plane remains unchanged
+
+Thus §9.1 CRITICAL is never a log-only event when live paper qty exists; it is a durable single-owner claim under §6.1.
 
 Otherwise:
 
@@ -758,7 +777,37 @@ A recovery attempt:
 
 Recovery parity against `simulate_b_v1` is validated on synthetic fixtures only. The live blind ZEC forward window must not be replayed through the official runner as a parity/scoring shortcut.
 
-### 14.2 Same-epoch recovery when reference remains open
+### 14.2 Dispatch-enable frontier invariant
+
+Every transition that can make reference processing dispatch-eligible uses the same frontier rule, including:
+
+- initial bootstrap enable
+- INVALID same-epoch resume
+- recovery-flatten completion followed by resume
+- creation/enable of a new adapter epoch
+
+Definitions for each such transition:
+
+- `enable_commit_wall_time` = server wall-clock time captured inside the enable/resume transaction
+- `enable_frontier_5m` = the latest fully closed **exact 5m bar present in the adapter's verified immutable source series** at or before that commit wall time
+- the enable/resume cursor must be advanced internally through every verified bar up to `enable_frontier_5m`
+- all bars with open_time <= `enable_frontier_5m` are permanently non-dispatchable for that enable transition
+- no recovered/bootstrap cursor older than `enable_frontier_5m` may become the dispatch cursor
+- the first dispatch-eligible bar is the first newly closed expected 5m strictly after the committed `enable_frontier_5m`
+
+Internal recovery workers may replay to different historical cutoffs for verification. Those cutoffs are **never** dispatch-enable cursors by themselves.
+
+If reference is not in a state eligible for safe enable at `enable_frontier_5m`:
+
+- remain DISABLED/INVALID as applicable
+- continue consuming subsequent newly closed exact 5m bars internally only
+- every internally consumed bar remains non-dispatchable
+- enable only when a newly reached safe boundary satisfies the relevant ownership/paper-flat conditions
+- dispatch starts on the next newly closed expected 5m after that boundary
+
+This invariant forbids historical catch-up dispatch on every recovery/bootstrap/new-epoch path, not only first bootstrap.
+
+### 14.3 Same-epoch recovery when reference remains open
 
 If verified replay at the cutoff leaves reference `LONG` or `SHORT`, the current adapter epoch may return to `CONTIGUOUS` **without waiting for an invented FLAT boundary** only when the recovered open reference cycle is provably the same cycle that existed before the gap.
 
@@ -783,7 +832,10 @@ Example forbidden resume:
 
 The paper LONG still belongs to the old cycle. The adapter must remain INVALID; it must not treat that position as matching the new recovered LONG.
 
-Then, and only then, persist the recovered shadow/cursor and resume with the next future 5m bar.
+Then, and only then, the state is eligible for resume. Apply §14.2 dispatch-enable frontier before setting CONTIGUOUS:
+- advance internal reference state through the verified immutable source to the enable frontier
+- do not dispatch any bar already closed at enable commit
+- resume dispatch only on the first newly closed expected 5m strictly after the committed frontier.
 
 If recovered reference is LONG/SHORT but paper is flat, opposite-side, same-side-but-wrong-cycle, or otherwise not coherent:
 
@@ -791,18 +843,18 @@ If recovered reference is LONG/SHORT but paper is flat, opposite-side, same-side
 2. remain `INVALID`
 3. continue frozen incremental replay internally only as new exact 5m bars become available
 4. do not emit paper actions during that internal replay
-5. when replay first reaches a later verified reference `FLAT` boundary, execute the §14.3 decision under locks:
+5. when replay first reaches a later verified reference `FLAT` boundary, execute the §14.4 decision under locks:
    - if paper is already flat and no late ENTRY path/live flatten remains, recovery may proceed to coherent resume/new epoch
    - if paper is still open, first defer to any existing owner claim; otherwise create/reuse the one `INVALID_RECOVERY` flatten and reduce paper to zero
-6. only after the recovery flatten is safely SATISFIED (or paper was already safely flat) may §14.4 create a new epoch if an integrity reset is required
+6. only after the recovery flatten is safely SATISFIED (or paper was already safely flat) may §14.5 create a new epoch if an integrity reset is required
 
 The required sequence for a hidden `EXIT_TO_FLAT -> later same-side ENTRY` gap is therefore:
 
-`stay INVALID -> internal replay to later FLAT -> §14.3 flatten old/wrong-cycle paper if needed -> paper flat + no late-entry capability -> optional §14.4 new epoch`
+`stay INVALID -> internal replay to later FLAT -> §14.4 flatten old/wrong-cycle paper if needed -> paper flat + no late-entry capability -> optional §14.5 new epoch`
 
 At no point may recovery synthesize the hidden later ENTRY against a current book.
 
-### 14.3 Recovery-only flatten when replay reference is FLAT
+### 14.4 Recovery-only flatten when replay reference is FLAT
 
 If verified replay at the cutoff leaves reference `FLAT` but paper quantity is still > 0, historical dispatch suppression must not wedge paper.
 
@@ -835,22 +887,24 @@ This recovery intent uses the same reduce-only execution machinery but must rema
 
 While this recovery flatten is unresolved, reference processing remains INVALID.
 
-If replayed reference is FLAT, data is verified contiguous through the cutoff, paper is already flat, and no fill-capable ENTRY path/live flatten remains, the same epoch may return directly to CONTIGUOUS at the recovered cursor without creating a recovery intent.
+If replayed reference is FLAT, data is verified contiguous, paper is already flat, and no fill-capable ENTRY path/live flatten remains, the same epoch becomes eligible to resume without creating a recovery intent. It must still apply §14.2: the recovered historical cutoff is not a dispatch cursor; internal state advances to the enable frontier and dispatch begins only on the first newly closed expected 5m after that frontier.
 
-After a recovery flatten is safely complete, the same rule applies: if replayed reference is FLAT and all paper exposure/late-entry capability is gone, the same epoch may return to CONTIGUOUS at that recovered cursor.
+After a recovery flatten is safely complete, the same rule applies: if reference is FLAT and all paper exposure/late-entry capability is gone, the same epoch is only *eligible* to resume. §14.2 frontier processing is mandatory before CONTIGUOUS/dispatch is enabled.
 
 A new epoch at a later verified FLAT boundary is also allowed when an integrity reset is needed, but it is not the only legal way to clear paper exposure left by a suppressed historical exit.
 
-### 14.4 Future FLAT boundary / new epoch
+### 14.5 Future FLAT boundary / new epoch
 
 If recovered reference and paper cannot be made coherent without delayed historical ENTRY or a flip, recovery may continue internal replay until a future verified reference FLAT boundary.
 
-A new adapter epoch may begin there only if:
+A new adapter epoch may become eligible there only if:
 
 - current paper position is flat
 - no nonterminal paper ENTRY/EXIT/recovery-flatten order exists
 - no `OPEN`/`PAUSED` flatten intent remains
-- no critical adapter integrity issue remains
+- no CRITICAL claim/integrity issue remains
+
+Before committing/enabling that new epoch, §14.2 dispatch-enable frontier is mandatory. The epoch cursor cannot remain on the older recovered FLAT if later bars are already closed at enable commit; those bars are consumed internally/non-dispatchably through the frontier. Dispatch begins only on the first newly closed expected 5m after the committed frontier.
 
 No recovered historical B action is dispatched against a current book.
 ## 15. Blind protection strengthened for B runtime
@@ -934,6 +988,8 @@ Do not enable TEST-SPEC-002 runtime binding until all are true:
 - existing SPEC-004/005 validations remain clean
 
 ### 17.1 Initial bootstrap is not an ENTRY
+
+This is the first-use specialization of the global §14.2 dispatch-enable frontier invariant.
 
 Because paper runtime may be enabled after the official TEST-SPEC-002 fold has already started, the adapter must not assume reference `FLAT` at activation time and must never catch up historical paper actions against current books.
 
@@ -1020,7 +1076,7 @@ ENTRY lifecycle / same-bar:
 20. every reference ENTRY has a durable lifecycle row
 21. first economic ENTRY fill creates immutable paper-position ownership linked to that ENTRY action/order
 21a. closing a paper position permanently retires that `paper_positions.id`; a later ENTRY cycle inserts a new id and new ownership row
-21b. no SPEC-006 path can mutate a CLOSED position row back to an active state
+21b. DB transition guard rejects CLOSED -> any active paper position state from both SPEC-006 and legacy/non-006 paths
 22. later fills of the same ENTRY order reuse ownership; NEVER_CREATED_FENCED/no-fill ENTRY can never own a position
 23. same-bar ENTRY+EXIT persists lifecycle=`NEVER_CREATED_FENCED`
 24. same-bar ENTRY outbox retry permanently no-ops and never creates a delayed order
@@ -1033,7 +1089,8 @@ ENTRY lifecycle / same-bar:
 Fence scope / next cycles:
 30. prior `OPEN`/`PAUSED` flatten fences a new reference cycle paper ENTRY as `NEVER_CREATED_FENCED`
 31. that lagging new reference ENTRY is not CRITICAL solely because paper qty remains >0 under the live flatten
-32. paper qty >0 with **no** live flatten on new reference ENTRY => CRITICAL/no stack
+32. paper qty >0 with **no** live flatten on new reference ENTRY => exactly one claimed `INTEGRITY_CRITICAL` intent/no stack/no automatic EXIT order
+32a. two concurrent §9.1 workers collide on integrity_key/claimed_position_id and cannot mint two CRITICAL owners
 33. historical `SATISFIED` intent does not fence the next cycle
 34. historical `CRITICAL` intent does not act as perpetual fence; active-position/integrity guards still prevent stack/flip
 35. if a fenced newer reference cycle later emits EXIT while an older paper flatten is still live, the newer EXIT intent must not claim the older position
@@ -1063,6 +1120,8 @@ Kill switch / INVALID separation:
 
 Recovery:
 53. replay uses exact contiguous data through missing key and persists reference state/cursor only
+53a. every INVALID resume/recovery completion/new epoch enable applies §14.2 frontier; no already-closed post-recovery bar can become dispatch-eligible
+53b. two recovery workers may use different internal replay cutoffs but neither cutoff can become a past dispatch cursor
 54. replay emits no historical paper dispatch
 55. replay never copies official B output
 56. recovered LONG/SHORT may return same epoch to CONTIGUOUS only when recovered reference cycle identity is unchanged from pre-gap and paper is linked to that same ENTRY lifecycle
