@@ -321,6 +321,7 @@ Fields:
 - exit_action_id uuid nullable references `paper_strategy_actions(id)`
 - linked_entry_action_id uuid nullable references `paper_strategy_actions(id)`
 - recovery_key text nullable
+- claimed_position_id uuid nullable references `paper_positions(id)`
 - strategy_version_id
 - pair
 - reference_position_side LONG | SHORT nullable
@@ -337,6 +338,7 @@ Constraints:
 
 - partial unique: `UNIQUE(exit_action_id) WHERE exit_action_id IS NOT NULL`
 - partial unique: `UNIQUE(recovery_key) WHERE recovery_key IS NOT NULL`
+- partial unique position claim: only one intent with status `OPEN | PAUSED | CRITICAL` may reference the same non-null `claimed_position_id`
 - `intent_origin='REFERENCE_EXIT'` requires non-null `exit_action_id`, `linked_entry_action_id`, and `reference_position_side`; `recovery_key` must be null
 - `intent_origin='INVALID_RECOVERY'` requires `exit_action_id IS NULL`, `linked_entry_action_id IS NULL`, and non-null canonical `recovery_key`
 - for `REFERENCE_EXIT`, `locked_reduce_side` is immutable and derived from `reference_position_side`: LONG -> SELL, SHORT -> BUY
@@ -352,6 +354,22 @@ The recovery cutoff is deliberately **not** part of the key. Different workers/r
 
 Duplicate recovery workers must therefore collide on the same gap key and reuse the same intent/order.
 
+### 6.1 Position claim invariant
+
+Before any flatten intent may create or continue an EXIT order against non-zero paper exposure, it must atomically claim the locked current `paper_positions.id` in `claimed_position_id`.
+
+- `REFERENCE_EXIT` may claim only a position whose `paper_position_entry_ownership.entry_action_id == linked_entry_action_id`
+- `INVALID_RECOVERY` may claim the current position only when no other OPEN/PAUSED/CRITICAL intent already claims it
+- a claim conflict creates no second order and no economic effect
+- OPEN/PAUSED claim conflict with the true owner => wait/retry the current intent
+- CRITICAL claim conflict => do not steal the position; preserve the critical hold for explicit recovery
+- `SATISFIED` intent no longer blocks the partial unique claim index
+- claim identity is internal/blind-hidden
+
+This DB invariant is the final duplicate-flatten gate across multiple reference cycles, recovery workers, crashes and retries.
+
+### 6.2 Fence scope
+
 ### 6.1 Fence scope
 
 Only `OPEN` or `PAUSED` flatten intents, regardless of `intent_origin`, fence new paper ENTRY creation or ENTRY fill application.
@@ -360,7 +378,7 @@ Only `OPEN` or `PAUSED` flatten intents, regardless of `intent_origin`, fence ne
 
 `CRITICAL` still remains an operational fault. If paper exposure remains, the ordinary active-position / integrity guard prevents stacking or flipping; the historical CRITICAL intent itself is not used as a perpetual execution fence.
 
-### 6.2 Satisfaction
+### 6.3 Satisfaction
 
 For `REFERENCE_EXIT`, the intent target is:
 
@@ -571,7 +589,7 @@ Processing sequence:
 
 ### No paper position / qty zero
 
-Only if the full section 6.2 satisfaction predicate is true:
+Only if the full section 6.3 satisfaction predicate is true:
 
 - mark intent `SATISFIED`
 - audit `EXIT_NO_PAPER_POSITION` internally if no paper quantity ever existed
@@ -582,7 +600,7 @@ For `REFERENCE_EXIT`, if its linked lifecycle is missing, dispatch is still fill
 - keep intent OPEN/PAUSED
 - do not infer terminality from temporary qty=0
 
-For `INVALID_RECOVERY`, qty=0 is insufficient until **every** same-pair ENTRY lifecycle/order/attempt/reservation satisfies the section 6.2 recovery predicate.
+For `INVALID_RECOVERY`, qty=0 is insufficient until **every** same-pair ENTRY lifecycle/order/attempt/reservation satisfies the section 6.3 recovery predicate.
 
 ### Paper position exists and a live flatten already owns it
 
@@ -595,6 +613,7 @@ First read the immutable `paper_position_entry_ownership` row under the normal f
 For `REFERENCE_EXIT`:
 
 - it may act only when active paper-position ownership `entry_action_id == linked_entry_action_id`
+- before creating/continuing an EXIT order, atomically set/reuse `claimed_position_id` for that exact position; claim conflict creates no order
 - if its linked ENTRY lifecycle is `NEVER_CREATED_FENCED` / terminal-no-fill, it can never claim a position owned by another cycle
 - if the active paper position is owned by a different ENTRY and another `OPEN`/`PAUSED` flatten intent owns that ENTRY, this intent stays OPEN and creates **no** EXIT order; the owning flatten proceeds
 - if the active paper position is owned by a different ENTRY and no live flatten owns that exposure, set CRITICAL: this is unowned/cross-cycle paper exposure
@@ -605,8 +624,10 @@ For `REFERENCE_EXIT`:
 For `INVALID_RECOVERY`:
 
 - there is no reference side to compare against
-- it may take operational ownership only when the current paper position is **not already owned by another OPEN/PAUSED flatten intent**
-- if a live REFERENCE_EXIT/other flatten already owns the position, INVALID recovery creates no competing EXIT order and waits while that existing durable flatten continues
+- it may take operational ownership only when the current paper position is **not already claimed by another OPEN/PAUSED/CRITICAL flatten intent**
+- it must atomically set/reuse its own `claimed_position_id` before creating/continuing the recovery EXIT order
+- if another OPEN/PAUSED intent already claims the position, INVALID recovery creates no competing EXIT order and waits while that existing durable flatten continues
+- if a CRITICAL intent claims the position, INVALID recovery does not steal it; explicit critical recovery is required
 - otherwise current paper side must be reducible by the intent's immutable `locked_reduce_side`
 - if the current paper side has changed such that `locked_reduce_side` would increase/reverse exposure, set intent CRITICAL, create no order, and do not flip
 
@@ -645,7 +666,7 @@ Each EXIT attempt must use:
 
 `attempt_base_qty = current remaining locked paper base qty`
 
-Intent/order completion is governed by current fill-derived position truth plus the section 6.2 no-late-entry predicate, not by blindly reaching the original `intended_quantity`.
+Intent/order completion is governed by current fill-derived position truth plus the section 6.3 no-late-entry predicate, not by blindly reaching the original `intended_quantity`.
 ## 12. EXIT fill and partial continuation
 
 ENTRY completion remains quote-notional based.
@@ -682,7 +703,7 @@ Transient stale-snapshot, lease-loss or attempt failure does not mint another or
 
 Residual paper quantity keeps the intent unsatisfied.
 
-If paper qty reaches zero, do not mark the intent SATISFIED until the complete section 6.2 ENTRY-lifecycle/no-in-flight predicate is also true.
+If paper qty reaches zero, do not mark the intent SATISFIED until the complete section 6.3 ENTRY-lifecycle/no-in-flight predicate is also true.
 
 Dust/residual quantity is execution divergence, not a new alpha exit.
 ## 13. Gap definition and INVALID behavior
@@ -765,7 +786,8 @@ If verified replay at the cutoff leaves reference `FLAT` but paper quantity is s
 
 Under execution fence + shadow + paper-position lock, first inspect `paper_position_entry_ownership` and all OPEN/PAUSED flatten intents:
 
-- if an existing live flatten intent already owns the active paper position, do **not** create a competing recovery EXIT order; remain INVALID and let that durable intent continue
+- if an existing OPEN/PAUSED flatten intent already claims the active paper position, do **not** create a competing recovery EXIT order; remain INVALID and let that durable intent continue
+- if a CRITICAL intent claims the active position, do not steal it or auto-recover it through INVALID_RECOVERY
 - once that owner intent finishes, re-evaluate recovery from the now-current paper state
 - only when paper exposure is not already owned by a live flatten may recovery create/reuse the one gap-scoped operational recovery intent
 
@@ -978,55 +1000,56 @@ Fence scope / next cycles:
 
 Reduce-only / durable intent:
 37. one exit intent => at most one EXIT order enforced by schema unique constraint
-38. PAUSED resumes the same intent and same order; if order absent it is created once on first valid resume
-39. each attempt sizes from remaining locked base qty, not original `intended_quantity`
-40. each attempt has new attempt_seq + immutable book snapshot + current lease binding
-41. stale snapshot/lease failure creates no second order/economic effect
-42. partial EXIT uses same intent/order and leaves residual unsatisfied
-43. no over-close/no flip
-44. REFERENCE_EXIT side mismatch or INVALID_RECOVERY locked-reduce-side mismatch => CRITICAL/no order/no auto-SATISFIED
-45. reference FLAT alone never satisfies paper intent
+38. one non-zero paper position => at most one OPEN/PAUSED/CRITICAL flatten intent claim enforced by partial unique claimed_position_id
+39. PAUSED resumes the same intent and same order; if order absent it is created once on first valid resume
+40. each attempt sizes from remaining locked base qty, not original `intended_quantity`
+41. each attempt has new attempt_seq + immutable book snapshot + current lease binding
+42. stale snapshot/lease failure creates no second order/economic effect
+43. partial EXIT uses same intent/order and leaves residual unsatisfied
+44. no over-close/no flip
+45. REFERENCE_EXIT side mismatch or INVALID_RECOVERY locked-reduce-side mismatch => CRITICAL/no order/no auto-SATISFIED
+46. reference FLAT alone never satisfies paper intent
 
 Kill switch / INVALID separation:
-46. HALT_NEW_ENTRIES permits flatten-intent processing
-47. independent HALTED/RECOVERY_PENDING pauses the same intent
-48. `data_state=INVALID` by itself stops reference actions only
-49. an already OPEN/PAUSED flatten continues while reference is INVALID if global kill-switch permits
-50. true gap preserves reference_position_state and prior stop/extrema fields
-51. no interpolation/substitute/invented reference exit
+47. HALT_NEW_ENTRIES permits flatten-intent processing
+48. independent HALTED/RECOVERY_PENDING pauses the same intent
+49. `data_state=INVALID` by itself stops reference actions only
+50. an already OPEN/PAUSED flatten continues while reference is INVALID if global kill-switch permits
+51. true gap preserves reference_position_state and prior stop/extrema fields
+52. no interpolation/substitute/invented reference exit
 
 Recovery:
-52. replay uses exact contiguous data through missing key and persists reference state/cursor only
-53. replay emits no historical paper dispatch
-54. replay never copies official B output
-55. recovered LONG/SHORT may return same epoch to CONTIGUOUS only when recovered reference cycle identity is unchanged from pre-gap and paper is linked to that same ENTRY lifecycle
-56. replay that crosses EXIT then later same-side ENTRY must not accept the old same-side paper position as a match
-57. recovered LONG/SHORT + paper flat/opposite/wrong-cycle emits no delayed ENTRY/flip and remains INVALID
-58. recovered FLAT + paper open first defers to any existing live flatten that owns that position; otherwise it creates/reuses exactly one operational `INVALID_RECOVERY` intent via a gap-identity recovery_key that excludes recovery cutoff, with no reference action link
-59. recovery flatten is reduce-only/current-book/non-official and uses one order/many attempts; it cannot SATISFY until all old ENTRY lifecycles/orders/attempts on the pair are exposure-incapable
-60. recovery flatten completion can clear the wedge without fabricating a second reference EXIT
-61. new epoch at a future verified FLAT boundary remains available when coherence cannot otherwise be restored
+53. replay uses exact contiguous data through missing key and persists reference state/cursor only
+54. replay emits no historical paper dispatch
+55. replay never copies official B output
+56. recovered LONG/SHORT may return same epoch to CONTIGUOUS only when recovered reference cycle identity is unchanged from pre-gap and paper is linked to that same ENTRY lifecycle
+57. replay that crosses EXIT then later same-side ENTRY must not accept the old same-side paper position as a match
+58. recovered LONG/SHORT + paper flat/opposite/wrong-cycle emits no delayed ENTRY/flip and remains INVALID
+59. recovered FLAT + paper open first defers to any existing live flatten that owns that position; otherwise it creates/reuses exactly one operational `INVALID_RECOVERY` intent via a gap-identity recovery_key that excludes recovery cutoff, with no reference action link
+60. recovery flatten is reduce-only/current-book/non-official and uses one order/many attempts; it cannot SATISFY until all old ENTRY lifecycles/orders/attempts on the pair are exposure-incapable
+61. recovery flatten completion can clear the wedge without fabricating a second reference EXIT
+62. new epoch at a future verified FLAT boundary remains available when coherence cannot otherwise be restored
 
 Blind:
-62. no action/intent/order/fill/position rows or counts leak
-63. no internal fence code/idempotency key/linked id/pair/side/exact cursor leaks
-64. queue/worker/recon surfaces are category-only with B enabled
-65. logs redact B payloads, outbox bodies and constraint errors
-66. generic client errors reveal no B action timing/type
+63. no action/intent/order/fill/position rows or counts leak
+64. no internal fence code/idempotency key/linked id/pair/side/exact cursor leaks
+65. queue/worker/recon surfaces are category-only with B enabled
+66. logs redact B payloads, outbox bodies and constraint errors
+67. generic client errors reveal no B action timing/type
 
 Activation bootstrap:
-67. bootstrap replay emits no historical paper action/order/fill/dispatch
-68. bootstrap ending FLAT + paper flat initializes first epoch and dispatch starts only on next future 5m
-69. bootstrap ending LONG/SHORT keeps binding disabled until a verified future FLAT boundary; no delayed ENTRY
-70. bootstrap gap/integrity failure leaves runtime binding disabled
-71. bootstrap never calls official scoring or copies official B output
+68. bootstrap replay emits no historical paper action/order/fill/dispatch
+69. bootstrap ending FLAT + paper flat initializes first epoch and dispatch starts only on next future 5m
+70. bootstrap ending LONG/SHORT keeps binding disabled until a verified future FLAT boundary; no delayed ENTRY
+71. bootstrap gap/integrity failure leaves runtime binding disabled
+72. bootstrap never calls official scoring or copies official B output
 
 Regression:
-72. TEST-SPEC-002 11/11 smoke unchanged
-73. SPEC-004 smoke unchanged
-74. SPEC-005 smoke unchanged
-75. no official B performance data/scoring touched
-76. TEST-SPEC-002 runtime binding remains DISABLED
+73. TEST-SPEC-002 11/11 smoke unchanged
+74. SPEC-004 smoke unchanged
+75. SPEC-005 smoke unchanged
+76. no official B performance data/scoring touched
+77. TEST-SPEC-002 runtime binding remains DISABLED
 ## 19. Implementation order after lock-gate approval
 
 1. shadow state + execution fence + actions + exit-intent schema
