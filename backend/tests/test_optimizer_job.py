@@ -105,3 +105,39 @@ def test_combine_optimizer_lock_results_keeps_current_lock_and_all_coin_rows():
     assert combined["winner"] is None
     assert combined["strategy_code"] is None
     assert combined["job_verdict"] == "ŽIADNY PLATNÝ VARIANT"
+
+
+def test_optimizer_candle_downloads_are_bounded_and_concurrent():
+    pairs = ["NEAR/USDT", "SUI/USDT"]
+    versions = [{"settings": {"_universe": {"pairs": pairs, "lock": {
+        "expires_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat()}}}}]
+    request = OptimizerRequest(
+        settings=StrategySettings(timeframe="5m"),
+        pairs=pairs,
+        timeframes=["15m", "5m"],
+        history_days=1,
+        trials_per_market=1,
+    )
+    optimizer_jobs["test-bounded-downloads"] = {"created_at": "test"}
+    active = 0
+    max_active = 0
+
+    async def fetch(pair, timeframe, count, *args):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(.02)
+        active -= 1
+        return [{}] * count
+
+    result = {"winner": None, "qualified": False, "job_verdict": "ŽIADNY PLATNÝ VARIANT"}
+    with patch("app.main.supabase_get", new=AsyncMock(return_value=versions)), \
+         patch("app.main.supabase_upsert", new=AsyncMock()), \
+         patch("app.main.load_pair_cost_model", new=AsyncMock(return_value={"fee_rate": .001})), \
+         patch("app.main.load_okx_candles", new=AsyncMock(side_effect=fetch)) as load, \
+         patch("app.main.optimize", return_value=result):
+        asyncio.run(run_optimizer_job("test-bounded-downloads", request))
+
+    assert optimizer_jobs["test-bounded-downloads"]["status"] == "completed"
+    assert load.await_count == 4
+    assert max_active == 3
