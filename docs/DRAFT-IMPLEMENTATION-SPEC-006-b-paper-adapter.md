@@ -140,6 +140,8 @@ Fields:
 - trough_low nullable numeric
 - last_processed_5m_open_time nullable
 - last_processed_1h_close_time nullable
+- dispatch_frontier_5m_open_time nullable
+- dispatch_enable_commit_time nullable
 - invalid_reason nullable
 - invalid_at_5m_open_time nullable
 - state_version bigint
@@ -154,6 +156,7 @@ Important:
 
 - INVALID is a data state, not FLAT.
 - On a true data gap, preserve the last valid reference_position_state and reference fields.
+- `dispatch_frontier_5m_open_time` and `dispatch_enable_commit_time` are internal/blind-hidden durability fields; restart/retry must reload them before processing any bar.
 - No PnL fields exist.
 
 ### 3.2 paper_strategy_execution_fence
@@ -474,18 +477,19 @@ For each expected next 5m bar, one DB transaction/RPC must:
 
 1. lock the execution fence
 2. lock shadow state
-3. re-read `last_processed_5m_open_time` after both locks
+3. re-read `last_processed_5m_open_time`, `dispatch_frontier_5m_open_time`, and `dispatch_enable_commit_time` after both locks
 4. if another adapter already advanced the cursor, exit with no writes
-5. verify `data_state=CONTIGUOUS`
-6. verify current bar open_time is exactly the expected next 5m key
-7. compute frozen B transition for that bar
-8. insert zero, one, or two immutable actions
-9. create the durable ENTRY lifecycle for every emitted ENTRY action
-10. if EXIT_TO_FLAT is emitted, insert the unique `paper_exit_intent`
-11. for same-bar ENTRY+EXIT, persist the ENTRY lifecycle as `NEVER_CREATED_FENCED`
-12. insert durable `STRATEGY_ACTION_DISPATCH` outbox event(s)
-13. update shadow state and `last_processed_5m_open_time`
-14. commit all of the above atomically
+5. if the expected bar is at/before the persisted dispatch frontier or has `close_time <= dispatch_enable_commit_time`, route it to the internal non-emitting frontier-extension path; it may update shadow/cursor/frontier but must not create action/lifecycle/intent/outbox rows
+6. verify `data_state=CONTIGUOUS`
+7. verify current bar open_time is exactly the expected next 5m key
+8. compute frozen B transition for that bar
+9. insert zero, one, or two immutable actions
+10. create the durable ENTRY lifecycle for every emitted ENTRY action
+11. if EXIT_TO_FLAT is emitted, insert the unique `paper_exit_intent`
+12. for same-bar ENTRY+EXIT, persist the ENTRY lifecycle as `NEVER_CREATED_FENCED`
+13. insert durable `STRATEGY_ACTION_DISPATCH` outbox event(s)
+14. update shadow state and `last_processed_5m_open_time`
+15. commit all of the above atomically
 
 If ENTRY and same-bar initial-stop EXIT both occur:
 
@@ -795,14 +799,17 @@ Definitions for each such transition:
 
 - `enable_commit_wall_time` = server wall-clock time captured inside the enable/resume transaction
 - `enable_frontier_5m` = the latest fully closed **exact 5m bar present in the adapter's verified immutable source series** at or before that commit wall time
+- the transaction persists `dispatch_frontier_5m_open_time = enable_frontier_5m.open_time` and `dispatch_enable_commit_time = enable_commit_wall_time` before any dispatch can become enabled
 - the enable/resume cursor must be advanced internally through every verified bar up to `enable_frontier_5m`
 - any safe-enable decision made at an earlier recovery/bootstrap cutoff is provisional only
 - after internal advance reaches `enable_frontier_5m`, re-evaluate the full relevant reference-cycle identity, paper ownership/side/flatness, live-claim, late-ENTRY and integrity conditions under locks
 - if those conditions changed during internal advance, do not enable; follow the resulting INVALID/recovery path from the frontier state
 - all bars with open_time <= `enable_frontier_5m` are permanently non-dispatchable for that enable transition
+- any bar discovered after enable with `close_time <= dispatch_enable_commit_time` is a late historical frontier-extension bar: process it through frozen incremental reference logic **internally only**, updating shadow/cursor as needed but creating no `paper_strategy_actions`, ENTRY lifecycle, exit intent, or dispatch outbox
+- after any such late historical frontier-extension bar, advance the persisted frontier/cursor and re-evaluate safe-enable state before the next truly live bar
 - no recovered/bootstrap cursor older than `enable_frontier_5m` may become the dispatch cursor
 - the first dispatch-eligible bar is the first expected 5m strictly after the committed `enable_frontier_5m` whose candle `close_time > enable_commit_wall_time`
-- a candle that arrives late after enable but whose `close_time <= enable_commit_wall_time` is historical/non-dispatchable even if it was absent from the source at commit
+- a candle that arrives late after enable but whose `close_time <= enable_commit_wall_time` is historical/non-dispatchable even if it was absent from the source at commit; it must use the internal non-emitting frontier-extension path above, never the normal action transaction
 
 Internal recovery workers may replay to different historical cutoffs for verification. Those cutoffs are **never** dispatch-enable cursors by themselves.
 
@@ -1025,6 +1032,7 @@ If reference state at `bootstrap_cutoff_5m` is `FLAT`:
 
 - create the first `adapter_epoch_id`
 - persist shadow = CONTIGUOUS + FLAT with cursor exactly at `bootstrap_cutoff_5m`
+- persist `dispatch_frontier_5m_open_time = bootstrap_cutoff_5m.open_time` and `dispatch_enable_commit_time = bootstrap_commit_wall_time`
 - set paper activation time separately
 - enable runtime binding only after that commit
 - the **first dispatch-eligible bar is the first expected 5m strictly after the committed cutoff whose `close_time > bootstrap_commit_wall_time`**
@@ -1038,6 +1046,7 @@ If reference state at `bootstrap_cutoff_5m` is `LONG` or `SHORT`:
 - those internally consumed bars emit no paper action/dispatch
 - remain unbound until one of those newly closed bars produces the first verified reference FLAT boundary
 - commit the first epoch/cursor at that newly observed FLAT bar
+- in that enable commit, persist the new `dispatch_frontier_5m_open_time` and `dispatch_enable_commit_time`
 - enable runtime binding only after that FLAT commit
 - after the FLAT commit, capture the binding-enable commit wall time; the first dispatch-eligible bar is the next expected 5m after the FLAT cursor whose `close_time` is strictly later than that enable commit wall time
 
@@ -1133,6 +1142,7 @@ Recovery:
 53a. every INVALID resume/recovery completion/new epoch enable applies §14.2 frontier; no bar with close_time <= enable_commit_wall_time can become dispatch-eligible, even if it arrives late
 53a.1. all safe-enable ownership/reference/paper conditions are re-evaluated after internal advance reaches the frontier; pre-frontier eligibility cannot authorize dispatch
 53b. two recovery workers may use different internal replay cutoffs but neither cutoff can become a past dispatch cursor
+53c. dispatch frontier + enable commit time survive restart; a late-arriving pre-enable-closed bar is processed shadow-only with zero action/lifecycle/intent/outbox rows
 54. replay emits no historical paper dispatch
 55. replay never copies official B output
 56. recovered LONG/SHORT may return same epoch to CONTIGUOUS only when recovered reference cycle identity is unchanged from pre-gap and paper is linked to that same ENTRY lifecycle
@@ -1154,6 +1164,7 @@ Activation bootstrap:
 68. bootstrap replay emits no historical paper action/order/fill/dispatch
 68a. bootstrap cutoff is the latest fully closed exact 5m at bootstrap commit wall time, never an older convenient FLAT
 68b. no bar at or before bootstrap cutoff and no late-arriving bar with close_time <= bootstrap_commit_wall_time can ever become dispatch-eligible
+68c. bootstrap persists frontier + enable commit time before binding enable; restart cannot forget the no-catch-up boundary
 69. bootstrap ending FLAT + paper flat initializes first epoch at the cutoff and dispatch starts only on the first newly closed expected 5m strictly after it
 70. bootstrap ending LONG/SHORT keeps binding disabled; only subsequent newly closed bars are internally consumed until a newly observed FLAT, and dispatch begins only on the next newly closed 5m
 70a. there is no catch-up dispatch between any older FLAT and bootstrap/enable wall time
