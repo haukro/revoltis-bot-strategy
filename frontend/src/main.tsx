@@ -64,6 +64,10 @@ function App() {
   const [universeSaving, setUniverseSaving] = useState(false);
   const [activeUniverse, setActiveUniverse] = useState<any>(null);
   const [paperBotRunning, setPaperBotRunning] = useState(false);
+  const [paperForward, setPaperForward] = useState<any>(() => {
+    try { return JSON.parse(localStorage.getItem('nofomo-paper-forward-v1') || 'null'); }
+    catch { return null; }
+  });
   const [simulation, setSimulation] = useState<any>(null);
   const [lastRun, setLastRun] = useState<any>(null);
   const [isRunning, setIsRunning] = useState(false);
@@ -357,6 +361,69 @@ function App() {
       runAbortRef.current = null;
     }
   };
+  const startQualifiedPaperForward = async (rawResult: any) => {
+    const view = normalizeOptimizerResult(rawResult);
+    if (!view.qualified || !view.settings || !view.pair || isRunning) return;
+    const frozen: Config = { ...(view.settings as Config), selected_pairs: [view.pair], timeframe: view.timeframe };
+    const saved = paperForward && paperForward.version_id === view.version_id && paperForward.pair === view.pair ? paperForward : null;
+    const startedAt = Number(saved?.started_at || Date.now());
+    const paper = { version_id: view.version_id, pair: view.pair, timeframe: view.timeframe, variant: view.variant, started_at: startedAt, settings: frozen };
+    localStorage.setItem('nofomo-paper-forward-v1', JSON.stringify(paper));
+    setPaperForward(paper);
+    setConfig(frozen);
+    setMarketPair(view.pair);
+    setHistoricalMode(false);
+    setTimeLimited(false);
+    liveEnabledRef.current = true;
+    setIsRunning(true);
+    setRunStatus('running');
+
+    const runPaperOnce = async (): Promise<void> => {
+      if (!liveEnabledRef.current) return;
+      const now = Date.now();
+      const minutes = Number(String(frozen.timeframe).replace('m', '')) || 5;
+      const startup = Math.max(Number(frozen.bb_period || 20), Number(frozen.rsi_period || 14), Number(frozen.atr_period || 14)) + 5;
+      const warmupCandles = Math.max(100, startup + 20);
+      const dataStart = startedAt - warmupCandles * minutes * 60_000;
+      const wantedCandles = Math.ceil((now - dataStart) / (minutes * 60_000)) + 2;
+      const controller = new AbortController();
+      runAbortRef.current = controller;
+      setMessage(`Paper forward · ${view.pair} ${view.timeframe} v${view.variant} · od ${new Date(startedAt).toLocaleString('sk-SK')}`);
+      try {
+        const response = await fetch('/api/simulations/run', {
+          method: 'POST',
+          signal: controller.signal,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            settings: frozen,
+            candle_limit: Math.min(45000, Math.max(100, wantedCandles)),
+            start_time: dataStart,
+            end_time: now,
+            trading_start_time: startedAt,
+            force_close_at_end: false,
+            use_current_cost_model: true,
+          }),
+        });
+        if (!response.ok) throw new Error('paper_forward_failed');
+        const result = await response.json();
+        setSimulation(result);
+        setLastRun(result.run);
+        setRunStatus('running');
+        if (!liveEnabledRef.current) return;
+        setMessage(`Paper forward beží · ${view.pair} · ${result.metrics.closed_trades} uzatvorených obchodov · ďalšia kontrola o 1 minútu.`);
+        liveTimerRef.current = window.setTimeout(runPaperOnce, 60_000);
+      } catch (error: any) {
+        if (error?.name === 'AbortError') return;
+        liveEnabledRef.current = false;
+        setIsRunning(false);
+        setRunStatus('failed');
+        setMessage('Paper forward test sa nepodarilo vyhodnotiť. Reálne obchodovanie zostáva vypnuté.');
+      } finally {
+        runAbortRef.current = null;
+      }
+    };
+    await runPaperOnce();
+  };
   const stopSimulation = () => { liveEnabledRef.current = false; if (liveTimerRef.current !== null) window.clearTimeout(liveTimerRef.current); liveTimerRef.current = null; runAbortRef.current?.abort(); runAbortRef.current = null; setIsRunning(false); setRunStatus('stopped'); setMessage('Simulácia bola zastavená.'); };
   useEffect(() => () => { liveEnabledRef.current = false; if (liveTimerRef.current !== null) window.clearTimeout(liveTimerRef.current); if (optimizerTimerRef.current !== null) window.clearTimeout(optimizerTimerRef.current); runAbortRef.current?.abort(); }, []);
   const setQuickRange = (hours: number) => { const now = Date.now(); setTestStart(inputDateTime(new Date(now))); setTestEnd(inputDateTime(new Date(now + hours * 60 * 60 * 1000))); };
@@ -403,7 +470,7 @@ function App() {
       {dashboard?.persistence?.durable === false && <p className="diagnostics-missing" role="status">persistence_unavailable · Režim demo. Lock nemá trvalé uloženie v Supabase a po cold starte sa môže stratiť. Uloženie nového locku a nový job sú v produkcii pozastavené.</p>}
       {optimizer?.status === 'running' && <div className="optimizer-progress"><div><span style={{ width: `${optimizer.progress || 0}%` }} /></div><p>{optimizer.message} · {optimizer.progress || 0} %</p></div>}
       {optimizer?.status === 'failed' && <div className="optimizer-error">Optimalizácia zlyhala: {optimizer.message}</div>}
-      {optimizer?.result?.selection_policy_version === 4 && optimizer?.result?.version_id === activeUniverse?.version_id && <AlgorithmResult result={optimizer.result} onCopy={copyAlgorithm} />}
+      {optimizer?.result?.selection_policy_version === 4 && optimizer?.result?.version_id === activeUniverse?.version_id && <AlgorithmResult result={optimizer.result} onCopy={copyAlgorithm} onPaper={() => startQualifiedPaperForward(optimizer.result)} paperForward={paperForward} />}
     </section>
     <section className="panel market-panel"><div className="section-title"><span>LIVE</span><div><h3>Aktuálne sviečky z burzy</h3><p>Verejné spot dáta OKX · bez API kľúča · {config.timeframe}</p></div><select className="market-pair" value={marketPair} onChange={event => setMarketPair(event.target.value)}>{selected.map(pair => <option key={pair}>{pair}</option>)}</select></div><MarketChart market={market} error={marketError} />{simulation && <div className="simulation-result"><b>Výsledok poslednej simulácie · {currentPair}</b><span>Hodnota portfólia: {metrics.portfolio_value} USDT</span><span>Zisk/strata: {metrics.realized_profit >= 0 ? '+' : ''}{metrics.realized_profit} USDT</span><span>Obchody: {metrics.closed_trades}</span><span>Drawdown: {metrics.max_drawdown_percent} %</span>{currentCoverage && <span className={currentCoverage.complete ? 'positive' : 'negative'}>Dáta: {currentCoverage.candles}/{currentCoverage.expected_candles} sviečok {currentCoverage.complete ? '✓' : '⚠'}</span>}</div>}</section>
     <section className="workspace"><aside className="settings panel"><div className="section-title"><span>01</span><div><h3>Konfigurátor stratégie</h3><p>Vyber coiny a hranice simulácie.</p></div></div><div className="universe-actions"><button className="ghost" onClick={proposeUniverse} disabled={universeLoading || universeSaving || optimizerRunning || isRunning}>{universeLoading ? 'Skenujem celý trh…' : 'Nájsť top 5'}</button>{universeProposal?.status === 'ok' && <button onClick={acceptUniverse} disabled={universeSaving || optimizerRunning || isRunning}>{universeSaving ? 'Zamykám…' : 'Zamknúť top 5'}</button>}</div>{universeProposal && <div className={`universe-proposal ${universeProposal.status}`}><b>{universeProposal.status === 'ok' ? 'Auto Market Scanner · top 5' : 'Scanner nenašiel vhodný výber'}</b><p>{universeProposal.message}</p>{universeProposal.scanner && <small>OKX USDT {universeProposal.scanner.usdt_markets_scanned} · po filtroch {universeProposal.scanner.eligible_universe} · shortlist {universeProposal.scanner.shortlist_size} · detail {universeProposal.scanner.deep_scan_size}</small>}{universeProposal.status !== 'ok' && universeProposal.scanner?.rejection_summary && <small>Najčastejšie vyradenia: {Object.entries(universeProposal.scanner.rejection_summary).sort((a: any,b: any) => Number(b[1])-Number(a[1])).slice(0,3).map(([key,value]) => `${key} ${value}`).join(' · ')}</small>}{universeProposal.picks?.map((item: any) => <span key={item.pair}>{item.pair} <strong>{item.score}/100</strong><small>spread {(item.spread_ratio * 100).toFixed(3)} % · ATR {(item.atr_ratio * 100).toFixed(2)} %</small></span>)}</div>}<p className="universe-lock" role="status">{universeLocked ? `Zamknuté na 24 h: ${activeUniverse.pairs.join(', ')}.` : 'Najprv nechaj Auto Market Scanner vybrať top 5 a zamkni ich.'}</p><h4>Vybrané coiny <small>{selected.length}</small></h4><div className="coin-grid">{availableCoins.map(coin => <label className={selected.includes(coin) ? 'coin active' : 'coin'} key={coin}><input type="checkbox" disabled={universeLocked || optimizerRunning || universeSaving} checked={selected.includes(coin)} onChange={event => update('selected_pairs', event.target.checked ? [...selected, coin] : selected.filter(item => item !== coin))} /><span>{coin.replace('/USDT', '')}</span><small>USDT</small></label>)}</div>{groups.map(([title, keys]) => <details key={title} open={title === 'Kapitál a limity'}><summary>{title}<span>⌄</span></summary><div className="field-grid">{keys.map(key => <label key={key}>{fields[key]}{key === 'timeframe' ? <select value={String(config[key])} onChange={event => update(key, event.target.value)}>{['1m', '3m', '5m', '15m'].map(value => <option key={value}>{value}</option>)}</select> : <div className="number"><input type="number" value={Number(config[key])} step="0.01" onChange={event => update(key, Number(event.target.value))} /><span>{key.includes('percent') || key.includes('ratio') || key.includes('stop') || key.includes('trailing') || key.includes('rebound') ? '%' : key.includes('capital') || key.includes('amount') || key.includes('volume') ? 'USDT' : ''}</span></div>}</label>)}</div></details>)}</aside>
@@ -473,7 +540,7 @@ function FreqtradeVisual({ result, activeVersionId, activePairs, timeframe }: { 
     </div>
   </section>;
 }
-function AlgorithmResult({ result, onCopy }: { result: any, onCopy: () => void }) {
+function AlgorithmResult({ result, onCopy, onPaper, paperForward }: { result: any, onCopy: () => void, onPaper: () => void, paperForward: any }) {
   const view = normalizeOptimizerResult(result);
   const m = view.holdout_metrics;
   const parameterKeys = ['bb_period', 'bb_deviation', 'rsi_period', 'rsi_oversold', 'atr_period', 'atr_min_percent', 'atr_max_percent', 'min_volume_ratio', 'rebound_min_percent', 'rebound_max_percent', 'stop_loss_percent', 'trailing_start_percent', 'trailing_distance_percent', 'max_no_trail_hours'];
@@ -484,7 +551,7 @@ function AlgorithmResult({ result, onCopy }: { result: any, onCopy: () => void }
       {!view.qualified && <p>Víťaz: žiadny. Diagnostika variantu: {view.pair} · {view.timeframe}</p>}
       <p>{view.method} · {view.tested_combinations} otestovaných kombinácií</p>
       <p>{view.qualified ? view.verdict : 'Parametre sa vyberajú vo validácii. Neúspešný holdout nespustí hľadanie náhradníka.'}</p>
-    </div><button onClick={onCopy} disabled={!view.qualified || !view.strategy_code}>Kopírovať algoritmus</button></div>
+    </div><div className="result-actions"><button className="run-button" onClick={onPaper} disabled={!view.qualified}>{paperForward?.version_id === view.version_id && paperForward?.pair === view.pair ? '▶ Pokračovať paper test' : '▶ Spustiť paper test'}</button><button className="ghost" onClick={onCopy} disabled={!view.qualified || !view.strategy_code}>Kopírovať algoritmus</button></div></div>
     <p className="validation-counts">Validačné obchody: {view.validation_trade_count}/40 · Holdout: {view.holdout_visible ? `${m.closed_trades || 0}/10` : '— (nevyhodnotený)'} · Policy v4 · 5× WF OOS</p>
     <div className="result-metrics">
       <div><span>Čistý zisk/strata holdoutu</span><b>{m.realized_profit ?? '—'} USDT</b><small>{view.holdout_profit_percent ?? '—'} % kapitálu</small></div>
