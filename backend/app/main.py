@@ -162,7 +162,9 @@ class SimulationRequest(BaseModel):
     candle_limit: int = Field(default=500, ge=100, le=45000)
     start_time: int | None = Field(default=None, ge=0)
     end_time: int | None = Field(default=None, ge=0)
+    trading_start_time: int | None = Field(default=None, ge=0)
     force_close_at_end: bool = False
+    use_current_cost_model: bool = False
 
 
 class OptimizerRequest(BaseModel):
@@ -2226,7 +2228,22 @@ async def run_standalone_simulation(request: SimulationRequest):
             "first_open_time": candles[0]["open_time"] if candles else None,
             "last_close_time": candles[-1]["close_time"] if candles else None,
         }
-    result = simulate(dict(zip(pairs, candle_sets)), settings, force_close_at_end=request.force_close_at_end)
+    cost_models = None
+    if request.use_current_cost_model:
+        try:
+            cost_models = {
+                pair: await load_pair_cost_model(pair, float(settings["stake_amount"]))
+                for pair in pairs
+            }
+        except (httpx.HTTPError, ValueError, KeyError) as error:
+            raise HTTPException(502, f"Paper cost model nie je dostupný: {error}")
+    result = simulate(
+        dict(zip(pairs, candle_sets)),
+        settings,
+        force_close_at_end=request.force_close_at_end,
+        trading_start_time=request.trading_start_time,
+        cost_models=cost_models,
+    )
     if result["equity_curve"] and request.start_time:
         start_iso = datetime.fromtimestamp(request.start_time / 1000, UTC).isoformat()
         result["equity_curve"][0]["time"] = start_iso
@@ -2236,7 +2253,7 @@ async def run_standalone_simulation(request: SimulationRequest):
     if result["trades"]:
         await supabase_upsert_many("simulated_trades", result["trades"])
     now = datetime.now(UTC).isoformat()
-    record = {"id": str(uuid4()), "status": "completed", "started_at": now, "finished_at": now, "test_start": request.start_time, "test_end": request.end_time, "timeframe": settings["timeframe"], "pairs": pairs, "summary": result["metrics"], "progress": {"equity_curve": result["equity_curve"], "per_pair_metrics": result["per_pair_metrics"], "per_pair_equity_curves": result["per_pair_equity_curves"], "data_coverage": data_coverage, "rejections": result["rejections"]}}
+    record = {"id": str(uuid4()), "status": "completed", "started_at": now, "finished_at": now, "test_start": request.start_time, "test_end": request.end_time, "timeframe": settings["timeframe"], "pairs": pairs, "summary": result["metrics"], "progress": {"equity_curve": result["equity_curve"], "per_pair_metrics": result["per_pair_metrics"], "per_pair_equity_curves": result["per_pair_equity_curves"], "data_coverage": data_coverage, "rejections": result["rejections"], "trading_start_time": request.trading_start_time, "paper_forward": bool(request.trading_start_time), "cost_model": "current_okx_book" if request.use_current_cost_model else "simulation_default"}}
     await supabase_upsert("simulation_runs", record)
     return {"source": "OKX public spot API", "timeframe": settings["timeframe"], "mode": "simulation", "live_trading": False, "data_coverage": data_coverage, "run": record, **result}
 
