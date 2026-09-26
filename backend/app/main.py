@@ -4707,6 +4707,18 @@ async def finalize_optimizer(request: OptimizerFinalizeRequest):
     combined.pop("trades", None)
     combined.pop("top_results", None)
 
+    # A qualified source row may embed the entire selected variant again under
+    # "winner", including trade tape and replay snapshots. Keep only the stable
+    # identity fields in the aggregate; top-level settings/strategy_code/metrics
+    # already contain everything required by the UI and export.
+    winner = combined.get("winner")
+    if isinstance(winner, dict):
+        combined["winner"] = {
+            key: winner.get(key)
+            for key in ("pair", "timeframe", "variant", "variant_id", "settings_sha256")
+            if winner.get(key) is not None
+        }
+
     now = datetime.now(UTC).isoformat()
     aggregate_record = {
         "id": aggregate_id,
