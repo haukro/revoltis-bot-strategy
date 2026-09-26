@@ -120,7 +120,9 @@ class StrategyVersionCreate(BaseModel):
 
 class UniversePickRequest(BaseModel):
     quote_ccy: str = "USDT"
-    max_picks: int = Field(5, ge=1, le=8)
+    max_picks: int = Field(5, ge=1, le=10)
+    shortlist_size: int = Field(30, ge=10, le=50)
+    deep_scan_size: int = Field(12, ge=5, le=20)
     timeframe: Literal["5m", "15m"] = "5m"
     trade_notional_usdt: float = Field(50, ge=5, le=10000)
     lookback_hours: int = Field(48, ge=24, le=72)
@@ -2085,10 +2087,27 @@ async def pick_market_universe(request: UniversePickRequest):
         else:
             candidates.append(row)
 
-    candidates.sort(key=lambda item: item["volume_24h"], reverse=True)
-    # Books and candles are expensive and rate-limited. The liquid top 12 form
-    # the actual detailed candidate pool; no missing member may be ignored.
-    candidate_pool = candidates[:12]
+    # Stage 1: score the complete eligible OKX USDT universe using only cheap
+    # instrument/ticker data. This prevents the expensive deep scan from being
+    # biased toward volume alone while keeping the request bounded.
+    stable_bases = {"USDC", "DAI", "FDUSD", "TUSD", "PYUSD", "USDE", "USDS", "EUR", "USD"}
+    candidates = [row for row in candidates if row["base_ccy"] not in stable_bases]
+    volumes = [row["volume_24h"] for row in candidates]
+    spreads = [row["spread_ratio"] for row in candidates]
+    moves = [abs(row["change_24h_ratio"]) for row in candidates]
+    for row in candidates:
+        volume_score = percentile_rank(volumes, row["volume_24h"]) if volumes else 0.0
+        spread_score = percentile_rank(spreads, row["spread_ratio"], True) if spreads else 0.0
+        # Prefer enough movement to trade, but avoid ranking the most explosive
+        # pair first merely because it moved the most in 24h.
+        move_score = min(1.0, abs(row["change_24h_ratio"]) / .06)
+        row["pre_score"] = round((.55 * volume_score + .30 * spread_score + .15 * move_score) * 100, 2)
+
+    candidates.sort(key=lambda item: (item["pre_score"], item["volume_24h"]), reverse=True)
+    preliminary = candidates[:request.shortlist_size]
+    # Stage 2: order book + candles are much more expensive. Deep-scan the best
+    # subset of the top-30/50 shortlist, then apply ATR/regime/correlation rules.
+    candidate_pool = preliminary[:min(request.deep_scan_size, len(preliminary))]
     candle_count = math.ceil(request.lookback_hours * 3_600_000 / TIMEFRAME_MILLISECONDS[request.timeframe]) + 2
     end_time = int(now.timestamp() * 1000)
     start_time = end_time - request.lookback_hours * 3_600_000
@@ -2133,7 +2152,7 @@ async def pick_market_universe(request: UniversePickRequest):
             detailed.append(result)
 
     proposal_id = str(uuid4())
-    base_response = {"proposal_id": proposal_id, "generated_at": now.isoformat(), "source": "OKX public spot API", "status": "ok", "picks": [], "rejected": rejected, "data_quality": {"candidate_pool": len(candidate_pool), "complete_candidates": len(detailed), "incomplete_pairs": data_errors}, "lock": {"hours": request.lock_hours, "expires_at": (now + timedelta(hours=request.lock_hours)).isoformat()}, "method": {"weights": {"volume": .30, "spread": .25, "range": .20, "atr_fit": .15, "bb_crosses": .10}, "max_correlation": request.max_pairwise_correlation}}
+    base_response = {"proposal_id": proposal_id, "generated_at": now.isoformat(), "source": "OKX public spot API", "status": "ok", "picks": [], "rejected": rejected, "scanner": {"eligible_universe": len(candidates), "shortlist_size": len(preliminary), "deep_scan_size": len(candidate_pool), "requested_picks": request.max_picks}, "data_quality": {"candidate_pool": len(candidate_pool), "complete_candidates": len(detailed), "incomplete_pairs": data_errors}, "lock": {"hours": request.lock_hours, "expires_at": (now + timedelta(hours=request.lock_hours)).isoformat()}, "method": {"stage1_weights": {"volume": .55, "spread": .30, "movement": .15}, "weights": {"volume": .30, "spread": .25, "range": .20, "atr_fit": .15, "bb_crosses": .10}, "max_correlation": request.max_pairwise_correlation}}
     if data_errors or len(detailed) < request.max_picks:
         return {**base_response, "status": "degraded_no_pick" if data_errors else "no_pick", "message": "Návrh sa nevytvoril, pretože údaje kandidátov nie sú úplné." if data_errors else "Tvrdé filtre prešlo príliš málo trhov."}
 
@@ -2166,7 +2185,7 @@ async def pick_market_universe(request: UniversePickRequest):
         remaining = [item for item in scored if item["pair"] != chosen["pair"]]
     base_response["method"]["correlation_penalty_points"] = 10
     public_picks = [{key: value for key, value in item.items() if key != "returns_by_time"} for item in picks]
-    return {**base_response, "status": "ok" if len(public_picks) >= 3 else "no_pick", "message": "Návrh je pripravený na potvrdenie." if len(public_picks) >= 3 else "Po korelačnom filtri ostali menej než tri trhy.", "picks": public_picks}
+    return {**base_response, "status": "ok" if len(public_picks) >= 3 else "no_pick", "message": f"Scanner prešiel celý OKX USDT universe, vytvoril top {len(preliminary)} shortlist a vybral {len(public_picks)} trhov." if len(public_picks) >= 3 else "Po korelačnom filtri ostali menej než tri trhy.", "picks": public_picks}
 
 
 @app.post("/api/simulations/run")
