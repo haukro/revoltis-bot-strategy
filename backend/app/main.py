@@ -2230,13 +2230,20 @@ async def run_standalone_simulation(request: SimulationRequest):
         }
     cost_models = None
     if request.use_current_cost_model:
-        try:
-            cost_models = {
-                pair: await load_pair_cost_model(pair, float(settings["stake_amount"]))
-                for pair in pairs
-            }
-        except (httpx.HTTPError, ValueError, KeyError) as error:
-            raise HTTPException(502, f"Paper cost model nie je dostupný: {error}")
+        cost_models = {}
+        for pair in pairs:
+            last_error: Exception | None = None
+            for attempt in range(2):
+                try:
+                    cost_models[pair] = await load_pair_cost_model(pair, float(settings["stake_amount"]))
+                    last_error = None
+                    break
+                except (httpx.HTTPError, ValueError, KeyError) as error:
+                    last_error = error
+                    if attempt == 0:
+                        await asyncio.sleep(.6)
+            if last_error is not None:
+                raise HTTPException(502, f"Paper cost model nie je dostupný pre {pair}: {last_error}")
     result = simulate(
         dict(zip(pairs, candle_sets)),
         settings,
