@@ -414,10 +414,10 @@ function App() {
         liveTimerRef.current = window.setTimeout(runPaperOnce, 60_000);
       } catch (error: any) {
         if (error?.name === 'AbortError') return;
-        liveEnabledRef.current = false;
-        setIsRunning(false);
-        setRunStatus('failed');
-        setMessage('Paper forward test sa nepodarilo vyhodnotiť. Reálne obchodovanie zostáva vypnuté.');
+        if (!liveEnabledRef.current) return;
+        setRunStatus('running');
+        setMessage('Paper forward pokračuje. Posledné vyhodnotenie zlyhalo dočasne; ďalší pokus o 1 minútu. Reálne obchodovanie je vypnuté.');
+        liveTimerRef.current = window.setTimeout(runPaperOnce, 60_000);
       } finally {
         runAbortRef.current = null;
       }
