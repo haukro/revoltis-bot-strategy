@@ -243,3 +243,5 @@ def test_finalize_batches_source_runs_and_avoids_broad_optimizer_scan():
     assert "replay_snapshots" not in result["result"]
     assert "variant_results" not in result["result"]
     assert "trades" not in result["result"]
+    if result["result"].get("winner"):
+        assert set(result["result"]["winner"]) <= {"pair", "timeframe", "variant", "variant_id", "settings_sha256"}
