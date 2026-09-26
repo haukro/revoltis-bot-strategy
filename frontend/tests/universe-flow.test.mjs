@@ -17,6 +17,28 @@ async function handler(name, nextName, environment) {
   return new Function(...Object.keys(environment), compiled)(...Object.values(environment));
 }
 
+test('auto market scanner requests top-30 shortlist and 24h lock', async () => {
+  const calls = []; const state = {};
+  const propose = await handler('proposeUniverse', 'acceptUniverse', {
+    config: { timeframe: '5m', stake_amount: 50 }, universeLoading: false,
+    setUniverseLoading: value => { state.loading = value; },
+    setUniverseProposal: value => { state.proposal = value; },
+    setMessage: value => { state.message = value; },
+    fetch: async (url, options) => {
+      calls.push({ url, body: JSON.parse(options.body) });
+      return response({ status: 'ok', scanner: { usdt_markets_scanned: 200, eligible_universe: 42, shortlist_size: 30, deep_scan_size: 12 }, picks: pairs.map(pair => ({ pair })) });
+    },
+  });
+  await propose();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, '/api/market/universe/pick');
+  assert.equal(calls[0].body.max_picks, 5);
+  assert.equal(calls[0].body.shortlist_size, 30);
+  assert.equal(calls[0].body.deep_scan_size, 12);
+  assert.equal(calls[0].body.lock_hours, 24);
+  assert.equal(state.loading, false);
+});
+
 test('apply proposal saves and activates in one request without reloading stale defaults', async () => {
   const calls = []; const state = {};
   const apply = await handler('acceptUniverse', 'compare', {
