@@ -551,7 +551,7 @@ function AlgorithmResult({ result, onCopy, onPaper, paperForward }: { result: an
       {!view.qualified && <p>Víťaz: žiadny. Diagnostika variantu: {view.pair} · {view.timeframe}</p>}
       <p>{view.method} · {view.tested_combinations} otestovaných kombinácií</p>
       <p>{view.qualified ? view.verdict : 'Parametre sa vyberajú vo validácii. Neúspešný holdout nespustí hľadanie náhradníka.'}</p>
-    </div><div className="result-actions"><button className="run-button" onClick={onPaper} disabled={!view.qualified}>{paperForward?.version_id === view.version_id && paperForward?.pair === view.pair ? '▶ Pokračovať paper test' : '▶ Spustiť paper test'}</button><button className="ghost" onClick={onCopy} disabled={!view.qualified || !view.strategy_code}>Kopírovať algoritmus</button></div></div>
+    </div><div className="result-actions">{(!paperForward || paperForward.version_id !== view.version_id || paperForward.pair !== view.pair) && <button className="run-button" onClick={onPaper} disabled={!view.qualified}>▶ Spustiť paper test</button>}<button className="ghost" onClick={onCopy} disabled={!view.qualified || !view.strategy_code}>Kopírovať algoritmus</button></div></div>
     <p className="validation-counts">Validačné obchody: {view.validation_trade_count}/40 · Holdout: {view.holdout_visible ? `${m.closed_trades || 0}/10` : '— (nevyhodnotený)'} · Policy v4 · 5× WF OOS</p>
     <div className="result-metrics">
       <div><span>Čistý zisk/strata holdoutu</span><b>{m.realized_profit ?? '—'} USDT</b><small>{view.holdout_profit_percent ?? '—'} % kapitálu</small></div>
