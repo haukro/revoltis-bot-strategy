@@ -26,7 +26,7 @@ test('auto market scanner requests top-30 shortlist and 24h lock', async () => {
     setMessage: value => { state.message = value; },
     fetch: async (url, options) => {
       calls.push({ url, body: JSON.parse(options.body) });
-      return response({ status: 'ok', scanner: { usdt_markets_scanned: 200, eligible_universe: 42, shortlist_size: 30, deep_scan_size: 12 }, picks: pairs.map(pair => ({ pair })) });
+      return response({ status: 'ok', scanner: { usdt_markets_scanned: 200, eligible_universe: 42, shortlist_size: 30, deep_scan_size: 20 }, picks: pairs.map(pair => ({ pair })) });
     },
   });
   await propose();
@@ -34,7 +34,7 @@ test('auto market scanner requests top-30 shortlist and 24h lock', async () => {
   assert.equal(calls[0].url, '/api/market/universe/pick');
   assert.equal(calls[0].body.max_picks, 5);
   assert.equal(calls[0].body.shortlist_size, 30);
-  assert.equal(calls[0].body.deep_scan_size, 12);
+  assert.equal(calls[0].body.deep_scan_size, 20);
   assert.equal(calls[0].body.lock_hours, 24);
   assert.equal(state.loading, false);
 });
