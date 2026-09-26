@@ -4666,6 +4666,15 @@ async def finalize_optimizer(request: OptimizerFinalizeRequest):
     )
     combined["source_job_ids"] = source_job_ids
 
+    # Aggregate rows are a dashboard/result summary, not a second archive of
+    # every 90d source payload. Source jobs already retain full variant tables,
+    # trade tapes and replay snapshots. Re-embedding those large blobs here can
+    # make the Supabase upsert exceed the serverless read/write timeout.
+    combined.pop("replay_snapshots", None)
+    combined.pop("variant_results", None)
+    combined.pop("trades", None)
+    combined.pop("top_results", None)
+
     now = datetime.now(UTC).isoformat()
     aggregate_record = {
         "id": aggregate_id,

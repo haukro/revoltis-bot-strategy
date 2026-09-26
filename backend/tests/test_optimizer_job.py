@@ -240,3 +240,6 @@ def test_finalize_batches_source_runs_and_avoids_broad_optimizer_scan():
     assert "order=finished_at.desc&limit=100" not in [query for _, query in queries]
     assert result["result"]["version_id"] == version_id
     assert result["result"]["locked_pairs"] == pairs
+    assert "replay_snapshots" not in result["result"]
+    assert "variant_results" not in result["result"]
+    assert "trades" not in result["result"]
