@@ -2057,11 +2057,13 @@ async def pick_market_universe(request: UniversePickRequest):
     instruments = {item.get("instId"): item for item in instrument_payload.get("data", [])}
     rejected: list[dict[str, Any]] = []
     candidates: list[dict[str, Any]] = []
+    usdt_markets_scanned = 0
     for ticker in ticker_payload.get("data", []):
         inst_id = str(ticker.get("instId", ""))
         instrument = instruments.get(inst_id, {})
         if not inst_id.endswith("-USDT") or instrument.get("state") != "live":
             continue
+        usdt_markets_scanned += 1
         base = str(instrument.get("baseCcy") or inst_id.split("-")[0])
         reasons = []
         if re.search(r"(?:3|5)[LS]$", base): reasons.append("leveraged_token")
@@ -2152,7 +2154,7 @@ async def pick_market_universe(request: UniversePickRequest):
             detailed.append(result)
 
     proposal_id = str(uuid4())
-    base_response = {"proposal_id": proposal_id, "generated_at": now.isoformat(), "source": "OKX public spot API", "status": "ok", "picks": [], "rejected": rejected, "scanner": {"eligible_universe": len(candidates), "shortlist_size": len(preliminary), "deep_scan_size": len(candidate_pool), "requested_picks": request.max_picks}, "data_quality": {"candidate_pool": len(candidate_pool), "complete_candidates": len(detailed), "incomplete_pairs": data_errors}, "lock": {"hours": request.lock_hours, "expires_at": (now + timedelta(hours=request.lock_hours)).isoformat()}, "method": {"stage1_weights": {"volume": .55, "spread": .30, "movement": .15}, "weights": {"volume": .30, "spread": .25, "range": .20, "atr_fit": .15, "bb_crosses": .10}, "max_correlation": request.max_pairwise_correlation}}
+    base_response = {"proposal_id": proposal_id, "generated_at": now.isoformat(), "source": "OKX public spot API", "status": "ok", "picks": [], "rejected": rejected, "scanner": {"usdt_markets_scanned": usdt_markets_scanned, "eligible_universe": len(candidates), "shortlist_size": len(preliminary), "deep_scan_size": len(candidate_pool), "requested_picks": request.max_picks}, "data_quality": {"candidate_pool": len(candidate_pool), "complete_candidates": len(detailed), "incomplete_pairs": data_errors}, "lock": {"hours": request.lock_hours, "expires_at": (now + timedelta(hours=request.lock_hours)).isoformat()}, "method": {"stage1_weights": {"volume": .55, "spread": .30, "movement": .15}, "weights": {"volume": .30, "spread": .25, "range": .20, "atr_fit": .15, "bb_crosses": .10}, "max_correlation": request.max_pairwise_correlation}}
     if data_errors or len(detailed) < request.max_picks:
         return {**base_response, "status": "degraded_no_pick" if data_errors else "no_pick", "message": "Návrh sa nevytvoril, pretože údaje kandidátov nie sú úplné." if data_errors else "Tvrdé filtre prešlo príliš málo trhov."}
 
