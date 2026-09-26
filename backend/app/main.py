@@ -122,7 +122,7 @@ class UniversePickRequest(BaseModel):
     quote_ccy: str = "USDT"
     max_picks: int = Field(5, ge=1, le=10)
     shortlist_size: int = Field(30, ge=10, le=50)
-    deep_scan_size: int = Field(12, ge=5, le=20)
+    deep_scan_size: int = Field(20, ge=5, le=30)
     timeframe: Literal["5m", "15m"] = "5m"
     trade_notional_usdt: float = Field(50, ge=5, le=10000)
     lookback_hours: int = Field(48, ge=24, le=72)
@@ -133,8 +133,8 @@ class UniversePickRequest(BaseModel):
     min_quote_volume_24h: float = Field(2_000_000, ge=0)
     max_spread_ratio: float = Field(.0008, gt=0, le=.01)
     max_book_impact_ratio: float = Field(.001, gt=0, le=.02)
-    min_atr_ratio: float = Field(.004, ge=0, le=.1)
-    max_atr_ratio: float = Field(.025, gt=0, le=.2)
+    min_atr_ratio: float = Field(.0015, ge=0, le=.1)
+    max_atr_ratio: float = Field(.03, gt=0, le=.2)
     max_abs_change_24h_ratio: float = Field(.25, gt=0, le=2)
     max_data_age_seconds: int = Field(30, ge=5, le=300)
 
@@ -2153,10 +2153,21 @@ async def pick_market_universe(request: UniversePickRequest):
         else:
             detailed.append(result)
 
+    rejection_summary: dict[str, int] = {}
+    for item in rejected:
+        for reason in item.get("reasons", []):
+            rejection_summary[reason] = rejection_summary.get(reason, 0) + 1
+
     proposal_id = str(uuid4())
-    base_response = {"proposal_id": proposal_id, "generated_at": now.isoformat(), "source": "OKX public spot API", "status": "ok", "picks": [], "rejected": rejected, "scanner": {"usdt_markets_scanned": usdt_markets_scanned, "eligible_universe": len(candidates), "shortlist_size": len(preliminary), "deep_scan_size": len(candidate_pool), "requested_picks": request.max_picks}, "data_quality": {"candidate_pool": len(candidate_pool), "complete_candidates": len(detailed), "incomplete_pairs": data_errors}, "lock": {"hours": request.lock_hours, "expires_at": (now + timedelta(hours=request.lock_hours)).isoformat()}, "method": {"stage1_weights": {"volume": .55, "spread": .30, "movement": .15}, "weights": {"volume": .30, "spread": .25, "range": .20, "atr_fit": .15, "bb_crosses": .10}, "max_correlation": request.max_pairwise_correlation}}
-    if data_errors or len(detailed) < request.max_picks:
-        return {**base_response, "status": "degraded_no_pick" if data_errors else "no_pick", "message": "Návrh sa nevytvoril, pretože údaje kandidátov nie sú úplné." if data_errors else "Tvrdé filtre prešlo príliš málo trhov."}
+    base_response = {"proposal_id": proposal_id, "generated_at": now.isoformat(), "source": "OKX public spot API", "status": "ok", "picks": [], "rejected": rejected, "scanner": {"usdt_markets_scanned": usdt_markets_scanned, "eligible_universe": len(candidates), "shortlist_size": len(preliminary), "deep_scan_size": len(candidate_pool), "requested_picks": request.max_picks, "rejection_summary": rejection_summary}, "data_quality": {"candidate_pool": len(candidate_pool), "complete_candidates": len(detailed), "incomplete_pairs": data_errors}, "lock": {"hours": request.lock_hours, "expires_at": (now + timedelta(hours=request.lock_hours)).isoformat()}, "method": {"stage1_weights": {"volume": .55, "spread": .30, "movement": .15}, "weights": {"volume": .30, "spread": .25, "range": .20, "atr_fit": .15, "bb_crosses": .10}, "max_correlation": request.max_pairwise_correlation}}
+    # A partial data outage must not kill the whole scan when enough complete
+    # candidates remain. Report incomplete pairs, but continue with verified rows.
+    if len(detailed) < request.max_picks:
+        return {
+            **base_response,
+            "status": "degraded_no_pick" if data_errors else "no_pick",
+            "message": f"Detailný filter našiel iba {len(detailed)} z požadovaných {request.max_picks} vhodných trhov.",
+        }
 
     volumes = [item["volume_24h"] for item in detailed]; spreads = [item["spread_ratio"] for item in detailed]
     crosses = [item["bb_mid_crosses"] for item in detailed]; ranges = [1 - item["trend_strength"] for item in detailed]
