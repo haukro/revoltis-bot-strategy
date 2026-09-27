@@ -68,6 +68,13 @@ function App() {
     try { return JSON.parse(localStorage.getItem('nofomo-paper-forward-v1') || 'null'); }
     catch { return null; }
   });
+  const [scaleForward, setScaleForward] = useState<any>(() => {
+    try { return JSON.parse(localStorage.getItem('nofomo-paper-scale-v1') || 'null'); }
+    catch { return null; }
+  });
+  const [scaleSimulation, setScaleSimulation] = useState<any>(null);
+  const [scaleLastRun, setScaleLastRun] = useState<any>(null);
+  const [scaleRunning, setScaleRunning] = useState(false);
   const [simulation, setSimulation] = useState<any>(null);
   const [lastRun, setLastRun] = useState<any>(null);
   const [isRunning, setIsRunning] = useState(false);
@@ -88,10 +95,13 @@ function App() {
   const runAbortRef = useRef<AbortController | null>(null);
   const liveTimerRef = useRef<number | null>(null);
   const liveEnabledRef = useRef(false);
+  const scaleTimerRef = useRef<number | null>(null);
+  const scaleAbortRef = useRef<AbortController | null>(null);
+  const scaleEnabledRef = useRef(false);
   const load = async () => {
     const [overview, savedVersions, savedBacktests, latestOptimizer] = await Promise.all([fetch('/api/dashboard'), fetch('/api/strategy-versions'), fetch('/api/backtests'), fetch('/api/optimizer-latest')]);
     if (!overview.ok) throw new Error('dashboard_failed');
-    const data = await overview.json(); setDashboard(data); setConfig(data.strategy); setActiveUniverse(data.active_universe || null); setMarketPair(current => data.strategy.selected_pairs.includes(current) ? current : data.strategy.selected_pairs[0] || ''); setLastRun(data.last_simulation); if (data.last_simulation) { setSimulation({ metrics: data.last_simulation.summary, equity_curve: data.last_simulation.progress?.equity_curve || [], per_pair_metrics: data.last_simulation.progress?.per_pair_metrics || {}, per_pair_equity_curves: data.last_simulation.progress?.per_pair_equity_curves || {}, data_coverage: data.last_simulation.progress?.data_coverage || {} }); if (data.last_simulation.progress?.paper_forward) setRunStatus('stopped'); } setVersions(savedVersions.ok ? await savedVersions.json() : []); const tests = savedBacktests.ok ? await savedBacktests.json() : []; setBacktests(tests); if (tests.length > 1) { setLeft(tests[1].id); setRight(tests[0].id); } if (latestOptimizer.ok) { const saved = await latestOptimizer.json(); if (saved) setOptimizer(saved); }
+    const data = await overview.json(); setDashboard(data); setConfig(data.strategy); setActiveUniverse(data.active_universe || null); setMarketPair(current => data.strategy.selected_pairs.includes(current) ? current : data.strategy.selected_pairs[0] || ''); setLastRun(data.last_simulation); if (data.last_simulation) { setSimulation({ metrics: data.last_simulation.summary, equity_curve: data.last_simulation.progress?.equity_curve || [], per_pair_metrics: data.last_simulation.progress?.per_pair_metrics || {}, per_pair_equity_curves: data.last_simulation.progress?.per_pair_equity_curves || {}, data_coverage: data.last_simulation.progress?.data_coverage || {} }); if (data.last_simulation.progress?.paper_forward) setRunStatus('stopped'); } if (data.last_scale_simulation) { setScaleLastRun(data.last_scale_simulation); setScaleSimulation({ metrics: data.last_scale_simulation.summary, equity_curve: data.last_scale_simulation.progress?.equity_curve || [], per_pair_metrics: data.last_scale_simulation.progress?.per_pair_metrics || {}, per_pair_equity_curves: data.last_scale_simulation.progress?.per_pair_equity_curves || {}, data_coverage: data.last_scale_simulation.progress?.data_coverage || {} }); } setVersions(savedVersions.ok ? await savedVersions.json() : []); const tests = savedBacktests.ok ? await savedBacktests.json() : []; setBacktests(tests); if (tests.length > 1) { setLeft(tests[1].id); setRight(tests[0].id); } if (latestOptimizer.ok) { const saved = await latestOptimizer.json(); if (saved) setOptimizer(saved); }
   };
   useEffect(() => { load().catch(() => setMessage('Aplikáciu sa nepodarilo načítať. Skontroluj, či beží API.')); }, []);
   useEffect(() => {
@@ -402,6 +412,7 @@ function App() {
             trading_start_time: startedAt,
             force_close_at_end: false,
             use_current_cost_model: true,
+            paper_label: 'official',
           }),
         });
         if (!response.ok) throw new Error('paper_forward_failed');
@@ -424,8 +435,70 @@ function App() {
     };
     await runPaperOnce();
   };
+  const startScaleForward = async (rawResult: any) => {
+    const view = normalizeOptimizerResult(rawResult);
+    if (!view.qualified || !view.settings || !view.pair || scaleRunning) return;
+    const frozen: Config = { ...(view.settings as Config), selected_pairs: [view.pair], timeframe: view.timeframe, initial_capital: 300, stake_amount: 150 };
+    const saved = scaleForward && scaleForward.version_id === view.version_id && scaleForward.pair === view.pair ? scaleForward : null;
+    const startedAt = Number(saved?.started_at || Date.now());
+    const scale = { version_id: view.version_id, pair: view.pair, timeframe: view.timeframe, variant: view.variant, started_at: startedAt, initial_capital: 300, stake_amount: 150, settings: frozen };
+    localStorage.setItem('nofomo-paper-scale-v1', JSON.stringify(scale));
+    setScaleForward(scale);
+    scaleEnabledRef.current = true;
+    setScaleRunning(true);
+
+    const runScaleOnce = async (): Promise<void> => {
+      if (!scaleEnabledRef.current) return;
+      const now = Date.now();
+      const minutes = Number(String(frozen.timeframe).replace('m', '')) || 5;
+      const startup = Math.max(Number(frozen.bb_period || 20), Number(frozen.rsi_period || 14), Number(frozen.atr_period || 14)) + 5;
+      const warmupCandles = Math.max(100, startup + 20);
+      const dataStart = startedAt - warmupCandles * minutes * 60_000;
+      const wantedCandles = Math.ceil((now - dataStart) / (minutes * 60_000)) + 2;
+      const controller = new AbortController();
+      scaleAbortRef.current = controller;
+      try {
+        const response = await fetch('/api/simulations/run', {
+          method: 'POST',
+          signal: controller.signal,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            settings: frozen,
+            candle_limit: Math.min(45000, Math.max(100, wantedCandles)),
+            start_time: dataStart,
+            end_time: now,
+            trading_start_time: startedAt,
+            force_close_at_end: false,
+            use_current_cost_model: true,
+            paper_label: 'scale_300_150',
+          }),
+        });
+        if (!response.ok) throw new Error('scale_forward_failed');
+        const result = await response.json();
+        setScaleSimulation(result);
+        setScaleLastRun(result.run);
+        if (!scaleEnabledRef.current) return;
+        scaleTimerRef.current = window.setTimeout(runScaleOnce, 60_000);
+      } catch (error: any) {
+        if (error?.name === 'AbortError') return;
+        if (!scaleEnabledRef.current) return;
+        scaleTimerRef.current = window.setTimeout(runScaleOnce, 60_000);
+      } finally {
+        scaleAbortRef.current = null;
+      }
+    };
+    await runScaleOnce();
+  };
+  const stopScaleForward = () => {
+    scaleEnabledRef.current = false;
+    if (scaleTimerRef.current !== null) window.clearTimeout(scaleTimerRef.current);
+    scaleTimerRef.current = null;
+    scaleAbortRef.current?.abort();
+    scaleAbortRef.current = null;
+    setScaleRunning(false);
+  };
   const stopSimulation = () => { liveEnabledRef.current = false; if (liveTimerRef.current !== null) window.clearTimeout(liveTimerRef.current); liveTimerRef.current = null; runAbortRef.current?.abort(); runAbortRef.current = null; setIsRunning(false); setRunStatus('stopped'); setMessage('Simulácia bola zastavená.'); };
-  useEffect(() => () => { liveEnabledRef.current = false; if (liveTimerRef.current !== null) window.clearTimeout(liveTimerRef.current); if (optimizerTimerRef.current !== null) window.clearTimeout(optimizerTimerRef.current); runAbortRef.current?.abort(); }, []);
+  useEffect(() => () => { liveEnabledRef.current = false; scaleEnabledRef.current = false; if (liveTimerRef.current !== null) window.clearTimeout(liveTimerRef.current); if (scaleTimerRef.current !== null) window.clearTimeout(scaleTimerRef.current); if (optimizerTimerRef.current !== null) window.clearTimeout(optimizerTimerRef.current); runAbortRef.current?.abort(); scaleAbortRef.current?.abort(); }, []);
   const setQuickRange = (hours: number) => { const now = Date.now(); setTestStart(inputDateTime(new Date(now))); setTestEnd(inputDateTime(new Date(now + hours * 60 * 60 * 1000))); };
   const chooseScannerPair = (pair: string) => {
     setMarketPair(pair);
@@ -451,6 +524,8 @@ function App() {
   const metrics = simulation?.per_pair_metrics?.[currentPair] || calculatePairMetrics(currentTrades, currentInitialCapital);
   const currentEquityCurve = simulation?.per_pair_equity_curves?.[currentPair] || calculatePairCurve(currentTrades, currentInitialCapital);
   const currentCoverage = simulation?.data_coverage?.[currentPair];
+  const scalePair = scaleForward?.pair || 'HYPE/USDT';
+  const scaleMetrics = scaleSimulation?.per_pair_metrics?.[scalePair] || scaleSimulation?.metrics || scaleLastRun?.summary || { initial_capital: 300, realized_profit: 0, win_rate: 0, closed_trades: 0, max_drawdown_percent: 0, portfolio_value: 300 };
   return <main>
     <header className="topbar"><div className="brand"><img className="brand-icon" src="/icons/nofomo.svg" alt="" /><div><h1>NoFomo</h1><p>DATA IN FOMO OUT</p></div></div><div className="top-actions"><span className="mode"><i />SIMULÁCIA</span><button onClick={save}>Uložiť</button></div></header>
     <section className="hero hero-compact"><div><span className="eyebrow">NOFOMO</span><h2>DATA IN<br /><em>FOMO OUT</em></h2><p>Testuj. Porovnávaj. Rozhoduj sa podľa dát.</p></div><div className="hero-status"><span>Aktívny lock</span><strong>{activeUniverse?.pairs?.length ? `${activeUniverse.pairs.length} trhov` : 'Bez locku'}</strong><small>{activeUniverse?.pairs?.join(' · ') || 'Najprv vyber trhy'}</small></div></section>
@@ -461,6 +536,17 @@ function App() {
       {!paperForward && <div className="run-mode" style={{ gridColumn: '1 / -1', display: 'flex', alignItems: 'center', gap: 12, padding: '14px 12px', border: `1px solid ${historicalMode ? '#5a9ee8' : '#304055'}`, borderRadius: 10, background: historicalMode ? '#12283d' : '#0d151e', boxShadow: historicalMode ? '0 0 0 3px #5a9ee822' : 'none' }}><label style={{ display: 'flex', alignItems: 'center', gap: 9, fontWeight: 700 }}><input type="checkbox" checked={historicalMode} onChange={event => { setHistoricalMode(event.target.checked); if (event.target.checked) setTimeLimited(false); }} disabled={isRunning} /><span>Historický test</span></label><p style={{ margin: 0, color: historicalMode ? '#c8e2ff' : '#a2b1c3', fontSize: 13 }}>{historicalMode ? 'Zapnuté – po spustení sa vykoná zrýchlený test spätne.' : 'Vypnuté – spustí sa živé sledovanie.'}</p></div>}
       {!paperForward && historicalMode && <div className="test-window"><div><strong style={{ color: '#c8e2ff' }}>Vyber obdobie spätne</strong></div><nav>{([1, 6, 24, 168, 336, 720] as const).map(hours => <button key={hours} className={historicalHours === hours ? 'active' : 'ghost'} onClick={() => setHistoricalHours(hours)} disabled={isRunning}>{historicalRangeLabels[hours]}</button>)}</nav></div>}
     </section>
+    {optimizer?.result && normalizeOptimizerResult(optimizer.result).qualified && <section className={`simulation-control scale-test-control status-${scaleForward ? (scaleRunning ? 'running' : 'stopped') : 'idle'}`}>
+      <div className="run-state"><span className="state-dot" /><div><small>PARALELNÝ SCALE TEST</small><strong>{scaleForward ? (scaleRunning ? 'Scale test 300/150 beží' : 'Scale test 300/150 čaká na pokračovanie') : 'Scale test 300/150 pripravený'}</strong><p>{scaleForward ? `HYPE/USDT 5m v8 · 300 USDT kapitál · 150 USDT na obchod${scaleLastRun ? ` · posledné vyhodnotenie: ${new Date(scaleLastRun.finished_at).toLocaleString('sk-SK')}` : ''}` : 'Rovnaká stratégia a rovnakých 50 % kapitálu na obchod; mení sa iba absolútna veľkosť.'}</p></div></div>
+      <div className="run-actions">{scaleRunning ? <button className="stop-button" onClick={stopScaleForward}>■ Pozastaviť scale test</button> : <button className="run-button" onClick={() => startScaleForward(optimizer.result)}>▶ {scaleForward ? 'Pokračovať scale test' : 'Spustiť scale test 300/150'}</button>}</div>
+      <div className="scale-metrics">
+        <span><small>Kapitál</small><b>{Number(scaleMetrics.initial_capital || 300).toFixed(0)} USDT</b></span>
+        <span><small>Výsledok</small><b className={Number(scaleMetrics.realized_profit || 0) >= 0 ? 'positive' : 'negative'}>{Number(scaleMetrics.realized_profit || 0) >= 0 ? '+' : ''}{Number(scaleMetrics.realized_profit || 0).toFixed(4)} USDT</b></span>
+        <span><small>Obchody</small><b>{Number(scaleMetrics.closed_trades || 0)}</b></span>
+        <span><small>Win rate</small><b>{Number(scaleMetrics.win_rate || 0).toFixed(1)} %</b></span>
+        <span><small>Max DD</small><b>{Number(scaleMetrics.max_drawdown_percent || 0).toFixed(2)} %</b></span>
+      </div>
+    </section>}
     <section className="metric-grid"><Metric label={`Simulačný kapitál · ${currentPair}`} value={`${metrics.initial_capital} USDT`} hint="počiatočný stav" /><Metric label={`Realizovaný výsledok · ${currentPair}`} value={`${metrics.realized_profit >= 0 ? '+' : ''}${metrics.realized_profit} USDT`} hint="po uzatvorených obchodoch" positive={metrics.realized_profit >= 0} /><Metric label={`Úspešnosť · ${currentPair}`} value={`${metrics.win_rate} %`} hint={`${metrics.closed_trades} uzatvorených obchodov`} /><Metric label={`Max. drawdown · ${currentPair}`} value={`${metrics.max_drawdown_percent ?? 0} %`} hint="pokles od maxima" /></section>
     <section className="preset-section"><div className="preset-heading"><div><span className="eyebrow">RÝCHLE NASTAVENIE</span><h3>Vyber profil stratégie</h3></div><p>Profil automaticky prenastaví obchodné hranice. Coiny a počiatočný kapitál ostanú zachované.</p></div><div className="preset-grid">{Object.entries(presets).map(([key, preset]) => <button key={key} className={`preset ${key} ${activePreset === key ? 'selected' : ''}`} onClick={() => applyPreset(key)}><span>{key === 'conservative' ? '◒' : key === 'growing' ? '↗' : '⚡'}</span><div><b>{preset.title}</b><small>{preset.description}</small></div><i>{activePreset === key ? 'Aktívna' : 'Použiť'}</i></button>)}</div></section>
     <section className="optimizer-panel">
@@ -551,7 +637,7 @@ function AlgorithmResult({ result, onCopy, onPaper, paperForward }: { result: an
       {!view.qualified && <p>Víťaz: žiadny. Diagnostika variantu: {view.pair} · {view.timeframe}</p>}
       <p>{view.method} · {view.tested_combinations} otestovaných kombinácií</p>
       <p>{view.qualified ? view.verdict : 'Parametre sa vyberajú vo validácii. Neúspešný holdout nespustí hľadanie náhradníka.'}</p>
-    </div><div className="result-actions">{(!paperForward || paperForward.version_id !== view.version_id || paperForward.pair !== view.pair) && <button className="run-button" onClick={onPaper} disabled={!view.qualified}>▶ Spustiť paper test</button>}<button className="ghost" onClick={onCopy} disabled={!view.qualified || !view.strategy_code}>Kopírovať algoritmus</button></div></div>
+    </div><div className="result-actions">{!paperForward && <button className="run-button" onClick={onPaper} disabled={!view.qualified}>▶ Spustiť paper test</button>}<button className="ghost" onClick={onCopy} disabled={!view.qualified || !view.strategy_code}>Kopírovať algoritmus</button></div></div>
     <p className="validation-counts">Validačné obchody: {view.validation_trade_count}/40 · Holdout: {view.holdout_visible ? `${m.closed_trades || 0}/10` : '— (nevyhodnotený)'} · Policy v4 · 5× WF OOS</p>
     <div className="result-metrics">
       <div><span>Čistý zisk/strata holdoutu</span><b>{m.realized_profit ?? '—'} USDT</b><small>{view.holdout_profit_percent ?? '—'} % kapitálu</small></div>
