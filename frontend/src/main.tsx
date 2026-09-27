@@ -435,13 +435,23 @@ function App() {
     };
     await runPaperOnce();
   };
-  const startScaleForward = async (rawResult: any) => {
-    const view = normalizeOptimizerResult(rawResult);
-    if (!view.qualified || !view.settings || !view.pair || scaleRunning) return;
-    const frozen: Config = { ...(view.settings as Config), selected_pairs: [view.pair], timeframe: view.timeframe, initial_capital: 300, stake_amount: 150 };
-    const saved = scaleForward && scaleForward.version_id === view.version_id && scaleForward.pair === view.pair ? scaleForward : null;
+  const startScaleForward = async () => {
+    if (scaleRunning) return;
+    const optimized = optimizer?.result ? normalizeOptimizerResult(optimizer.result) : null;
+    const frozenOfficial = paperForward?.settings as Config | undefined;
+    const pair = String(paperForward?.pair || optimized?.pair || '');
+    const timeframe = String(paperForward?.timeframe || optimized?.timeframe || '5m');
+    const variant = Number(paperForward?.variant || optimized?.variant || 8);
+    const versionId = String(paperForward?.version_id || optimized?.version_id || '');
+    const baseSettings = frozenOfficial || (optimized?.settings as Config | undefined);
+    if (!baseSettings || !pair) {
+      setMessage('Scale test sa nedá spustiť bez zmrazenej HYPE paper stratégie.');
+      return;
+    }
+    const frozen: Config = { ...baseSettings, selected_pairs: [pair], timeframe, initial_capital: 300, stake_amount: 150 };
+    const saved = scaleForward && scaleForward.version_id === versionId && scaleForward.pair === pair ? scaleForward : null;
     const startedAt = Number(saved?.started_at || Date.now());
-    const scale = { version_id: view.version_id, pair: view.pair, timeframe: view.timeframe, variant: view.variant, started_at: startedAt, initial_capital: 300, stake_amount: 150, settings: frozen };
+    const scale = { version_id: versionId, pair, timeframe, variant, started_at: startedAt, initial_capital: 300, stake_amount: 150, settings: frozen };
     localStorage.setItem('nofomo-paper-scale-v1', JSON.stringify(scale));
     setScaleForward(scale);
     scaleEnabledRef.current = true;
@@ -536,9 +546,9 @@ function App() {
       {!paperForward && <div className="run-mode" style={{ gridColumn: '1 / -1', display: 'flex', alignItems: 'center', gap: 12, padding: '14px 12px', border: `1px solid ${historicalMode ? '#5a9ee8' : '#304055'}`, borderRadius: 10, background: historicalMode ? '#12283d' : '#0d151e', boxShadow: historicalMode ? '0 0 0 3px #5a9ee822' : 'none' }}><label style={{ display: 'flex', alignItems: 'center', gap: 9, fontWeight: 700 }}><input type="checkbox" checked={historicalMode} onChange={event => { setHistoricalMode(event.target.checked); if (event.target.checked) setTimeLimited(false); }} disabled={isRunning} /><span>Historický test</span></label><p style={{ margin: 0, color: historicalMode ? '#c8e2ff' : '#a2b1c3', fontSize: 13 }}>{historicalMode ? 'Zapnuté – po spustení sa vykoná zrýchlený test spätne.' : 'Vypnuté – spustí sa živé sledovanie.'}</p></div>}
       {!paperForward && historicalMode && <div className="test-window"><div><strong style={{ color: '#c8e2ff' }}>Vyber obdobie spätne</strong></div><nav>{([1, 6, 24, 168, 336, 720] as const).map(hours => <button key={hours} className={historicalHours === hours ? 'active' : 'ghost'} onClick={() => setHistoricalHours(hours)} disabled={isRunning}>{historicalRangeLabels[hours]}</button>)}</nav></div>}
     </section>
-    {optimizer?.result && normalizeOptimizerResult(optimizer.result).qualified && <section className={`simulation-control scale-test-control status-${scaleForward ? (scaleRunning ? 'running' : 'stopped') : 'idle'}`}>
+    {paperForward && <section className={`simulation-control scale-test-control status-${scaleForward ? (scaleRunning ? 'running' : 'stopped') : 'idle'}`}>
       <div className="run-state"><span className="state-dot" /><div><small>PARALELNÝ SCALE TEST</small><strong>{scaleForward ? (scaleRunning ? 'Scale test 300/150 beží' : 'Scale test 300/150 čaká na pokračovanie') : 'Scale test 300/150 pripravený'}</strong><p>{scaleForward ? `HYPE/USDT 5m v8 · 300 USDT kapitál · 150 USDT na obchod${scaleLastRun ? ` · posledné vyhodnotenie: ${new Date(scaleLastRun.finished_at).toLocaleString('sk-SK')}` : ''}` : 'Rovnaká stratégia a rovnakých 50 % kapitálu na obchod; mení sa iba absolútna veľkosť.'}</p></div></div>
-      <div className="run-actions">{scaleRunning ? <button className="stop-button" onClick={stopScaleForward}>■ Pozastaviť scale test</button> : <button className="run-button" onClick={() => startScaleForward(optimizer.result)}>▶ {scaleForward ? 'Pokračovať scale test' : 'Spustiť scale test 300/150'}</button>}</div>
+      <div className="run-actions">{scaleRunning ? <button className="stop-button" onClick={stopScaleForward}>■ Pozastaviť scale test</button> : <button className="run-button" onClick={startScaleForward}>▶ {scaleForward ? 'Pokračovať scale test' : 'Spustiť scale test 300/150'}</button>}</div>
       <div className="scale-metrics">
         <span><small>Kapitál</small><b>{Number(scaleMetrics.initial_capital || 300).toFixed(0)} USDT</b></span>
         <span><small>Výsledok</small><b className={Number(scaleMetrics.realized_profit || 0) >= 0 ? 'positive' : 'negative'}>{Number(scaleMetrics.realized_profit || 0) >= 0 ? '+' : ''}{Number(scaleMetrics.realized_profit || 0).toFixed(4)} USDT</b></span>
