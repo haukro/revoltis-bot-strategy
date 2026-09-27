@@ -4807,7 +4807,7 @@ async def dashboard():
         if diagnostic.get("decision") == "rejected":
             reason = diagnostic.get("reason", "Neznámy dôvod")
             rejections[reason] = rejections.get(reason, 0) + 1
-        last_official = next((run for run in simulation_runs if (run.get("progress") or {}).get("paper_label") == "official"), None)
+    last_official = next((run for run in simulation_runs if (run.get("progress") or {}).get("paper_label") == "official"), None)
     if last_official is None:
         last_official = next((run for run in simulation_runs if (run.get("progress") or {}).get("paper_forward") and not (run.get("progress") or {}).get("paper_label")), None)
     last_scale = next((run for run in simulation_runs if (run.get("progress") or {}).get("paper_label") == "scale_300_150"), None)
