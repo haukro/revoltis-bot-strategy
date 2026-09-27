@@ -68,6 +68,13 @@ function App() {
     try { return JSON.parse(localStorage.getItem('nofomo-paper-forward-v1') || 'null'); }
     catch { return null; }
   });
+  const [scaleForward, setScaleForward] = useState<any>(() => {
+    try { return JSON.parse(localStorage.getItem('nofomo-paper-scale-v1') || 'null'); }
+    catch { return null; }
+  });
+  const [scaleSimulation, setScaleSimulation] = useState<any>(null);
+  const [scaleLastRun, setScaleLastRun] = useState<any>(null);
+  const [scaleRunning, setScaleRunning] = useState(false);
   const [simulation, setSimulation] = useState<any>(null);
   const [lastRun, setLastRun] = useState<any>(null);
   const [isRunning, setIsRunning] = useState(false);
@@ -88,10 +95,13 @@ function App() {
   const runAbortRef = useRef<AbortController | null>(null);
   const liveTimerRef = useRef<number | null>(null);
   const liveEnabledRef = useRef(false);
+  const scaleTimerRef = useRef<number | null>(null);
+  const scaleAbortRef = useRef<AbortController | null>(null);
+  const scaleEnabledRef = useRef(false);
   const load = async () => {
     const [overview, savedVersions, savedBacktests, latestOptimizer] = await Promise.all([fetch('/api/dashboard'), fetch('/api/strategy-versions'), fetch('/api/backtests'), fetch('/api/optimizer-latest')]);
     if (!overview.ok) throw new Error('dashboard_failed');
-    const data = await overview.json(); setDashboard(data); setConfig(data.strategy); setActiveUniverse(data.active_universe || null); setMarketPair(current => data.strategy.selected_pairs.includes(current) ? current : data.strategy.selected_pairs[0] || ''); setLastRun(data.last_simulation); if (data.last_simulation) { setSimulation({ metrics: data.last_simulation.summary, equity_curve: data.last_simulation.progress?.equity_curve || [], per_pair_metrics: data.last_simulation.progress?.per_pair_metrics || {}, per_pair_equity_curves: data.last_simulation.progress?.per_pair_equity_curves || {}, data_coverage: data.last_simulation.progress?.data_coverage || {} }); if (data.last_simulation.progress?.paper_forward) setRunStatus('stopped'); } setVersions(savedVersions.ok ? await savedVersions.json() : []); const tests = savedBacktests.ok ? await savedBacktests.json() : []; setBacktests(tests); if (tests.length > 1) { setLeft(tests[1].id); setRight(tests[0].id); } if (latestOptimizer.ok) { const saved = await latestOptimizer.json(); if (saved) setOptimizer(saved); }
+    const data = await overview.json(); setDashboard(data); setConfig(data.strategy); setActiveUniverse(data.active_universe || null); setMarketPair(current => data.strategy.selected_pairs.includes(current) ? current : data.strategy.selected_pairs[0] || ''); setLastRun(data.last_simulation); if (data.last_simulation) { setSimulation({ metrics: data.last_simulation.summary, equity_curve: data.last_simulation.progress?.equity_curve || [], per_pair_metrics: data.last_simulation.progress?.per_pair_metrics || {}, per_pair_equity_curves: data.last_simulation.progress?.per_pair_equity_curves || {}, data_coverage: data.last_simulation.progress?.data_coverage || {} }); if (data.last_simulation.progress?.paper_forward) setRunStatus('stopped'); } if (data.last_scale_simulation) { setScaleLastRun(data.last_scale_simulation); setScaleSimulation({ metrics: data.last_scale_simulation.summary, equity_curve: data.last_scale_simulation.progress?.equity_curve || [], per_pair_metrics: data.last_scale_simulation.progress?.per_pair_metrics || {}, per_pair_equity_curves: data.last_scale_simulation.progress?.per_pair_equity_curves || {}, data_coverage: data.last_scale_simulation.progress?.data_coverage || {} }); } setVersions(savedVersions.ok ? await savedVersions.json() : []); const tests = savedBacktests.ok ? await savedBacktests.json() : []; setBacktests(tests); if (tests.length > 1) { setLeft(tests[1].id); setRight(tests[0].id); } if (latestOptimizer.ok) { const saved = await latestOptimizer.json(); if (saved) setOptimizer(saved); }
   };
   useEffect(() => { load().catch(() => setMessage('Aplikáciu sa nepodarilo načítať. Skontroluj, či beží API.')); }, []);
   useEffect(() => {
@@ -402,6 +412,7 @@ function App() {
             trading_start_time: startedAt,
             force_close_at_end: false,
             use_current_cost_model: true,
+            paper_label: 'official',
           }),
         });
         if (!response.ok) throw new Error('paper_forward_failed');
@@ -424,8 +435,70 @@ function App() {
     };
     await runPaperOnce();
   };
+  const startScaleForward = async (rawResult: any) => {
+    const view = normalizeOptimizerResult(rawResult);
+    if (!view.qualified || !view.settings || !view.pair || scaleRunning) return;
+    const frozen: Config = { ...(view.settings as Config), selected_pairs: [view.pair], timeframe: view.timeframe, initial_capital: 300, stake_amount: 150 };
+    const saved = scaleForward && scaleForward.version_id === view.version_id && scaleForward.pair === view.pair ? scaleForward : null;
+    const startedAt = Number(saved?.started_at || Date.now());
+    const scale = { version_id: view.version_id, pair: view.pair, timeframe: view.timeframe, variant: view.variant, started_at: startedAt, initial_capital: 300, stake_amount: 150, settings: frozen };
+    localStorage.setItem('nofomo-paper-scale-v1', JSON.stringify(scale));
+    setScaleForward(scale);
+    scaleEnabledRef.current = true;
+    setScaleRunning(true);
+
+    const runScaleOnce = async (): Promise<void> => {
+      if (!scaleEnabledRef.current) return;
+      const now = Date.now();
+      const minutes = Number(String(frozen.timeframe).replace('m', '')) || 5;
+      const startup = Math.max(Number(frozen.bb_period || 20), Number(frozen.rsi_period || 14), Number(frozen.atr_period || 14)) + 5;
+      const warmupCandles = Math.max(100, startup + 20);
+      const dataStart = startedAt - warmupCandles * minutes * 60_000;
+      const wantedCandles = Math.ceil((now - dataStart) / (minutes * 60_000)) + 2;
+      const controller = new AbortController();
+      scaleAbortRef.current = controller;
+      try {
+        const response = await fetch('/api/simulations/run', {
+          method: 'POST',
+          signal: controller.signal,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            settings: frozen,
+            candle_limit: Math.min(45000, Math.max(100, wantedCandles)),
+            start_time: dataStart,
+            end_time: now,
+            trading_start_time: startedAt,
+            force_close_at_end: false,
+            use_current_cost_model: true,
+            paper_label: 'scale_300_150',
+          }),
+        });
+        if (!response.ok) throw new Error('scale_forward_failed');
+        const result = await response.json();
+        setScaleSimulation(result);
+        setScaleLastRun(result.run);
+        if (!scaleEnabledRef.current) return;
+        scaleTimerRef.current = window.setTimeout(runScaleOnce, 60_000);
+      } catch (error: any) {
+        if (error?.name === 'AbortError') return;
+        if (!scaleEnabledRef.current) return;
+        scaleTimerRef.current = window.setTimeout(runScaleOnce, 60_000);
+      } finally {
+        scaleAbortRef.current = null;
+      }
+    };
+    await runScaleOnce();
+  };
+  const stopScaleForward = () => {
+    scaleEnabledRef.current = false;
+    if (scaleTimerRef.current !== null) window.clearTimeout(scaleTimerRef.current);
+    scaleTimerRef.current = null;
+    scaleAbortRef.current?.abort();
+    scaleAbortRef.current = null;
+    setScaleRunning(false);
+  };
   const stopSimulation = () => { liveEnabledRef.current = false; if (liveTimerRef.current !== null) window.clearTimeout(liveTimerRef.current); liveTimerRef.current = null; runAbortRef.current?.abort(); runAbortRef.current = null; setIsRunning(false); setRunStatus('stopped'); setMessage('Simulácia bola zastavená.'); };
-  useEffect(() => () => { liveEnabledRef.current = false; if (liveTimerRef.current !== null) window.clearTimeout(liveTimerRef.current); if (optimizerTimerRef.current !== null) window.clearTimeout(optimizerTimerRef.current); runAbortRef.current?.abort(); }, []);
+  useEffect(() => () => { liveEnabledRef.current = false; scaleEnabledRef.current = false; if (liveTimerRef.current !== null) window.clearTimeout(liveTimerRef.current); if (scaleTimerRef.current !== null) window.clearTimeout(scaleTimerRef.current); if (optimizerTimerRef.current !== null) window.clearTimeout(optimizerTimerRef.current); runAbortRef.current?.abort(); scaleAbortRef.current?.abort(); }, []);
   const setQuickRange = (hours: number) => { const now = Date.now(); setTestStart(inputDateTime(new Date(now))); setTestEnd(inputDateTime(new Date(now + hours * 60 * 60 * 1000))); };
   const chooseScannerPair = (pair: string) => {
     setMarketPair(pair);
@@ -551,7 +624,7 @@ function AlgorithmResult({ result, onCopy, onPaper, paperForward }: { result: an
       {!view.qualified && <p>Víťaz: žiadny. Diagnostika variantu: {view.pair} · {view.timeframe}</p>}
       <p>{view.method} · {view.tested_combinations} otestovaných kombinácií</p>
       <p>{view.qualified ? view.verdict : 'Parametre sa vyberajú vo validácii. Neúspešný holdout nespustí hľadanie náhradníka.'}</p>
-    </div><div className="result-actions">{(!paperForward || paperForward.version_id !== view.version_id || paperForward.pair !== view.pair) && <button className="run-button" onClick={onPaper} disabled={!view.qualified}>▶ Spustiť paper test</button>}<button className="ghost" onClick={onCopy} disabled={!view.qualified || !view.strategy_code}>Kopírovať algoritmus</button></div></div>
+    </div><div className="result-actions">{!paperForward && <button className="run-button" onClick={onPaper} disabled={!view.qualified}>▶ Spustiť paper test</button>}<button className="ghost" onClick={onCopy} disabled={!view.qualified || !view.strategy_code}>Kopírovať algoritmus</button></div></div>
     <p className="validation-counts">Validačné obchody: {view.validation_trade_count}/40 · Holdout: {view.holdout_visible ? `${m.closed_trades || 0}/10` : '— (nevyhodnotený)'} · Policy v4 · 5× WF OOS</p>
     <div className="result-metrics">
       <div><span>Čistý zisk/strata holdoutu</span><b>{m.realized_profit ?? '—'} USDT</b><small>{view.holdout_profit_percent ?? '—'} % kapitálu</small></div>
