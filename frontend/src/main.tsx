@@ -387,14 +387,24 @@ function App() {
       runAbortRef.current = null;
     }
   };
-  const startQualifiedPaperForward = async (rawResult: any) => {
-    const view = normalizeOptimizerResult(rawResult);
-    if (!view.qualified || !view.settings || !view.pair || isRunning) return;
-    const frozen: Config = { ...(view.settings as Config), selected_pairs: [view.pair], timeframe: view.timeframe };
-    const saved = paperForward && paperForward.version_id === view.version_id && paperForward.pair === view.pair ? paperForward : null;
+  const startQualifiedPaperForward = async (rawResult?: any) => {
+    if (isRunning || liveEnabledRef.current) return;
+    const optimized = rawResult ? normalizeOptimizerResult(rawResult) : (optimizer?.result ? normalizeOptimizerResult(optimizer.result) : null);
+    const saved = paperForward;
+    const pair = String(saved?.pair || optimized?.pair || '');
+    const timeframe = String(saved?.timeframe || optimized?.timeframe || '5m');
+    const variant = Number(saved?.variant || optimized?.variant || 8);
+    const versionId = String(saved?.version_id || optimized?.version_id || '');
+    const baseSettings = (saved?.settings as Config | undefined) || (optimized?.settings as Config | undefined);
+    if (!baseSettings || !pair) {
+      setMessage('Paper forward sa nedá pokračovať bez zmrazenej HYPE stratégie.');
+      return;
+    }
+    if (!saved && !optimized?.qualified) return;
+    const frozen: Config = { ...baseSettings, selected_pairs: [pair], timeframe };
     const startedAt = Number(saved?.started_at || Date.now());
-    const paper = { version_id: view.version_id, pair: view.pair, timeframe: view.timeframe, variant: view.variant, started_at: startedAt, settings: frozen };
-    const existingClosedTrades = Number(simulation?.per_pair_metrics?.[view.pair]?.closed_trades ?? simulation?.metrics?.closed_trades ?? lastRun?.summary?.closed_trades ?? 0);
+    const paper = { version_id: versionId, pair, timeframe, variant, started_at: startedAt, settings: frozen, paused_by_user: false };
+    const existingClosedTrades = Number(simulation?.per_pair_metrics?.[pair]?.closed_trades ?? simulation?.metrics?.closed_trades ?? lastRun?.summary?.closed_trades ?? 0);
     if (paperGate(startedAt, existingClosedTrades).complete) {
       const completed = { ...paper, completed_at: saved?.completed_at || Date.now() };
       localStorage.setItem('nofomo-paper-forward-v1', JSON.stringify(completed));
@@ -406,7 +416,7 @@ function App() {
     localStorage.setItem('nofomo-paper-forward-v1', JSON.stringify(paper));
     setPaperForward(paper);
     setConfig(frozen);
-    setMarketPair(view.pair);
+    setMarketPair(pair);
     setHistoricalMode(false);
     setTimeLimited(false);
     liveEnabledRef.current = true;
@@ -423,7 +433,7 @@ function App() {
       const wantedCandles = Math.ceil((now - dataStart) / (minutes * 60_000)) + 2;
       const controller = new AbortController();
       runAbortRef.current = controller;
-      setMessage(`Paper forward · ${view.pair} ${view.timeframe} v${view.variant} · od ${new Date(startedAt).toLocaleString('sk-SK')}`);
+      setMessage(`Paper forward · ${pair} ${timeframe} v${variant} · od ${new Date(startedAt).toLocaleString('sk-SK')}`);
       try {
         const response = await fetch('/api/simulations/run', {
           method: 'POST',
@@ -459,7 +469,7 @@ function App() {
         }
         setRunStatus('running');
         if (!liveEnabledRef.current) return;
-        setMessage(`Paper forward beží · ${view.pair} · ${closedTrades}/30 obchodov · ${gate.daysDone ? '30 dní splnených' : gate.daysRemaining + ' dní zostáva'} · ďalšia kontrola o 1 minútu.`);
+        setMessage(`Paper forward beží · ${pair} · ${closedTrades}/30 obchodov · ${gate.daysDone ? '30 dní splnených' : gate.daysRemaining + ' dní zostáva'} · ďalšia kontrola o 1 minútu.`);
         liveTimerRef.current = window.setTimeout(runPaperOnce, 60_000);
       } catch (error: any) {
         if (error?.name === 'AbortError') return;
@@ -474,7 +484,7 @@ function App() {
     await runPaperOnce();
   };
   const startScaleForward = async () => {
-    if (scaleRunning) return;
+    if (scaleRunning || scaleEnabledRef.current) return;
     const optimized = optimizer?.result ? normalizeOptimizerResult(optimizer.result) : null;
     const frozenOfficial = paperForward?.settings as Config | undefined;
     const pair = String(paperForward?.pair || optimized?.pair || '');
@@ -489,7 +499,7 @@ function App() {
     const frozen: Config = { ...baseSettings, selected_pairs: [pair], timeframe, initial_capital: 300, stake_amount: 150 };
     const saved = scaleForward && scaleForward.version_id === versionId && scaleForward.pair === pair ? scaleForward : null;
     const startedAt = Number(saved?.started_at || Date.now());
-    const scale = { version_id: versionId, pair, timeframe, variant, started_at: startedAt, initial_capital: 300, stake_amount: 150, settings: frozen };
+    const scale = { version_id: versionId, pair, timeframe, variant, started_at: startedAt, initial_capital: 300, stake_amount: 150, settings: frozen, paused_by_user: false };
     const existingClosedTrades = Number(scaleSimulation?.per_pair_metrics?.[pair]?.closed_trades ?? scaleSimulation?.metrics?.closed_trades ?? scaleLastRun?.summary?.closed_trades ?? 0);
     if (paperGate(startedAt, existingClosedTrades).complete) {
       const completed = { ...scale, completed_at: saved?.completed_at || Date.now() };
@@ -565,9 +575,41 @@ function App() {
     scaleAbortRef.current?.abort();
     scaleAbortRef.current = null;
     setScaleRunning(false);
+    if (scaleForward) {
+      const paused = { ...scaleForward, paused_by_user: true, paused_at: Date.now() };
+      localStorage.setItem('nofomo-paper-scale-v1', JSON.stringify(paused));
+      setScaleForward(paused);
+    }
   };
-  const stopSimulation = () => { liveEnabledRef.current = false; if (liveTimerRef.current !== null) window.clearTimeout(liveTimerRef.current); liveTimerRef.current = null; runAbortRef.current?.abort(); runAbortRef.current = null; setIsRunning(false); setRunStatus('stopped'); setMessage('Simulácia bola zastavená.'); };
+  const stopSimulation = () => {
+    liveEnabledRef.current = false;
+    if (liveTimerRef.current !== null) window.clearTimeout(liveTimerRef.current);
+    liveTimerRef.current = null;
+    runAbortRef.current?.abort();
+    runAbortRef.current = null;
+    setIsRunning(false);
+    setRunStatus('stopped');
+    if (paperForward) {
+      const paused = { ...paperForward, paused_by_user: true, paused_at: Date.now() };
+      localStorage.setItem('nofomo-paper-forward-v1', JSON.stringify(paused));
+      setPaperForward(paused);
+      setMessage('Paper test bol ručne pozastavený.');
+    } else {
+      setMessage('Simulácia bola zastavená.');
+    }
+  };
   useEffect(() => () => { liveEnabledRef.current = false; scaleEnabledRef.current = false; if (liveTimerRef.current !== null) window.clearTimeout(liveTimerRef.current); if (scaleTimerRef.current !== null) window.clearTimeout(scaleTimerRef.current); if (optimizerTimerRef.current !== null) window.clearTimeout(optimizerTimerRef.current); runAbortRef.current?.abort(); scaleAbortRef.current?.abort(); }, []);
+  useEffect(() => {
+    if (!dashboard || !config) return;
+    const timers: number[] = [];
+    if (paperForward && !paperForward.completed_at && !paperForward.paused_by_user && !liveEnabledRef.current) {
+      timers.push(window.setTimeout(() => { void startQualifiedPaperForward(); }, 300));
+    }
+    if (scaleForward && !scaleForward.completed_at && !scaleForward.paused_by_user && !scaleEnabledRef.current) {
+      timers.push(window.setTimeout(() => { void startScaleForward(); }, 500));
+    }
+    return () => timers.forEach(timer => window.clearTimeout(timer));
+  }, [Boolean(dashboard), paperForward?.started_at, paperForward?.paused_by_user, paperForward?.completed_at, scaleForward?.started_at, scaleForward?.paused_by_user, scaleForward?.completed_at]);
   const setQuickRange = (hours: number) => { const now = Date.now(); setTestStart(inputDateTime(new Date(now))); setTestEnd(inputDateTime(new Date(now + hours * 60 * 60 * 1000))); };
   const chooseScannerPair = (pair: string) => {
     setMarketPair(pair);
@@ -604,8 +646,8 @@ function App() {
     <section className="hero hero-compact"><div><span className="eyebrow">NOFOMO</span><h2>DATA IN<br /><em>FOMO OUT</em></h2><p>Testuj. Porovnávaj. Rozhoduj sa podľa dát.</p></div><div className="hero-status"><span>Aktívny lock</span><strong>{activeUniverse?.pairs?.length ? `${activeUniverse.pairs.length} trhov` : 'Bez locku'}</strong><small>{activeUniverse?.pairs?.join(' · ') || 'Najprv vyber trhy'}</small></div></section>
     <BotControlCenter scanner={scanner} error={scannerError} loading={scannerLoading} running={paperBotRunning} onRefresh={scanOkx} onToggle={togglePaperBot} onChoose={testScannerPair} dailyLoss={Math.min(5, Number(config.stop_loss_percent || 4))} stake={Number(config.stake_amount || 0)} preferredPairs={universeLocked ? (activeUniverse?.pairs || []) : []} />
     <section className={`simulation-control status-${paperForward ? (officialGate.complete ? 'completed' : isRunning ? 'running' : 'stopped') : runStatus}`}>
-      <div className="run-state"><span className="state-dot" /><div><small>{paperForward ? 'PAPER FORWARD' : 'STAV SIMULÁCIE'}</small><strong>{paperForward ? (officialGate.complete ? 'Paper test dokončený' : isRunning ? 'Paper test beží' : 'Paper test čaká na pokračovanie') : runStatus === 'running' ? (historicalMode ? 'HISTORICKÝ TEST PREBIEHA' : 'PREBIEHA') : runStatus === 'completed' ? (historicalMode ? 'Historický test dokončený' : 'Čas simulácie uplynul – dokončená') : runStatus === 'stopped' ? 'Simulácia zastavená' : runStatus === 'failed' ? 'Simulácia zlyhala' : 'Simulácia nebeží'}</strong><p>{paperForward ? `HYPE/USDT 5m v8 · minimum 30 dní + 30 obchodov · ${lastRun ? `posledné vyhodnotenie: ${new Date(lastRun.finished_at).toLocaleString('sk-SK')}` : 'pripravený'}` : runStatus === 'running' ? (historicalMode ? 'Spracúvam zvolené historické sviečky zrýchlene.' : timeLimited ? `Aktívna do ${new Date(testEnd).toLocaleString('sk-SK')}. Stav zostane rozsvietený až do ukončenia.` : 'Stav zostáva aktívny, kým nestlačíš Zastaviť simuláciu.') : lastRun ? `Posledné vyhodnotenie: ${new Date(lastRun.finished_at).toLocaleString('sk-SK')}` : 'Spusti živú simuláciu alebo zapni historický test.'}</p>{paperForward && <div className="paper-gate"><span>{officialGate.daysDone ? '✓ 30 dní splnených' : `${officialGate.daysRemaining} dní zostáva`}</span><span className={officialGate.tradesDone ? 'positive' : ''}>{Math.min(Number(officialMetrics.closed_trades || 0), PAPER_MIN_TRADES)}/{PAPER_MIN_TRADES} obchodov{officialGate.tradesDone ? ' ✓' : ''}</span>{officialGate.endAt > 0 && <span>najskôr {new Date(officialGate.endAt).toLocaleString('sk-SK')}</span>}</div>}</div></div>
-      <div className="run-actions">{paperForward && officialGate.complete ? <span className="test-complete">✓ HOTOVO</span> : isRunning ? <button className="stop-button" onClick={stopSimulation}>■ {paperForward ? 'Pozastaviť paper test' : 'Zastaviť simuláciu'}</button> : paperForward && optimizer?.result ? <button className="run-button" onClick={() => startQualifiedPaperForward(optimizer.result)}>▶ Pokračovať paper test</button> : <button className="run-button" onClick={runSimulation}>▶ Spustiť simuláciu</button>}</div>
+      <div className="run-state"><span className="state-dot" /><div><small>{paperForward ? 'PAPER FORWARD' : 'STAV SIMULÁCIE'}</small><strong>{paperForward ? (officialGate.complete ? 'Paper test dokončený' : isRunning ? 'Paper test beží' : 'Paper test čaká na pokračovanie') : runStatus === 'running' ? (historicalMode ? 'HISTORICKÝ TEST PREBIEHA' : 'PREBIEHA') : runStatus === 'completed' ? (historicalMode ? 'Historický test dokončený' : 'Čas simulácie uplynul – dokončená') : runStatus === 'stopped' ? 'Simulácia zastavená' : runStatus === 'failed' ? 'Simulácia zlyhala' : 'Simulácia nebeží'}</strong><p>{paperForward ? `HYPE/USDT 5m v8 · minimum 30 dní + 30 obchodov · po obnovení stránky automaticky pokračuje · ${lastRun ? `posledné vyhodnotenie: ${new Date(lastRun.finished_at).toLocaleString('sk-SK')}` : 'pripravený'}` : runStatus === 'running' ? (historicalMode ? 'Spracúvam zvolené historické sviečky zrýchlene.' : timeLimited ? `Aktívna do ${new Date(testEnd).toLocaleString('sk-SK')}. Stav zostane rozsvietený až do ukončenia.` : 'Stav zostáva aktívny, kým nestlačíš Zastaviť simuláciu.') : lastRun ? `Posledné vyhodnotenie: ${new Date(lastRun.finished_at).toLocaleString('sk-SK')}` : 'Spusti živú simuláciu alebo zapni historický test.'}</p>{paperForward && <div className="paper-gate"><span>{officialGate.daysDone ? '✓ 30 dní splnených' : `${officialGate.daysRemaining} dní zostáva`}</span><span className={officialGate.tradesDone ? 'positive' : ''}>{Math.min(Number(officialMetrics.closed_trades || 0), PAPER_MIN_TRADES)}/{PAPER_MIN_TRADES} obchodov{officialGate.tradesDone ? ' ✓' : ''}</span>{officialGate.endAt > 0 && <span>najskôr {new Date(officialGate.endAt).toLocaleString('sk-SK')}</span>}</div>}</div></div>
+      <div className="run-actions">{paperForward && officialGate.complete ? <span className="test-complete">✓ HOTOVO</span> : isRunning ? <button className="stop-button" onClick={stopSimulation}>■ {paperForward ? 'Pozastaviť paper test' : 'Zastaviť simuláciu'}</button> : paperForward ? <button className="run-button" onClick={() => startQualifiedPaperForward()}>▶ Pokračovať paper test</button> : <button className="run-button" onClick={runSimulation}>▶ Spustiť simuláciu</button>}</div>
       {!paperForward && <div className="run-mode" style={{ gridColumn: '1 / -1', display: 'flex', alignItems: 'center', gap: 12, padding: '14px 12px', border: `1px solid ${historicalMode ? '#5a9ee8' : '#304055'}`, borderRadius: 10, background: historicalMode ? '#12283d' : '#0d151e', boxShadow: historicalMode ? '0 0 0 3px #5a9ee822' : 'none' }}><label style={{ display: 'flex', alignItems: 'center', gap: 9, fontWeight: 700 }}><input type="checkbox" checked={historicalMode} onChange={event => { setHistoricalMode(event.target.checked); if (event.target.checked) setTimeLimited(false); }} disabled={isRunning} /><span>Historický test</span></label><p style={{ margin: 0, color: historicalMode ? '#c8e2ff' : '#a2b1c3', fontSize: 13 }}>{historicalMode ? 'Zapnuté – po spustení sa vykoná zrýchlený test spätne.' : 'Vypnuté – spustí sa živé sledovanie.'}</p></div>}
       {!paperForward && historicalMode && <div className="test-window"><div><strong style={{ color: '#c8e2ff' }}>Vyber obdobie spätne</strong></div><nav>{([1, 6, 24, 168, 336, 720] as const).map(hours => <button key={hours} className={historicalHours === hours ? 'active' : 'ghost'} onClick={() => setHistoricalHours(hours)} disabled={isRunning}>{historicalRangeLabels[hours]}</button>)}</nav></div>}
     </section>
