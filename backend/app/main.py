@@ -165,6 +165,7 @@ class SimulationRequest(BaseModel):
     trading_start_time: int | None = Field(default=None, ge=0)
     force_close_at_end: bool = False
     use_current_cost_model: bool = False
+    paper_label: Literal["official", "scale_300_150"] | None = None
 
 
 class OptimizerRequest(BaseModel):
@@ -2260,7 +2261,7 @@ async def run_standalone_simulation(request: SimulationRequest):
     if result["trades"]:
         await supabase_upsert_many("simulated_trades", result["trades"])
     now = datetime.now(UTC).isoformat()
-    record = {"id": str(uuid4()), "status": "completed", "started_at": now, "finished_at": now, "test_start": request.start_time, "test_end": request.end_time, "timeframe": settings["timeframe"], "pairs": pairs, "summary": result["metrics"], "progress": {"equity_curve": result["equity_curve"], "per_pair_metrics": result["per_pair_metrics"], "per_pair_equity_curves": result["per_pair_equity_curves"], "data_coverage": data_coverage, "rejections": result["rejections"], "trading_start_time": request.trading_start_time, "paper_forward": bool(request.trading_start_time), "cost_model": "current_okx_book" if request.use_current_cost_model else "simulation_default"}}
+    record = {"id": str(uuid4()), "status": "completed", "started_at": now, "finished_at": now, "test_start": request.start_time, "test_end": request.end_time, "timeframe": settings["timeframe"], "pairs": pairs, "summary": result["metrics"], "progress": {"equity_curve": result["equity_curve"], "per_pair_metrics": result["per_pair_metrics"], "per_pair_equity_curves": result["per_pair_equity_curves"], "data_coverage": data_coverage, "rejections": result["rejections"], "trading_start_time": request.trading_start_time, "paper_forward": bool(request.trading_start_time), "paper_label": request.paper_label, "paper_initial_capital": settings["initial_capital"] if request.paper_label else None, "paper_stake_amount": settings["stake_amount"] if request.paper_label else None, "cost_model": "current_okx_book" if request.use_current_cost_model else "simulation_default"}}
     await supabase_upsert("simulation_runs", record)
     return {"source": "OKX public spot API", "timeframe": settings["timeframe"], "mode": "simulation", "live_trading": False, "data_coverage": data_coverage, "run": record, **result}
 
@@ -4785,7 +4786,7 @@ async def dashboard():
         trades = await supabase_get("simulated_trades", "order=opened_at.desc&limit=30")
         sync = await supabase_get("sync_events", "order=received_at.desc&limit=1")
         diagnostics = await supabase_get("signal_diagnostics", "order=occurred_at.desc&limit=500")
-        simulation_runs = await supabase_get("simulation_runs", "order=finished_at.desc&limit=1")
+        simulation_runs = await supabase_get("simulation_runs", "order=finished_at.desc&limit=30")
     except httpx.HTTPError as error:
         raise HTTPException(502, f"Supabase is unavailable: {error}")
     total = sum(float(t.get("profit_usdt") or 0) for t in trades if t.get("status") == "closed")
@@ -4806,7 +4807,12 @@ async def dashboard():
         if diagnostic.get("decision") == "rejected":
             reason = diagnostic.get("reason", "Neznámy dôvod")
             rejections[reason] = rejections.get(reason, 0) + 1
-    return {"mode": "simulation", **context, "trades": trades, "last_sync": sync[0] if sync else None, "last_simulation": simulation_runs[0] if simulation_runs else None, "analytics": {"equity_curve": equity_curve, "max_drawdown_percent": round(max_drawdown_percent, 2), "rejections": rejections}, "metrics": {"initial_capital": initial_capital, "realized_profit": round(total, 4), "closed_trades": len(closed), "win_rate": round((wins / len(closed) * 100) if closed else 0, 1), "open_trades": sum(1 for t in trades if t.get("status") == "open")}}
+        last_official = next((run for run in simulation_runs if (run.get("progress") or {}).get("paper_label") == "official"), None)
+    if last_official is None:
+        last_official = next((run for run in simulation_runs if (run.get("progress") or {}).get("paper_forward") and not (run.get("progress") or {}).get("paper_label")), None)
+    last_scale = next((run for run in simulation_runs if (run.get("progress") or {}).get("paper_label") == "scale_300_150"), None)
+    last_generic = next((run for run in simulation_runs if not (run.get("progress") or {}).get("paper_forward")), None)
+    return {"mode": "simulation", **context, "trades": trades, "last_sync": sync[0] if sync else None, "last_simulation": last_official or last_generic, "last_scale_simulation": last_scale, "analytics": {"equity_curve": equity_curve, "max_drawdown_percent": round(max_drawdown_percent, 2), "rejections": rejections}, "metrics": {"initial_capital": initial_capital, "realized_profit": round(total, 4), "closed_trades": len(closed), "win_rate": round((wins / len(closed) * 100) if closed else 0, 1), "open_trades": sum(1 for t in trades if t.get("status") == "open")}}
 
 
 @app.put("/api/strategy")
