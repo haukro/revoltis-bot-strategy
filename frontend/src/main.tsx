@@ -42,6 +42,22 @@ const settingInfo: Record<string, { purpose: string, effect: string, mechanism: 
   atr_period: { purpose: 'ATR perióda', effect: 'Mení, z koľkých sviečok sa počíta bežná volatilita.', mechanism: 'Kratšia perióda reaguje na aktuálne zmeny volatility rýchlejšie. Dlhšia je stabilnejšia.' },
 };
 const inputDateTime = (date: Date) => new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+const PAPER_MIN_DAYS = 30;
+const PAPER_MIN_TRADES = 30;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const paperGate = (startedAt: number | string | undefined, closedTrades: number, now = Date.now()) => {
+  const start = Number(startedAt || 0);
+  const endAt = start ? start + PAPER_MIN_DAYS * DAY_MS : 0;
+  const daysDone = Boolean(endAt && now >= endAt);
+  const tradesDone = Number(closedTrades || 0) >= PAPER_MIN_TRADES;
+  return {
+    endAt,
+    daysDone,
+    tradesDone,
+    complete: daysDone && tradesDone,
+    daysRemaining: endAt ? Math.max(0, Math.ceil((endAt - now) / DAY_MS)) : PAPER_MIN_DAYS,
+  };
+};
 const calculatePairMetrics = (trades: any[], initialCapital: number) => { const closed = [...trades].filter(trade => trade.status === 'closed').sort((a, b) => String(a.closed_at || a.opened_at || '').localeCompare(String(b.closed_at || b.opened_at || ''))); const realized = closed.reduce((sum, trade) => sum + Number(trade.profit_usdt || 0), 0); const wins = closed.filter(trade => Number(trade.profit_usdt || 0) > 0).length; let equity = initialCapital; let peak = equity; let drawdown = 0; closed.forEach(trade => { equity += Number(trade.profit_usdt || 0); peak = Math.max(peak, equity); drawdown = Math.max(drawdown, peak ? (peak - equity) / peak * 100 : 0); }); return { initial_capital: initialCapital, portfolio_value: Number((initialCapital + realized).toFixed(4)), realized_profit: Number(realized.toFixed(4)), unrealized_profit: 0, closed_trades: closed.length, win_rate: closed.length ? Number((wins / closed.length * 100).toFixed(1)) : 0, max_drawdown_percent: Number(drawdown.toFixed(2)) }; };
 const calculatePairCurve = (trades: any[], initialCapital: number) => { let equity = initialCapital; const curve = [{ time: 'start', value: equity }]; [...trades].filter(trade => trade.status === 'closed').sort((a, b) => String(a.closed_at || a.opened_at || '').localeCompare(String(b.closed_at || b.opened_at || ''))).forEach(trade => { equity += Number(trade.profit_usdt || 0); curve.push({ time: trade.closed_at || trade.opened_at || 'start', value: Number(equity.toFixed(4)) }); }); return curve; };
 
@@ -378,6 +394,15 @@ function App() {
     const saved = paperForward && paperForward.version_id === view.version_id && paperForward.pair === view.pair ? paperForward : null;
     const startedAt = Number(saved?.started_at || Date.now());
     const paper = { version_id: view.version_id, pair: view.pair, timeframe: view.timeframe, variant: view.variant, started_at: startedAt, settings: frozen };
+    const existingClosedTrades = Number(simulation?.per_pair_metrics?.[view.pair]?.closed_trades ?? simulation?.metrics?.closed_trades ?? lastRun?.summary?.closed_trades ?? 0);
+    if (paperGate(startedAt, existingClosedTrades).complete) {
+      const completed = { ...paper, completed_at: saved?.completed_at || Date.now() };
+      localStorage.setItem('nofomo-paper-forward-v1', JSON.stringify(completed));
+      setPaperForward(completed);
+      setRunStatus('completed');
+      setMessage('Paper forward je dokončený: splnených 30 dní aj minimálne 30 obchodov.');
+      return;
+    }
     localStorage.setItem('nofomo-paper-forward-v1', JSON.stringify(paper));
     setPaperForward(paper);
     setConfig(frozen);
@@ -419,9 +444,22 @@ function App() {
         const result = await response.json();
         setSimulation(result);
         setLastRun(result.run);
+        const closedTrades = Number(result.metrics?.closed_trades || 0);
+        const gate = paperGate(startedAt, closedTrades, now);
+        if (gate.complete) {
+          liveEnabledRef.current = false;
+          liveTimerRef.current = null;
+          setIsRunning(false);
+          setRunStatus('completed');
+          const completed = { ...paper, completed_at: now };
+          localStorage.setItem('nofomo-paper-forward-v1', JSON.stringify(completed));
+          setPaperForward(completed);
+          setMessage(`Paper forward dokončený · ${closedTrades} obchodov · splnených 30 dní aj minimum 30 obchodov.`);
+          return;
+        }
         setRunStatus('running');
         if (!liveEnabledRef.current) return;
-        setMessage(`Paper forward beží · ${view.pair} · ${result.metrics.closed_trades} uzatvorených obchodov · ďalšia kontrola o 1 minútu.`);
+        setMessage(`Paper forward beží · ${view.pair} · ${closedTrades}/30 obchodov · ${gate.daysDone ? '30 dní splnených' : gate.daysRemaining + ' dní zostáva'} · ďalšia kontrola o 1 minútu.`);
         liveTimerRef.current = window.setTimeout(runPaperOnce, 60_000);
       } catch (error: any) {
         if (error?.name === 'AbortError') return;
@@ -452,6 +490,15 @@ function App() {
     const saved = scaleForward && scaleForward.version_id === versionId && scaleForward.pair === pair ? scaleForward : null;
     const startedAt = Number(saved?.started_at || Date.now());
     const scale = { version_id: versionId, pair, timeframe, variant, started_at: startedAt, initial_capital: 300, stake_amount: 150, settings: frozen };
+    const existingClosedTrades = Number(scaleSimulation?.per_pair_metrics?.[pair]?.closed_trades ?? scaleSimulation?.metrics?.closed_trades ?? scaleLastRun?.summary?.closed_trades ?? 0);
+    if (paperGate(startedAt, existingClosedTrades).complete) {
+      const completed = { ...scale, completed_at: saved?.completed_at || Date.now() };
+      localStorage.setItem('nofomo-paper-scale-v1', JSON.stringify(completed));
+      setScaleForward(completed);
+      setScaleRunning(false);
+      setMessage('Scale test 300/150 je dokončený: splnených 30 dní aj minimálne 30 obchodov.');
+      return;
+    }
     localStorage.setItem('nofomo-paper-scale-v1', JSON.stringify(scale));
     setScaleForward(scale);
     scaleEnabledRef.current = true;
@@ -487,6 +534,18 @@ function App() {
         const result = await response.json();
         setScaleSimulation(result);
         setScaleLastRun(result.run);
+        const closedTrades = Number(result.metrics?.closed_trades || 0);
+        const gate = paperGate(startedAt, closedTrades, now);
+        if (gate.complete) {
+          scaleEnabledRef.current = false;
+          scaleTimerRef.current = null;
+          setScaleRunning(false);
+          const completed = { ...scale, completed_at: now };
+          localStorage.setItem('nofomo-paper-scale-v1', JSON.stringify(completed));
+          setScaleForward(completed);
+          setMessage(`Scale test 300/150 dokončený · ${closedTrades} obchodov · splnených 30 dní aj minimum 30 obchodov.`);
+          return;
+        }
         if (!scaleEnabledRef.current) return;
         scaleTimerRef.current = window.setTimeout(runScaleOnce, 60_000);
       } catch (error: any) {
@@ -534,21 +593,25 @@ function App() {
   const metrics = simulation?.per_pair_metrics?.[currentPair] || calculatePairMetrics(currentTrades, currentInitialCapital);
   const currentEquityCurve = simulation?.per_pair_equity_curves?.[currentPair] || calculatePairCurve(currentTrades, currentInitialCapital);
   const currentCoverage = simulation?.data_coverage?.[currentPair];
+  const officialPair = paperForward?.pair || 'HYPE/USDT';
+  const officialMetrics = simulation?.per_pair_metrics?.[officialPair] || simulation?.metrics || lastRun?.summary || { initial_capital: 100, realized_profit: 0, win_rate: 0, closed_trades: 0, max_drawdown_percent: 0, portfolio_value: 100 };
+  const officialGate = paperGate(paperForward?.started_at, Number(officialMetrics.closed_trades || 0));
   const scalePair = scaleForward?.pair || 'HYPE/USDT';
   const scaleMetrics = scaleSimulation?.per_pair_metrics?.[scalePair] || scaleSimulation?.metrics || scaleLastRun?.summary || { initial_capital: 300, realized_profit: 0, win_rate: 0, closed_trades: 0, max_drawdown_percent: 0, portfolio_value: 300 };
+  const scaleGate = paperGate(scaleForward?.started_at, Number(scaleMetrics.closed_trades || 0));
   return <main>
     <header className="topbar"><div className="brand"><img className="brand-icon" src="/icons/nofomo.svg" alt="" /><div><h1>NoFomo</h1><p>DATA IN FOMO OUT</p></div></div><div className="top-actions"><span className="mode"><i />SIMULÁCIA</span><button onClick={save}>Uložiť</button></div></header>
     <section className="hero hero-compact"><div><span className="eyebrow">NOFOMO</span><h2>DATA IN<br /><em>FOMO OUT</em></h2><p>Testuj. Porovnávaj. Rozhoduj sa podľa dát.</p></div><div className="hero-status"><span>Aktívny lock</span><strong>{activeUniverse?.pairs?.length ? `${activeUniverse.pairs.length} trhov` : 'Bez locku'}</strong><small>{activeUniverse?.pairs?.join(' · ') || 'Najprv vyber trhy'}</small></div></section>
     <BotControlCenter scanner={scanner} error={scannerError} loading={scannerLoading} running={paperBotRunning} onRefresh={scanOkx} onToggle={togglePaperBot} onChoose={testScannerPair} dailyLoss={Math.min(5, Number(config.stop_loss_percent || 4))} stake={Number(config.stake_amount || 0)} preferredPairs={universeLocked ? (activeUniverse?.pairs || []) : []} />
-    <section className={`simulation-control status-${paperForward ? (isRunning ? 'running' : 'stopped') : runStatus}`}>
-      <div className="run-state"><span className="state-dot" /><div><small>{paperForward ? 'PAPER FORWARD' : 'STAV SIMULÁCIE'}</small><strong>{paperForward ? (isRunning ? 'Paper test beží' : 'Paper test čaká na pokračovanie') : runStatus === 'running' ? (historicalMode ? 'HISTORICKÝ TEST PREBIEHA' : 'PREBIEHA') : runStatus === 'completed' ? (historicalMode ? 'Historický test dokončený' : 'Čas simulácie uplynul – dokončená') : runStatus === 'stopped' ? 'Simulácia zastavená' : runStatus === 'failed' ? 'Simulácia zlyhala' : 'Simulácia nebeží'}</strong><p>{paperForward ? (lastRun ? `HYPE/USDT 5m v8 · posledné vyhodnotenie: ${new Date(lastRun.finished_at).toLocaleString('sk-SK')}` : 'Zmrazená kvalifikovaná stratégia pripravená na forward paper test.') : runStatus === 'running' ? (historicalMode ? 'Spracúvam zvolené historické sviečky zrýchlene.' : timeLimited ? `Aktívna do ${new Date(testEnd).toLocaleString('sk-SK')}. Stav zostane rozsvietený až do ukončenia.` : 'Stav zostáva aktívny, kým nestlačíš Zastaviť simuláciu.') : lastRun ? `Posledné vyhodnotenie: ${new Date(lastRun.finished_at).toLocaleString('sk-SK')}` : 'Spusti živú simuláciu alebo zapni historický test.'}</p></div></div>
-      <div className="run-actions">{isRunning ? <button className="stop-button" onClick={stopSimulation}>■ {paperForward ? 'Pozastaviť paper test' : 'Zastaviť simuláciu'}</button> : paperForward && optimizer?.result ? <button className="run-button" onClick={() => startQualifiedPaperForward(optimizer.result)}>▶ Pokračovať paper test</button> : <button className="run-button" onClick={runSimulation}>▶ Spustiť simuláciu</button>}</div>
+    <section className={`simulation-control status-${paperForward ? (officialGate.complete ? 'completed' : isRunning ? 'running' : 'stopped') : runStatus}`}>
+      <div className="run-state"><span className="state-dot" /><div><small>{paperForward ? 'PAPER FORWARD' : 'STAV SIMULÁCIE'}</small><strong>{paperForward ? (officialGate.complete ? 'Paper test dokončený' : isRunning ? 'Paper test beží' : 'Paper test čaká na pokračovanie') : runStatus === 'running' ? (historicalMode ? 'HISTORICKÝ TEST PREBIEHA' : 'PREBIEHA') : runStatus === 'completed' ? (historicalMode ? 'Historický test dokončený' : 'Čas simulácie uplynul – dokončená') : runStatus === 'stopped' ? 'Simulácia zastavená' : runStatus === 'failed' ? 'Simulácia zlyhala' : 'Simulácia nebeží'}</strong><p>{paperForward ? `HYPE/USDT 5m v8 · minimum 30 dní + 30 obchodov · ${lastRun ? `posledné vyhodnotenie: ${new Date(lastRun.finished_at).toLocaleString('sk-SK')}` : 'pripravený'}` : runStatus === 'running' ? (historicalMode ? 'Spracúvam zvolené historické sviečky zrýchlene.' : timeLimited ? `Aktívna do ${new Date(testEnd).toLocaleString('sk-SK')}. Stav zostane rozsvietený až do ukončenia.` : 'Stav zostáva aktívny, kým nestlačíš Zastaviť simuláciu.') : lastRun ? `Posledné vyhodnotenie: ${new Date(lastRun.finished_at).toLocaleString('sk-SK')}` : 'Spusti živú simuláciu alebo zapni historický test.'}</p>{paperForward && <div className="paper-gate"><span>{officialGate.daysDone ? '✓ 30 dní splnených' : `${officialGate.daysRemaining} dní zostáva`}</span><span className={officialGate.tradesDone ? 'positive' : ''}>{Math.min(Number(officialMetrics.closed_trades || 0), PAPER_MIN_TRADES)}/{PAPER_MIN_TRADES} obchodov{officialGate.tradesDone ? ' ✓' : ''}</span>{officialGate.endAt > 0 && <span>najskôr {new Date(officialGate.endAt).toLocaleString('sk-SK')}</span>}</div>}</div></div>
+      <div className="run-actions">{paperForward && officialGate.complete ? <span className="test-complete">✓ HOTOVO</span> : isRunning ? <button className="stop-button" onClick={stopSimulation}>■ {paperForward ? 'Pozastaviť paper test' : 'Zastaviť simuláciu'}</button> : paperForward && optimizer?.result ? <button className="run-button" onClick={() => startQualifiedPaperForward(optimizer.result)}>▶ Pokračovať paper test</button> : <button className="run-button" onClick={runSimulation}>▶ Spustiť simuláciu</button>}</div>
       {!paperForward && <div className="run-mode" style={{ gridColumn: '1 / -1', display: 'flex', alignItems: 'center', gap: 12, padding: '14px 12px', border: `1px solid ${historicalMode ? '#5a9ee8' : '#304055'}`, borderRadius: 10, background: historicalMode ? '#12283d' : '#0d151e', boxShadow: historicalMode ? '0 0 0 3px #5a9ee822' : 'none' }}><label style={{ display: 'flex', alignItems: 'center', gap: 9, fontWeight: 700 }}><input type="checkbox" checked={historicalMode} onChange={event => { setHistoricalMode(event.target.checked); if (event.target.checked) setTimeLimited(false); }} disabled={isRunning} /><span>Historický test</span></label><p style={{ margin: 0, color: historicalMode ? '#c8e2ff' : '#a2b1c3', fontSize: 13 }}>{historicalMode ? 'Zapnuté – po spustení sa vykoná zrýchlený test spätne.' : 'Vypnuté – spustí sa živé sledovanie.'}</p></div>}
       {!paperForward && historicalMode && <div className="test-window"><div><strong style={{ color: '#c8e2ff' }}>Vyber obdobie spätne</strong></div><nav>{([1, 6, 24, 168, 336, 720] as const).map(hours => <button key={hours} className={historicalHours === hours ? 'active' : 'ghost'} onClick={() => setHistoricalHours(hours)} disabled={isRunning}>{historicalRangeLabels[hours]}</button>)}</nav></div>}
     </section>
-    {paperForward && <section className={`simulation-control scale-test-control status-${scaleForward ? (scaleRunning ? 'running' : 'stopped') : 'idle'}`}>
-      <div className="run-state"><span className="state-dot" /><div><small>PARALELNÝ SCALE TEST</small><strong>{scaleForward ? (scaleRunning ? 'Scale test 300/150 beží' : 'Scale test 300/150 čaká na pokračovanie') : 'Scale test 300/150 pripravený'}</strong><p>{scaleForward ? `HYPE/USDT 5m v8 · 300 USDT kapitál · 150 USDT na obchod${scaleLastRun ? ` · posledné vyhodnotenie: ${new Date(scaleLastRun.finished_at).toLocaleString('sk-SK')}` : ''}` : 'Rovnaká stratégia a rovnakých 50 % kapitálu na obchod; mení sa iba absolútna veľkosť.'}</p></div></div>
-      <div className="run-actions">{scaleRunning ? <button className="stop-button" onClick={stopScaleForward}>■ Pozastaviť scale test</button> : <button className="run-button" onClick={startScaleForward}>▶ {scaleForward ? 'Pokračovať scale test' : 'Spustiť scale test 300/150'}</button>}</div>
+    {paperForward && <section className={`simulation-control scale-test-control status-${scaleForward ? (scaleGate.complete ? 'completed' : scaleRunning ? 'running' : 'stopped') : 'idle'}`}>
+      <div className="run-state"><span className="state-dot" /><div><small>PARALELNÝ SCALE TEST</small><strong>{scaleForward ? (scaleGate.complete ? 'Scale test 300/150 dokončený' : scaleRunning ? 'Scale test 300/150 beží' : 'Scale test 300/150 čaká na pokračovanie') : 'Scale test 300/150 pripravený'}</strong><p>{scaleForward ? `HYPE/USDT 5m v8 · 300 USDT kapitál · 150 USDT na obchod · minimum 30 dní + 30 obchodov${scaleLastRun ? ` · posledné vyhodnotenie: ${new Date(scaleLastRun.finished_at).toLocaleString('sk-SK')}` : ''}` : 'Rovnaká stratégia a rovnakých 50 % kapitálu na obchod; mení sa iba absolútna veľkosť.'}</p>{scaleForward && <div className="paper-gate"><span>{scaleGate.daysDone ? '✓ 30 dní splnených' : `${scaleGate.daysRemaining} dní zostáva`}</span><span className={scaleGate.tradesDone ? 'positive' : ''}>{Math.min(Number(scaleMetrics.closed_trades || 0), PAPER_MIN_TRADES)}/{PAPER_MIN_TRADES} obchodov{scaleGate.tradesDone ? ' ✓' : ''}</span>{scaleGate.endAt > 0 && <span>najskôr {new Date(scaleGate.endAt).toLocaleString('sk-SK')}</span>}</div>}</div></div>
+      <div className="run-actions">{scaleForward && scaleGate.complete ? <span className="test-complete">✓ HOTOVO</span> : scaleRunning ? <button className="stop-button" onClick={stopScaleForward}>■ Pozastaviť scale test</button> : <button className="run-button" onClick={startScaleForward}>▶ {scaleForward ? 'Pokračovať scale test' : 'Spustiť scale test 300/150'}</button>}</div>
       <div className="scale-metrics">
         <span><small>Kapitál</small><b>{Number(scaleMetrics.initial_capital || 300).toFixed(0)} USDT</b></span>
         <span><small>Výsledok</small><b className={Number(scaleMetrics.realized_profit || 0) >= 0 ? 'positive' : 'negative'}>{Number(scaleMetrics.realized_profit || 0) >= 0 ? '+' : ''}{Number(scaleMetrics.realized_profit || 0).toFixed(4)} USDT</b></span>
