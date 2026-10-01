@@ -9,7 +9,7 @@ import './run-status.css';
 import './settings-info.css';
 import './simulation-controls.css';
 import './optimizer.css';
-import { fetchPaperLedger, ledgerMetrics, type LedgerRow } from './paper-ledger';
+import { fetchPaperLedger, ledgerMetrics, type LedgerRow, type PaperLabel } from './paper-ledger';
 
 type Config = Record<string, string | number | string[]>;
 const coins = ['PEPE/USDT', 'DOGE/USDT', 'WIF/USDT', 'BONK/USDT', 'SUI/USDT', 'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'ADA/USDT', 'AVAX/USDT', 'LINK/USDT', 'XEC/USDT', 'ZEC/USDT'];
@@ -94,6 +94,20 @@ function App() {
   const [officialLedger, setOfficialLedger] = useState<LedgerRow[] | null>(null);
   const [scaleLedger, setScaleLedger] = useState<LedgerRow[] | null>(null);
   const [ledgerProblem, setLedgerProblem] = useState(false);
+  const [scaleLedgerProblem, setScaleLedgerProblem] = useState(false);
+  const refreshPaperLedger = async (label: PaperLabel) => {
+    const setRows = label === 'official' ? setOfficialLedger : setScaleLedger;
+    const setProblem = label === 'official' ? setLedgerProblem : setScaleLedgerProblem;
+    try {
+      const rows = await fetchPaperLedger(label);
+      setRows(rows);
+      setProblem(false);
+      return rows;
+    } catch (error) {
+      setProblem(true);
+      throw error;
+    }
+  };
   const [scaleLastRun, setScaleLastRun] = useState<any>(null);
   const [scaleRunning, setScaleRunning] = useState(false);
   const [simulation, setSimulation] = useState<any>(null);
@@ -409,8 +423,7 @@ function App() {
     const frozen: Config = { ...baseSettings, selected_pairs: [pair], timeframe };
     const startedAt = Number(saved?.started_at || Date.now());
     const paper = { version_id: versionId, pair, timeframe, variant, started_at: startedAt, settings: frozen, paused_by_user: false };
-    const existingLedger = await fetchPaperLedger('official').catch(() => null);
-    if (existingLedger) setOfficialLedger(existingLedger);
+    const existingLedger = await refreshPaperLedger('official').catch(() => null);
     const existingClosedTrades = existingLedger?.length ?? 0;
     if (paperGate(startedAt, existingClosedTrades).complete) {
       const completed = { ...paper, completed_at: saved?.completed_at || Date.now() };
@@ -461,8 +474,7 @@ function App() {
         const result = await response.json();
         setSimulation(result);
         setLastRun(result.run);
-        const ledgerRows = await fetchPaperLedger('official');
-        setOfficialLedger(ledgerRows);
+        const ledgerRows = await refreshPaperLedger('official');
         const closedTrades = ledgerRows.length;
         const gate = paperGate(startedAt, closedTrades, now);
         if (gate.complete) {
@@ -509,8 +521,7 @@ function App() {
     const saved = scaleForward && scaleForward.version_id === versionId && scaleForward.pair === pair ? scaleForward : null;
     const startedAt = Number(saved?.started_at || Date.now());
     const scale = { version_id: versionId, pair, timeframe, variant, started_at: startedAt, initial_capital: 300, stake_amount: 150, settings: frozen, paused_by_user: false };
-    const existingScaleLedger = await fetchPaperLedger('scale_300_150').catch(() => null);
-    if (existingScaleLedger) setScaleLedger(existingScaleLedger);
+    const existingScaleLedger = await refreshPaperLedger('scale_300_150').catch(() => null);
     const existingClosedTrades = existingScaleLedger?.length ?? 0;
     if (paperGate(startedAt, existingClosedTrades).complete) {
       const completed = { ...scale, completed_at: saved?.completed_at || Date.now() };
@@ -555,8 +566,7 @@ function App() {
         const result = await response.json();
         setScaleSimulation(result);
         setScaleLastRun(result.run);
-        const ledgerRows = await fetchPaperLedger('scale_300_150');
-        setScaleLedger(ledgerRows);
+        const ledgerRows = await refreshPaperLedger('scale_300_150');
         const closedTrades = ledgerRows.length;
         const gate = paperGate(startedAt, closedTrades, now);
         if (gate.complete) {
@@ -626,9 +636,9 @@ function App() {
   useEffect(() => {
     // Show frozen results even when the tests are paused or already completed.
     if (!dashboard) return;
-    const failed = () => setLedgerProblem(true);
-    if (paperForward) void fetchPaperLedger('official').then(rows => { setOfficialLedger(rows); setLedgerProblem(false); }).catch(failed);
-    if (scaleForward) void fetchPaperLedger('scale_300_150').then(rows => { setScaleLedger(rows); setLedgerProblem(false); }).catch(failed);
+    // refreshPaperLedger records failures independently before rethrowing.
+    if (paperForward) void refreshPaperLedger('official').catch(() => undefined);
+    if (scaleForward) void refreshPaperLedger('scale_300_150').catch(() => undefined);
   }, [Boolean(dashboard), Boolean(paperForward), Boolean(scaleForward)]);
   const setQuickRange = (hours: number) => { const now = Date.now(); setTestStart(inputDateTime(new Date(now))); setTestEnd(inputDateTime(new Date(now + hours * 60 * 60 * 1000))); };
   const chooseScannerPair = (pair: string) => {
@@ -668,13 +678,13 @@ function App() {
     <section className="hero hero-compact"><div><span className="eyebrow">NOFOMO</span><h2>DATA IN<br /><em>FOMO OUT</em></h2><p>Testuj. Porovnávaj. Rozhoduj sa podľa dát.</p></div><div className="hero-status"><span>Aktívny lock</span><strong>{activeUniverse?.pairs?.length ? `${activeUniverse.pairs.length} trhov` : 'Bez locku'}</strong><small>{activeUniverse?.pairs?.join(' · ') || 'Najprv vyber trhy'}</small></div></section>
     <BotControlCenter scanner={scanner} error={scannerError} loading={scannerLoading} running={paperBotRunning} onRefresh={scanOkx} onToggle={togglePaperBot} onChoose={testScannerPair} dailyLoss={Math.min(5, Number(config.stop_loss_percent || 4))} stake={Number(config.stake_amount || 0)} preferredPairs={universeLocked ? (activeUniverse?.pairs || []) : []} />
     <section className={`simulation-control status-${paperForward ? (officialGate.complete ? 'completed' : isRunning ? 'running' : 'stopped') : runStatus}`}>
-      <div className="run-state"><span className="state-dot" /><div><small>{paperForward ? 'PAPER FORWARD' : 'STAV SIMULÁCIE'}</small><strong>{paperForward ? (officialGate.complete ? 'Paper test dokončený' : isRunning ? 'Paper test beží' : 'Paper test čaká na pokračovanie') : runStatus === 'running' ? (historicalMode ? 'HISTORICKÝ TEST PREBIEHA' : 'PREBIEHA') : runStatus === 'completed' ? (historicalMode ? 'Historický test dokončený' : 'Čas simulácie uplynul – dokončená') : runStatus === 'stopped' ? 'Simulácia zastavená' : runStatus === 'failed' ? 'Simulácia zlyhala' : 'Simulácia nebeží'}</strong><p>{paperForward ? `HYPE/USDT 5m v8 · minimum 30 dní + 30 obchodov · po obnovení stránky automaticky pokračuje · ${lastRun ? `posledné vyhodnotenie: ${new Date(lastRun.finished_at).toLocaleString('sk-SK')}` : 'pripravený'}` : runStatus === 'running' ? (historicalMode ? 'Spracúvam zvolené historické sviečky zrýchlene.' : timeLimited ? `Aktívna do ${new Date(testEnd).toLocaleString('sk-SK')}. Stav zostane rozsvietený až do ukončenia.` : 'Stav zostáva aktívny, kým nestlačíš Zastaviť simuláciu.') : lastRun ? `Posledné vyhodnotenie: ${new Date(lastRun.finished_at).toLocaleString('sk-SK')}` : 'Spusti živú simuláciu alebo zapni historický test.'}</p>{paperForward && <div className="paper-gate"><span>{officialGate.daysDone ? '✓ 30 dní splnených' : `${officialGate.daysRemaining} dní zostáva`}</span><span className={officialGate.tradesDone ? 'positive' : ''}>{Math.min(Number(officialMetrics.closed_trades || 0), PAPER_MIN_TRADES)}/{PAPER_MIN_TRADES} obchodov{officialGate.tradesDone ? ' ✓' : ''}</span>{officialGate.endAt > 0 && <span>najskôr {new Date(officialGate.endAt).toLocaleString('sk-SK')}</span>}</div>}{paperForward && (ledgerProblem || officialLedger === null) && <p className={ledgerProblem ? 'negative' : ''}>{ledgerProblem ? '⚠ Zápisník obchodov je nedostupný. Čísla v paneli nie sú aktuálne.' : 'Načítavam zápisník obchodov…'}</p>}</div></div>
+      <div className="run-state"><span className="state-dot" /><div><small>{paperForward ? 'PAPER FORWARD' : 'STAV SIMULÁCIE'}</small><strong>{paperForward ? (officialGate.complete ? 'Paper test dokončený' : isRunning ? 'Paper test beží' : 'Paper test čaká na pokračovanie') : runStatus === 'running' ? (historicalMode ? 'HISTORICKÝ TEST PREBIEHA' : 'PREBIEHA') : runStatus === 'completed' ? (historicalMode ? 'Historický test dokončený' : 'Čas simulácie uplynul – dokončená') : runStatus === 'stopped' ? 'Simulácia zastavená' : runStatus === 'failed' ? 'Simulácia zlyhala' : 'Simulácia nebeží'}</strong><p>{paperForward ? `HYPE/USDT 5m v8 · minimum 30 dní + 30 obchodov · po obnovení stránky automaticky pokračuje · ${lastRun ? `posledné vyhodnotenie: ${new Date(lastRun.finished_at).toLocaleString('sk-SK')}` : 'pripravený'}` : runStatus === 'running' ? (historicalMode ? 'Spracúvam zvolené historické sviečky zrýchlene.' : timeLimited ? `Aktívna do ${new Date(testEnd).toLocaleString('sk-SK')}. Stav zostane rozsvietený až do ukončenia.` : 'Stav zostáva aktívny, kým nestlačíš Zastaviť simuláciu.') : lastRun ? `Posledné vyhodnotenie: ${new Date(lastRun.finished_at).toLocaleString('sk-SK')}` : 'Spusti živú simuláciu alebo zapni historický test.'}</p>{paperForward && <div className="paper-gate"><span>{officialGate.daysDone ? '✓ 30 dní splnených' : `${officialGate.daysRemaining} dní zostáva`}</span><span className={officialGate.tradesDone ? 'positive' : ''}>{Math.min(Number(officialMetrics.closed_trades || 0), PAPER_MIN_TRADES)}/{PAPER_MIN_TRADES} obchodov{officialGate.tradesDone ? ' ✓' : ''}</span>{officialGate.endAt > 0 && <span>najskôr {new Date(officialGate.endAt).toLocaleString('sk-SK')}</span>}</div>}{paperForward && (ledgerProblem || officialLedger === null) && <p role={ledgerProblem ? 'alert' : 'status'} className={ledgerProblem ? 'negative' : ''}>{ledgerProblem ? '⚠ Zápisník obchodov je nedostupný. Čísla v paneli nie sú aktuálne.' : 'Načítavam zápisník obchodov…'}</p>}</div></div>
       <div className="run-actions">{paperForward && officialGate.complete ? <span className="test-complete">✓ HOTOVO</span> : isRunning ? <button className="stop-button" onClick={stopSimulation}>■ {paperForward ? 'Pozastaviť paper test' : 'Zastaviť simuláciu'}</button> : paperForward ? <button className="run-button" onClick={() => startQualifiedPaperForward()}>▶ Pokračovať paper test</button> : <button className="run-button" onClick={runSimulation}>▶ Spustiť simuláciu</button>}</div>
       {!paperForward && <div className="run-mode" style={{ gridColumn: '1 / -1', display: 'flex', alignItems: 'center', gap: 12, padding: '14px 12px', border: `1px solid ${historicalMode ? '#5a9ee8' : '#304055'}`, borderRadius: 10, background: historicalMode ? '#12283d' : '#0d151e', boxShadow: historicalMode ? '0 0 0 3px #5a9ee822' : 'none' }}><label style={{ display: 'flex', alignItems: 'center', gap: 9, fontWeight: 700 }}><input type="checkbox" checked={historicalMode} onChange={event => { setHistoricalMode(event.target.checked); if (event.target.checked) setTimeLimited(false); }} disabled={isRunning} /><span>Historický test</span></label><p style={{ margin: 0, color: historicalMode ? '#c8e2ff' : '#a2b1c3', fontSize: 13 }}>{historicalMode ? 'Zapnuté – po spustení sa vykoná zrýchlený test spätne.' : 'Vypnuté – spustí sa živé sledovanie.'}</p></div>}
       {!paperForward && historicalMode && <div className="test-window"><div><strong style={{ color: '#c8e2ff' }}>Vyber obdobie spätne</strong></div><nav>{([1, 6, 24, 168, 336, 720] as const).map(hours => <button key={hours} className={historicalHours === hours ? 'active' : 'ghost'} onClick={() => setHistoricalHours(hours)} disabled={isRunning}>{historicalRangeLabels[hours]}</button>)}</nav></div>}
     </section>
     {paperForward && <section className={`simulation-control scale-test-control status-${scaleForward ? (scaleGate.complete ? 'completed' : scaleRunning ? 'running' : 'stopped') : 'idle'}`}>
-      <div className="run-state"><span className="state-dot" /><div><small>PARALELNÝ SCALE TEST</small><strong>{scaleForward ? (scaleGate.complete ? 'Scale test 300/150 dokončený' : scaleRunning ? 'Scale test 300/150 beží' : 'Scale test 300/150 čaká na pokračovanie') : 'Scale test 300/150 pripravený'}</strong><p>{scaleForward ? `HYPE/USDT 5m v8 · 300 USDT kapitál · 150 USDT na obchod · minimum 30 dní + 30 obchodov${scaleLastRun ? ` · posledné vyhodnotenie: ${new Date(scaleLastRun.finished_at).toLocaleString('sk-SK')}` : ''}` : 'Rovnaká stratégia a rovnakých 50 % kapitálu na obchod; mení sa iba absolútna veľkosť.'}</p>{scaleForward && <div className="paper-gate"><span>{scaleGate.daysDone ? '✓ 30 dní splnených' : `${scaleGate.daysRemaining} dní zostáva`}</span><span className={scaleGate.tradesDone ? 'positive' : ''}>{Math.min(Number(scaleMetrics.closed_trades || 0), PAPER_MIN_TRADES)}/{PAPER_MIN_TRADES} obchodov{scaleGate.tradesDone ? ' ✓' : ''}</span>{scaleGate.endAt > 0 && <span>najskôr {new Date(scaleGate.endAt).toLocaleString('sk-SK')}</span>}</div>}</div></div>
+      <div className="run-state"><span className="state-dot" /><div><small>PARALELNÝ SCALE TEST</small><strong>{scaleForward ? (scaleGate.complete ? 'Scale test 300/150 dokončený' : scaleRunning ? 'Scale test 300/150 beží' : 'Scale test 300/150 čaká na pokračovanie') : 'Scale test 300/150 pripravený'}</strong><p>{scaleForward ? `HYPE/USDT 5m v8 · 300 USDT kapitál · 150 USDT na obchod · minimum 30 dní + 30 obchodov${scaleLastRun ? ` · posledné vyhodnotenie: ${new Date(scaleLastRun.finished_at).toLocaleString('sk-SK')}` : ''}` : 'Rovnaká stratégia a rovnakých 50 % kapitálu na obchod; mení sa iba absolútna veľkosť.'}</p>{scaleForward && <div className="paper-gate"><span>{scaleGate.daysDone ? '✓ 30 dní splnených' : `${scaleGate.daysRemaining} dní zostáva`}</span><span className={scaleGate.tradesDone ? 'positive' : ''}>{Math.min(Number(scaleMetrics.closed_trades || 0), PAPER_MIN_TRADES)}/{PAPER_MIN_TRADES} obchodov{scaleGate.tradesDone ? ' ✓' : ''}</span>{scaleGate.endAt > 0 && <span>najskôr {new Date(scaleGate.endAt).toLocaleString('sk-SK')}</span>}</div>}{scaleForward && (scaleLedgerProblem || scaleLedger === null) && <p role={scaleLedgerProblem ? 'alert' : 'status'} className={scaleLedgerProblem ? 'negative' : ''}>{scaleLedgerProblem ? '⚠ Zápisník obchodov je nedostupný. Čísla v paneli nie sú aktuálne.' : 'Načítavam zápisník obchodov…'}</p>}</div></div>
       <div className="run-actions">{scaleForward && scaleGate.complete ? <span className="test-complete">✓ HOTOVO</span> : scaleRunning ? <button className="stop-button" onClick={stopScaleForward}>■ Pozastaviť scale test</button> : <button className="run-button" onClick={startScaleForward}>▶ {scaleForward ? 'Pokračovať scale test' : 'Spustiť scale test 300/150'}</button>}</div>
       <div className="scale-metrics">
         <span><small>Kapitál</small><b>{Number(scaleMetrics.initial_capital || 300).toFixed(0)} USDT</b></span>

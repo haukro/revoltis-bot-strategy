@@ -36,11 +36,3 @@ test('unavailable or malformed ledger is an error, never an empty success', asyn
   await assert.rejects(fetchPaperLedger('official', reply(false, {})), /paper_ledger_unavailable/);
   await assert.rejects(fetchPaperLedger('official', reply(true, { nope: 1 })), /paper_ledger_invalid/);
 });
-
-test('panel warns when the ledger is unavailable instead of showing silent zeros', async () => {
-  const { readFileSync } = await import('node:fs');
-  const source = readFileSync(new URL('../src/main.tsx', import.meta.url), 'utf8');
-  assert.ok(source.includes('setLedgerProblem(true)'), 'load failure must set the problem flag');
-  assert.ok(source.includes('Zápisník obchodov je nedostupný'), 'warning text must be rendered');
-  assert.ok(!/fetchPaperLedger\([^)]*\)\.then\(setOfficialLedger\)\.catch\(\(\) => undefined\)/.test(source), 'no silent catch on page-open load');
-});

@@ -1,1 +1,20 @@
-{"scripts":{"dev":"vite --host 0.0.0.0","build":"tsc -b && vite build"},"dependencies":{"@vercel/analytics":"2.0.1","@vitejs/plugin-react":"latest","react":"latest","react-dom":"latest","typescript":"latest","vite":"latest"},"devDependencies":{"@types/react":"latest","@types/react-dom":"latest"}}
+{
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "tsc -b && vite build",
+    "test:paper": "pnpm build && node --test tests/paper-ledger.test.mjs tests/paper-panel.test.cjs"
+  },
+  "dependencies": {
+    "@vercel/analytics": "2.0.1",
+    "@vitejs/plugin-react": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "typescript": "latest",
+    "vite": "latest"
+  },
+  "devDependencies": {
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "jsdom": "26.1.0"
+  }
+}
