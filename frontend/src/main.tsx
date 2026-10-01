@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
+import { Analytics } from '@vercel/analytics/react';
 import { normalizeOptimizerResult, combineOptimizerResults } from './optimizer-result';
 import './styles.css';
 import './presets.css';
@@ -920,4 +921,4 @@ function Rejections({ reasons }: { reasons: Record<string, number> }) { const en
 function TradeList({ trades }: { trades: any[] }) { return trades.length ? <ul className="list">{trades.slice(0, 8).map(trade => <li key={trade.id}><span><b>{trade.pair}</b><small>{new Date(trade.opened_at).toLocaleString('sk-SK')} → {new Date(trade.closed_at).toLocaleString('sk-SK')}</small><small>{trade.entry_rate} → {trade.exit_rate} · {trade.exit_reason}</small><small>Poplatky: {Number((trade.raw?.entry_fee_usdt || 0) + (trade.raw?.exit_fee_usdt || 0)).toFixed(4)} USDT · {trade.raw?.holding_candles ?? '—'} sviečok</small></span><b className={Number(trade.profit_usdt) >= 0 ? 'positive' : 'negative'}>{Number(trade.profit_usdt) >= 0 ? '+' : ''}{trade.profit_usdt ?? 0}</b></li>)}</ul> : <div className="empty"><span>◎</span><p>Zatiaľ bez simulovaných obchodov.</p></div>; }
 function VersionList({ versions }: { versions: any[] }) { return versions.length ? <ul className="version-list">{versions.slice(0, 5).map(version => <li key={version.id}><div><b>{version.name}</b><small>{version.note || 'Bez poznámky'}</small></div><span>{new Date(version.created_at).toLocaleDateString('sk-SK')}</span></li>)}</ul> : <p className="muted">Ešte nemáš uloženú verziu stratégie.</p>; }
 function Comparison({ data }: { data: any }) { const diff = data.difference; return <div className="comparison"><span>ROZDIEL DRUHEJ VERZIE</span><div><b>Zisk {diff.profit_total_usdt ?? '—'} USDT</b><b>Obchody {diff.total_trades ?? '—'}</b><b>Úspešnosť {diff.win_rate_percent ?? '—'} %</b><b>Drawdown {diff.max_drawdown_percent ?? '—'} %</b></div></div>; }
-createRoot(document.getElementById('root')!).render(<App />);
+createRoot(document.getElementById('root')!).render(<><App /><Analytics mode={import.meta.env.PROD ? 'production' : 'development'} /></>);
