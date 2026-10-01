@@ -11,14 +11,19 @@ from datetime import UTC, datetime
 from typing import Any
 
 
-def closed_candles_only(candles: list[dict[str, Any]], now_ms: int) -> list[dict[str, Any]]:
-    """Drop candles that are not finished yet (close_time in the future)."""
-    return [candle for candle in candles if int(candle["close_time"]) <= now_ms]
+def closed_candles_only(candles: list[dict[str, Any]], now_ms: int, end_ms: int | None = None) -> list[dict[str, Any]]:
+    """Drop candles that are not finished yet or end after the simulation end time."""
+    cutoff = now_ms if end_ms is None else min(now_ms, end_ms)
+    return [candle for candle in candles if int(candle["close_time"]) <= cutoff]
 
 
 def ledger_key(paper_label: str, trade: dict[str, Any]) -> str:
-    """Stable id from what happened, not from the position in the result list."""
-    return f"{paper_label}|{trade['pair']}|{trade['opened_at']}|{trade['closed_at']}"
+    """One entry is one trade: the key ignores the exit time.
+
+    A recalculation may move the exit; it must never create a second row for
+    the same entry. Only one position per pair is open at a time.
+    """
+    return f"{paper_label}|{trade['pair']}|{trade['opened_at']}"
 
 
 def ledger_rows(paper_label: str, trades: list[dict[str, Any]], run_id: str | None = None,
@@ -54,6 +59,12 @@ def ledger_rows(paper_label: str, trades: list[dict[str, Any]], run_id: str | No
 def new_rows(rows: list[dict[str, Any]], existing_ids: set[str]) -> list[dict[str, Any]]:
     """Rows not yet in the ledger. Existing ids are left untouched."""
     return [row for row in rows if row["id"] not in existing_ids]
+
+
+def drifted_ids(rows: list[dict[str, Any]], recorded_profit: dict[str, float], tolerance: float = 1e-6) -> list[str]:
+    """Ids already recorded whose recalculated PnL now differs. Reported, never applied."""
+    return [row["id"] for row in rows
+            if row["id"] in recorded_profit and abs(float(row["profit_usdt"]) - float(recorded_profit[row["id"]])) > tolerance]
 
 
 def ledger_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:

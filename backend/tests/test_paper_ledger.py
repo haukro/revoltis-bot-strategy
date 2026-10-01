@@ -24,6 +24,23 @@ class PaperLedgerTest(unittest.TestCase):
         candles = [{"close_time": 1_000}, {"close_time": 2_000}, {"close_time": 3_000}]
         self.assertEqual(ledger.closed_candles_only(candles, 2_000), candles[:2])
 
+    def test_candles_after_simulation_end_are_dropped(self):
+        candles = [{"close_time": 1_000}, {"close_time": 2_000}, {"close_time": 3_000}]
+        self.assertEqual(ledger.closed_candles_only(candles, 10_000, 2_000), candles[:2])
+
+    def test_moved_exit_does_not_create_second_row_for_same_entry(self):
+        first = trade(0.1)
+        moved = trade(0.2)
+        moved["closed_at"] = "2026-09-26T23:14:59.999+00:00"
+        self.assertEqual(ledger.ledger_rows("official", [first])[0]["id"],
+                         ledger.ledger_rows("official", [moved])[0]["id"])
+
+    def test_drift_is_reported_not_applied(self):
+        rows = ledger.ledger_rows("official", [trade(0.2)])
+        self.assertEqual(ledger.drifted_ids(rows, {rows[0]["id"]: 0.257}), [rows[0]["id"]])
+        self.assertEqual(ledger.drifted_ids(rows, {rows[0]["id"]: 0.2}), [])
+        self.assertEqual(ledger.new_rows(rows, {rows[0]["id"]}), [])
+
     def test_open_trades_are_never_recorded(self):
         self.assertEqual(ledger.ledger_rows("official", [trade(0.1, status="open")]), [])
 
@@ -49,6 +66,7 @@ class PaperLedgerTest(unittest.TestCase):
 
     def test_new_trade_is_added(self):
         second = trade(-0.3)
+        second["opened_at"] = "2026-09-27T13:09:59.999+00:00"
         second["closed_at"] = "2026-09-27T21:09:59.999+00:00"
         rows = ledger.ledger_rows("official", [trade(0.1), second])
         existing = {rows[0]["id"]}

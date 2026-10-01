@@ -19,7 +19,7 @@ from .simulation import simulate
 from .optimizer import optimize, present_optimizer_record, assess_candidate, aggregate_metrics, walk_forward_windows
 from .trade_audit import matches_target, prepare_replay, replay_validation, unpack_snapshot, trade_tape, tape_summary, entry_path_audit
 from .costs import book_costs, FEE_SCHEDULE, FEE_TAKER, FEE_MAKER, net_return
-from .paper_ledger import closed_candles_only, ledger_rows, ledger_summary, new_rows
+from .paper_ledger import closed_candles_only, drifted_ids, ledger_rows, ledger_summary, new_rows
 from .tsmom_b_v1 import (
     pack_ohlc_snapshot,
     unpack_ohlc_snapshot,
@@ -304,10 +304,14 @@ async def supabase_insert_ignore_duplicates(table: str, records: list[dict]) -> 
 async def append_paper_ledger(paper_label: str, trades: list[dict], run_id: str) -> dict:
     """Freeze newly closed paper trades. Already recorded trades are never changed."""
     rows = ledger_rows(paper_label, trades, run_id)
-    existing = await supabase_get("paper_trade_ledger", f"select=id&paper_label=eq.{paper_label}&limit=10000")
-    fresh = new_rows(rows, {row["id"] for row in existing})
+    existing = await supabase_get("paper_trade_ledger", f"select=id,profit_usdt&paper_label=eq.{paper_label}&limit=10000")
+    recorded = {row["id"]: row.get("profit_usdt") for row in existing}
+    fresh = new_rows(rows, set(recorded))
     inserted = await supabase_insert_ignore_duplicates("paper_trade_ledger", fresh)
-    return {"closed_seen": len(rows), "newly_recorded": len(inserted)}
+    if len(inserted) != len(fresh):
+        raise ValueError("paper_ledger_incomplete_write")
+    return {"closed_seen": len(rows), "newly_recorded": len(inserted),
+            "recalculated_differs_from_recorded": len(drifted_ids(rows, recorded))}
 
 
 async def supabase_rpc(function_name: str, payload: dict[str, Any]) -> Any:
@@ -2244,7 +2248,7 @@ async def run_standalone_simulation(request: SimulationRequest):
         raise HTTPException(502, f"Simuláciu nebolo možné načítať z OKX: {error}")
     if request.paper_label:
         now_ms = int(datetime.now(UTC).timestamp() * 1000)
-        candle_sets = [closed_candles_only(candles, now_ms) for candles in candle_sets]
+        candle_sets = [closed_candles_only(candles, now_ms, request.end_time) for candles in candle_sets]
     expected_count = request.candle_limit
     if request.start_time is not None and request.end_time is not None:
         expected_count = min(request.candle_limit, max(1, (request.end_time - request.start_time + TIMEFRAME_MILLISECONDS[settings["timeframe"]] - 1) // TIMEFRAME_MILLISECONDS[settings["timeframe"]]))
@@ -2290,13 +2294,14 @@ async def run_standalone_simulation(request: SimulationRequest):
         await supabase_upsert_many("simulated_trades", result["trades"])
     now = datetime.now(UTC).isoformat()
     record = {"id": str(uuid4()), "status": "completed", "started_at": now, "finished_at": now, "test_start": request.start_time, "test_end": request.end_time, "timeframe": settings["timeframe"], "pairs": pairs, "summary": result["metrics"], "progress": {"equity_curve": result["equity_curve"], "per_pair_metrics": result["per_pair_metrics"], "per_pair_equity_curves": result["per_pair_equity_curves"], "data_coverage": data_coverage, "rejections": result["rejections"], "trading_start_time": request.trading_start_time, "paper_forward": bool(request.trading_start_time), "paper_label": request.paper_label, "paper_initial_capital": settings["initial_capital"] if request.paper_label else None, "paper_stake_amount": settings["stake_amount"] if request.paper_label else None, "cost_model": "current_okx_book" if request.use_current_cost_model else "simulation_default"}}
-    await supabase_upsert("simulation_runs", record)
     ledger = None
     if request.paper_label and request.use_current_cost_model:
         try:
             ledger = await append_paper_ledger(request.paper_label, result["trades"], record["id"])
         except (httpx.HTTPError, KeyError, ValueError) as error:
-            ledger = {"error": f"paper_ledger_write_failed: {error}"}
+            # Do not report a completed paper run whose results were not frozen.
+            raise HTTPException(502, f"paper_ledger_write_failed: {error}")
+    await supabase_upsert("simulation_runs", record)
     return {"source": "OKX public spot API", "timeframe": settings["timeframe"], "mode": "simulation", "live_trading": False, "data_coverage": data_coverage, "run": record, "paper_ledger": ledger, **result}
 
 
