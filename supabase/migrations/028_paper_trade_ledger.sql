@@ -38,3 +38,8 @@ drop trigger if exists paper_trade_ledger_immutable_trg on public.paper_trade_le
 create trigger paper_trade_ledger_immutable_trg
 before update or delete on public.paper_trade_ledger
 for each row execute function public.paper_trade_ledger_reject_change();
+
+drop trigger if exists paper_trade_ledger_no_truncate_trg on public.paper_trade_ledger;
+create trigger paper_trade_ledger_no_truncate_trg
+before truncate on public.paper_trade_ledger
+for each statement execute function public.paper_trade_ledger_reject_change();

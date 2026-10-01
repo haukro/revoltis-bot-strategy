@@ -9,6 +9,7 @@ import './run-status.css';
 import './settings-info.css';
 import './simulation-controls.css';
 import './optimizer.css';
+import { fetchPaperLedger, ledgerMetrics, type LedgerRow } from './paper-ledger';
 
 type Config = Record<string, string | number | string[]>;
 const coins = ['PEPE/USDT', 'DOGE/USDT', 'WIF/USDT', 'BONK/USDT', 'SUI/USDT', 'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'ADA/USDT', 'AVAX/USDT', 'LINK/USDT', 'XEC/USDT', 'ZEC/USDT'];
@@ -90,6 +91,8 @@ function App() {
     catch { return null; }
   });
   const [scaleSimulation, setScaleSimulation] = useState<any>(null);
+  const [officialLedger, setOfficialLedger] = useState<LedgerRow[] | null>(null);
+  const [scaleLedger, setScaleLedger] = useState<LedgerRow[] | null>(null);
   const [scaleLastRun, setScaleLastRun] = useState<any>(null);
   const [scaleRunning, setScaleRunning] = useState(false);
   const [simulation, setSimulation] = useState<any>(null);
@@ -405,7 +408,9 @@ function App() {
     const frozen: Config = { ...baseSettings, selected_pairs: [pair], timeframe };
     const startedAt = Number(saved?.started_at || Date.now());
     const paper = { version_id: versionId, pair, timeframe, variant, started_at: startedAt, settings: frozen, paused_by_user: false };
-    const existingClosedTrades = Number(simulation?.per_pair_metrics?.[pair]?.closed_trades ?? simulation?.metrics?.closed_trades ?? lastRun?.summary?.closed_trades ?? 0);
+    const existingLedger = await fetchPaperLedger('official').catch(() => null);
+    if (existingLedger) setOfficialLedger(existingLedger);
+    const existingClosedTrades = existingLedger?.length ?? 0;
     if (paperGate(startedAt, existingClosedTrades).complete) {
       const completed = { ...paper, completed_at: saved?.completed_at || Date.now() };
       localStorage.setItem('nofomo-paper-forward-v1', JSON.stringify(completed));
@@ -455,7 +460,9 @@ function App() {
         const result = await response.json();
         setSimulation(result);
         setLastRun(result.run);
-        const closedTrades = Number(result.metrics?.closed_trades || 0);
+        const ledgerRows = await fetchPaperLedger('official');
+        setOfficialLedger(ledgerRows);
+        const closedTrades = ledgerRows.length;
         const gate = paperGate(startedAt, closedTrades, now);
         if (gate.complete) {
           liveEnabledRef.current = false;
@@ -501,7 +508,9 @@ function App() {
     const saved = scaleForward && scaleForward.version_id === versionId && scaleForward.pair === pair ? scaleForward : null;
     const startedAt = Number(saved?.started_at || Date.now());
     const scale = { version_id: versionId, pair, timeframe, variant, started_at: startedAt, initial_capital: 300, stake_amount: 150, settings: frozen, paused_by_user: false };
-    const existingClosedTrades = Number(scaleSimulation?.per_pair_metrics?.[pair]?.closed_trades ?? scaleSimulation?.metrics?.closed_trades ?? scaleLastRun?.summary?.closed_trades ?? 0);
+    const existingScaleLedger = await fetchPaperLedger('scale_300_150').catch(() => null);
+    if (existingScaleLedger) setScaleLedger(existingScaleLedger);
+    const existingClosedTrades = existingScaleLedger?.length ?? 0;
     if (paperGate(startedAt, existingClosedTrades).complete) {
       const completed = { ...scale, completed_at: saved?.completed_at || Date.now() };
       localStorage.setItem('nofomo-paper-scale-v1', JSON.stringify(completed));
@@ -545,7 +554,9 @@ function App() {
         const result = await response.json();
         setScaleSimulation(result);
         setScaleLastRun(result.run);
-        const closedTrades = Number(result.metrics?.closed_trades || 0);
+        const ledgerRows = await fetchPaperLedger('scale_300_150');
+        setScaleLedger(ledgerRows);
+        const closedTrades = ledgerRows.length;
         const gate = paperGate(startedAt, closedTrades, now);
         if (gate.complete) {
           scaleEnabledRef.current = false;
@@ -611,6 +622,12 @@ function App() {
     }
     return () => timers.forEach(timer => window.clearTimeout(timer));
   }, [Boolean(dashboard), paperForward?.started_at, paperForward?.paused_by_user, paperForward?.completed_at, scaleForward?.started_at, scaleForward?.paused_by_user, scaleForward?.completed_at]);
+  useEffect(() => {
+    // Show frozen results even when the tests are paused or already completed.
+    if (!dashboard) return;
+    if (paperForward) void fetchPaperLedger('official').then(setOfficialLedger).catch(() => undefined);
+    if (scaleForward) void fetchPaperLedger('scale_300_150').then(setScaleLedger).catch(() => undefined);
+  }, [Boolean(dashboard), Boolean(paperForward), Boolean(scaleForward)]);
   const setQuickRange = (hours: number) => { const now = Date.now(); setTestStart(inputDateTime(new Date(now))); setTestEnd(inputDateTime(new Date(now + hours * 60 * 60 * 1000))); };
   const chooseScannerPair = (pair: string) => {
     setMarketPair(pair);
@@ -631,16 +648,18 @@ function App() {
   if (!config || !dashboard) return <main className="loading"><img className="brand-icon loading-icon" src="/icons/nofomo.svg" alt="" /><h1>NoFomo</h1><p>{message || 'Pripravujem simuláciu…'}</p></main>;
   const currentPair = marketPair || selected[0];
   const allVisibleTrades = simulation?.trades || dashboard.trades || [];
-  const currentTrades = allVisibleTrades.filter((trade: any) => trade.pair === currentPair);
-  const currentInitialCapital = Number(simulation?.metrics?.initial_capital || dashboard.metrics.initial_capital || 100);
-  const metrics = simulation?.per_pair_metrics?.[currentPair] || calculatePairMetrics(currentTrades, currentInitialCapital);
-  const currentEquityCurve = simulation?.per_pair_equity_curves?.[currentPair] || calculatePairCurve(currentTrades, currentInitialCapital);
-  const currentCoverage = simulation?.data_coverage?.[currentPair];
   const officialPair = paperForward?.pair || 'HYPE/USDT';
-  const officialMetrics = simulation?.per_pair_metrics?.[officialPair] || simulation?.metrics || lastRun?.summary || { initial_capital: 100, realized_profit: 0, win_rate: 0, closed_trades: 0, max_drawdown_percent: 0, portfolio_value: 100 };
+  // During the paper test the official pair is shown only from the frozen ledger.
+  const showLedger = Boolean(paperForward) && currentPair === officialPair;
+  const currentTrades = showLedger ? (officialLedger || []) : allVisibleTrades.filter((trade: any) => trade.pair === currentPair);
+  const currentInitialCapital = showLedger ? 100 : Number(simulation?.metrics?.initial_capital || dashboard.metrics.initial_capital || 100);
+  const metrics = showLedger ? ledgerMetrics(officialLedger || [], 100) : (simulation?.per_pair_metrics?.[currentPair] || calculatePairMetrics(currentTrades, currentInitialCapital));
+  const currentEquityCurve = showLedger ? calculatePairCurve(currentTrades, currentInitialCapital) : (simulation?.per_pair_equity_curves?.[currentPair] || calculatePairCurve(currentTrades, currentInitialCapital));
+  const currentCoverage = simulation?.data_coverage?.[currentPair];
+  const officialMetrics = ledgerMetrics(officialLedger || [], 100);
   const officialGate = paperGate(paperForward?.started_at, Number(officialMetrics.closed_trades || 0));
   const scalePair = scaleForward?.pair || 'HYPE/USDT';
-  const scaleMetrics = scaleSimulation?.per_pair_metrics?.[scalePair] || scaleSimulation?.metrics || scaleLastRun?.summary || { initial_capital: 300, realized_profit: 0, win_rate: 0, closed_trades: 0, max_drawdown_percent: 0, portfolio_value: 300 };
+  const scaleMetrics = ledgerMetrics(scaleLedger || [], 300);
   const scaleGate = paperGate(scaleForward?.started_at, Number(scaleMetrics.closed_trades || 0));
   return <main>
     <header className="topbar"><div className="brand"><img className="brand-icon" src="/icons/nofomo.svg" alt="" /><div><h1>NoFomo</h1><p>DATA IN FOMO OUT</p></div></div><div className="top-actions"><span className="mode"><i />SIMULÁCIA</span><button onClick={save}>Uložiť</button></div></header>

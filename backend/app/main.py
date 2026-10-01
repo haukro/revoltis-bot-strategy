@@ -19,7 +19,7 @@ from .simulation import simulate
 from .optimizer import optimize, present_optimizer_record, assess_candidate, aggregate_metrics, walk_forward_windows
 from .trade_audit import matches_target, prepare_replay, replay_validation, unpack_snapshot, trade_tape, tape_summary, entry_path_audit
 from .costs import book_costs, FEE_SCHEDULE, FEE_TAKER, FEE_MAKER, net_return
-from .paper_ledger import closed_candles_only, drifted_ids, ledger_rows, ledger_summary, new_rows
+from .paper_ledger import append_closed_trades, closed_candles_only, ledger_summary
 from .tsmom_b_v1 import (
     pack_ohlc_snapshot,
     unpack_ohlc_snapshot,
@@ -303,15 +303,13 @@ async def supabase_insert_ignore_duplicates(table: str, records: list[dict]) -> 
 
 async def append_paper_ledger(paper_label: str, trades: list[dict], run_id: str) -> dict:
     """Freeze newly closed paper trades. Already recorded trades are never changed."""
-    rows = ledger_rows(paper_label, trades, run_id)
-    existing = await supabase_get("paper_trade_ledger", f"select=id,profit_usdt&paper_label=eq.{paper_label}&limit=10000")
-    recorded = {row["id"]: row.get("profit_usdt") for row in existing}
-    fresh = new_rows(rows, set(recorded))
-    inserted = await supabase_insert_ignore_duplicates("paper_trade_ledger", fresh)
-    if len(inserted) != len(fresh):
-        raise ValueError("paper_ledger_incomplete_write")
-    return {"closed_seen": len(rows), "newly_recorded": len(inserted),
-            "recalculated_differs_from_recorded": len(drifted_ids(rows, recorded))}
+    async def read_existing(label: str) -> list[dict]:
+        return await supabase_get("paper_trade_ledger", f"select=id,profit_usdt&paper_label=eq.{label}&limit=10000")
+
+    async def insert_new(rows: list[dict]) -> list[dict]:
+        return await supabase_insert_ignore_duplicates("paper_trade_ledger", rows)
+
+    return await append_closed_trades(paper_label, trades, run_id, read_existing, insert_new)
 
 
 async def supabase_rpc(function_name: str, payload: dict[str, Any]) -> Any:

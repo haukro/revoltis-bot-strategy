@@ -79,3 +79,23 @@ def ledger_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "win_rate_percent": round(len(wins) / len(rows) * 100, 2) if rows else None,
         "profit_factor": round(sum(wins) / -sum(losses), 4) if losses else None,
     }
+
+
+async def append_closed_trades(paper_label: str, trades: list[dict[str, Any]], run_id: str,
+                               read_existing, insert_new) -> dict[str, Any]:
+    """Freeze newly closed trades using injected storage calls.
+
+    read_existing(paper_label) -> rows with id and profit_usdt
+    insert_new(rows) -> rows that were really inserted
+
+    Kept free of web framework imports so repeated refreshes can be tested.
+    """
+    rows = ledger_rows(paper_label, trades, run_id)
+    existing = await read_existing(paper_label)
+    recorded = {row["id"]: row.get("profit_usdt") for row in existing}
+    fresh = new_rows(rows, set(recorded))
+    inserted = await insert_new(fresh) if fresh else []
+    if len(inserted) != len(fresh):
+        raise ValueError("paper_ledger_incomplete_write")
+    return {"closed_seen": len(rows), "newly_recorded": len(inserted),
+            "recalculated_differs_from_recorded": len(drifted_ids(rows, recorded))}

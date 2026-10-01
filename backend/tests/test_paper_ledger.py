@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 from pathlib import Path
 import unittest
@@ -79,6 +80,62 @@ class PaperLedgerTest(unittest.TestCase):
         self.assertEqual(summary["pnl_usdt"], 0.5)
         self.assertEqual(summary["profit_factor"], 3.0)
         self.assertEqual(ledger.ledger_summary([])["win_rate_percent"], None)
+
+
+class FakeStore:
+    """In-memory stand-in for the database with the same insert-once behaviour."""
+    def __init__(self, fail_insert: bool = False):
+        self.rows: dict[str, dict] = {}
+        self.fail_insert = fail_insert
+
+    async def read(self, label):
+        return [row for row in self.rows.values() if row["paper_label"] == label]
+
+    async def insert(self, rows):
+        if self.fail_insert:
+            return []
+        inserted = []
+        for row in rows:
+            if row["id"] not in self.rows:
+                self.rows[row["id"]] = row
+                inserted.append(row)
+        return inserted
+
+
+class RepeatedRefreshTest(unittest.TestCase):
+    def run_refresh(self, store, label, trades, run_id):
+        return asyncio.run(ledger.append_closed_trades(label, trades, run_id, store.read, store.insert))
+
+    def test_repeated_refresh_records_each_trade_once_and_keeps_first_pnl(self):
+        store = FakeStore()
+        first = self.run_refresh(store, "official", [trade(0.257, "100")], "run-1")
+        self.assertEqual((first["closed_seen"], first["newly_recorded"]), (1, 1))
+        # ten more refreshes, order book changed, exit time moved
+        moved = trade(0.199, "200")
+        moved["closed_at"] = "2026-09-26T22:44:59.999+00:00"
+        for number in range(10):
+            result = self.run_refresh(store, "official", [moved], f"run-{number + 2}")
+            self.assertEqual(result["newly_recorded"], 0)
+            self.assertEqual(result["recalculated_differs_from_recorded"], 1)
+        self.assertEqual(len(store.rows), 1)
+        only = next(iter(store.rows.values()))
+        self.assertEqual((only["profit_usdt"], only["run_id"], only["cost_book_ts"]), (0.257, "run-1", "100"))
+
+    def test_official_and_scale_are_separate(self):
+        store = FakeStore()
+        self.run_refresh(store, "official", [trade(0.257)], "a")
+        self.run_refresh(store, "scale_300_150", [trade(0.77)], "b")
+        self.assertEqual(len(store.rows), 2)
+        self.assertEqual(len(asyncio.run(store.read("official"))), 1)
+
+    def test_write_failure_is_raised_not_hidden(self):
+        with self.assertRaises(ValueError):
+            self.run_refresh(FakeStore(fail_insert=True), "official", [trade(0.257)], "a")
+
+    def test_open_position_is_not_recorded_on_refresh(self):
+        store = FakeStore()
+        result = self.run_refresh(store, "official", [trade(0.1, status="open")], "a")
+        self.assertEqual((result["closed_seen"], result["newly_recorded"], len(store.rows)), (0, 0, 0))
 
 
 if __name__ == "__main__":
