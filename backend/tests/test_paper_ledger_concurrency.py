@@ -208,3 +208,13 @@ def test_duplicate_keeps_first_value_and_frozen_rows_stay_immutable(db):
             with pytest.raises(psycopg.errors.RaiseException, match="immutable_paper_trade_ledger_row"):
                 conn.execute(statement)
     assert stored(db) == [(original["id"], 0.257, "run-1")]
+
+
+@pytest.mark.parametrize("closed", ["2026-09-26T20:49:59.999+00:00", "2026-09-26T19:00:00+00:00"])
+def test_empty_or_reversed_holding_interval_is_rejected(db, closed):
+    candidate = row()
+    candidate["closed_at"] = closed
+    with psycopg.connect(db, autocommit=True) as conn:
+        with pytest.raises(psycopg.errors.CheckViolation, match="paper_trade_ledger_positive_interval"):
+            append(conn, [candidate])
+    assert stored(db) == []

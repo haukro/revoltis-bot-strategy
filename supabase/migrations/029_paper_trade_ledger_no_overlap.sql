@@ -16,6 +16,13 @@
 create schema if not exists extensions;
 create extension if not exists btree_gist with schema extensions;
 
+-- Empty ranges never overlap anything and could otherwise freeze invalid PnL.
+alter table public.paper_trade_ledger
+  drop constraint if exists paper_trade_ledger_positive_interval;
+alter table public.paper_trade_ledger
+  add constraint paper_trade_ledger_positive_interval
+  check (closed_at > opened_at);
+
 alter table public.paper_trade_ledger
   drop constraint if exists paper_trade_ledger_no_overlap;
 alter table public.paper_trade_ledger
