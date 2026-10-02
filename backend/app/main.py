@@ -19,7 +19,7 @@ from .simulation import simulate
 from .optimizer import optimize, present_optimizer_record, assess_candidate, aggregate_metrics, walk_forward_windows
 from .trade_audit import matches_target, prepare_replay, replay_validation, unpack_snapshot, trade_tape, tape_summary, entry_path_audit
 from .costs import book_costs, FEE_SCHEDULE, FEE_TAKER, FEE_MAKER, net_return
-from .paper_ledger import append_closed_trades, closed_candles_only, ledger_summary
+from .paper_ledger import append_closed_trades, closed_candles_only, ledger_summary, overlapping_ids
 from .tsmom_b_v1 import (
     pack_ohlc_snapshot,
     unpack_ohlc_snapshot,
@@ -286,30 +286,40 @@ async def supabase_upsert_many(table: str, records: list[dict]) -> list[dict]:
         return response.json()
 
 
-async def supabase_insert_ignore_duplicates(table: str, records: list[dict]) -> list[dict]:
-    """Insert rows once. Rows whose id already exists are left untouched."""
-    if not records:
-        return []
+# Local demo mode has no database constraint; one process-wide lock gives the
+# same check-and-insert atomicity that migration 029 gives Supabase.
+local_paper_ledger_lock = asyncio.Lock()
+
+
+async def insert_paper_ledger_rows(rows: list[dict]) -> dict:
+    """Freeze rows atomically. Duplicate ids keep the first value; overlaps are rejected."""
+    if not rows:
+        return {"inserted": [], "overlapping": []}
     url = os.getenv("SUPABASE_URL")
     if not url or not os.getenv("SUPABASE_SERVICE_ROLE_KEY"):
-        existing = {row["id"] for row in local_store.get(table)}
-        return local_store.upsert(table, [row for row in records if row["id"] not in existing])
-    headers = supabase_headers() | {"Prefer": "resolution=ignore-duplicates,return=representation"}
-    async with httpx.AsyncClient(timeout=15) as client:
-        response = await client.post(f"{url}/rest/v1/{table}?on_conflict=id", headers=headers, json=records)
-        response.raise_for_status()
-        return response.json()
+        async with local_paper_ledger_lock:
+            existing = local_store.get("paper_trade_ledger")
+            known = {row["id"] for row in existing}
+            candidates = [row for row in rows if row["id"] not in known]
+            overlapping = overlapping_ids(candidates, existing)
+            accepted = [row for row in candidates if row["id"] not in set(overlapping)]
+            if accepted:
+                local_store.upsert("paper_trade_ledger", accepted)
+            return {"inserted": accepted, "overlapping": overlapping}
+    outcomes = await supabase_rpc("append_paper_trade_ledger", {"p_rows": rows})
+    by_id = {row["id"]: row for row in rows}
+    if not isinstance(outcomes, list) or {item.get("ledger_id") for item in outcomes} != set(by_id):
+        raise ValueError("paper_ledger_rpc_incomplete")
+    return {"inserted": [by_id[item["ledger_id"]] for item in outcomes if item.get("outcome") == "inserted"],
+            "overlapping": [item["ledger_id"] for item in outcomes if item.get("outcome") == "overlap"]}
 
 
 async def append_paper_ledger(paper_label: str, trades: list[dict], run_id: str) -> dict:
     """Freeze newly closed paper trades. Already recorded trades are never changed."""
     async def read_existing(label: str) -> list[dict]:
-        return await supabase_get("paper_trade_ledger", f"select=id,pair,opened_at,closed_at,profit_usdt&paper_label=eq.{label}&limit=10000")
+        return await supabase_get("paper_trade_ledger", f"select=id,paper_label,pair,opened_at,closed_at,profit_usdt&paper_label=eq.{label}&limit=10000")
 
-    async def insert_new(rows: list[dict]) -> list[dict]:
-        return await supabase_insert_ignore_duplicates("paper_trade_ledger", rows)
-
-    return await append_closed_trades(paper_label, trades, run_id, read_existing, insert_new)
+    return await append_closed_trades(paper_label, trades, run_id, read_existing, insert_paper_ledger_rows)
 
 
 async def supabase_rpc(function_name: str, payload: dict[str, Any]) -> Any:

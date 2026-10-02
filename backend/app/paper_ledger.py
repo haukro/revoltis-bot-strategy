@@ -77,7 +77,8 @@ def overlapping_ids(rows: list[dict[str, Any]], existing: list[dict[str, Any]]) 
     def ms(value: Any) -> float:
         return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
 
-    frozen = [(row["pair"], ms(row["opened_at"]), ms(row["closed_at"])) for row in existing
+    # Labels are independent tests: the same HYPE trade may exist in both.
+    frozen = [((row.get("paper_label"), row["pair"]), ms(row["opened_at"]), ms(row["closed_at"])) for row in existing
               if row.get("pair") and row.get("opened_at") and row.get("closed_at")]
     conflicts = []
     accepted_ids = set()
@@ -87,11 +88,12 @@ def overlapping_ids(rows: list[dict[str, Any]], existing: list[dict[str, Any]]) 
         if row["id"] in accepted_ids:
             continue
         start, end = ms(row["opened_at"]), ms(row["closed_at"])
-        if any(pair == row["pair"] and start < closed and end > opened
-               for pair, opened, closed in frozen):
+        key = (row.get("paper_label"), row["pair"])
+        if any(other == key and start < closed and end > opened
+               for other, opened, closed in frozen):
             conflicts.append(row["id"])
         else:
-            frozen.append((row["pair"], start, end))
+            frozen.append((key, start, end))
             accepted_ids.add(row["id"])
     return conflicts
 
@@ -114,24 +116,35 @@ async def append_closed_trades(paper_label: str, trades: list[dict[str, Any]], r
                                read_existing, insert_new) -> dict[str, Any]:
     """Freeze newly closed trades using injected storage calls.
 
-    read_existing(paper_label) -> rows with id, pair, opened_at, closed_at and profit_usdt
-    insert_new(rows) -> rows that were really inserted
+    read_existing(paper_label) -> rows with id, paper_label, pair, opened_at, closed_at and profit_usdt
+    insert_new(rows) -> rows that were really inserted, or
+                        {"inserted": rows, "overlapping": ids} from an atomic store
 
+    The read-then-filter here only avoids pointless writes. Two concurrent
+    refreshes can both read an empty ledger, so the store itself must reject
+    overlapping entries atomically (migration 029 / local lock) and report them.
     Kept free of web framework imports so repeated refreshes can be tested.
     """
     rows = ledger_rows(paper_label, trades, run_id)
-    existing = await read_existing(paper_label)
+    existing = [row for row in await read_existing(paper_label) if row.get("paper_label") == paper_label]
     recorded = {row["id"]: row.get("profit_usdt") for row in existing}
     fresh = new_rows(rows, set(recorded))
     conflicts = set(overlapping_ids(fresh, existing))
     fresh = [row for row in fresh if row["id"] not in conflicts]
-    inserted = await insert_new(fresh) if fresh else []
-    if len(inserted) != len(fresh):
+    written = await insert_new(fresh) if fresh else []
+    if isinstance(written, dict):
+        inserted = list(written.get("inserted") or [])
+        rejected = set(written.get("overlapping") or [])
+    else:
+        inserted, rejected = list(written), set()
+    conflicts |= rejected
+    pending = [row for row in fresh if row["id"] not in rejected]
+    if len(inserted) != len(pending):
         # A parallel refresh may have frozen the same rows first. That is fine;
         # only rows that are still missing afterwards are a failed write.
         stored = await read_existing(paper_label)
         recorded.update({row["id"]: row.get("profit_usdt") for row in stored})
-        if any(row["id"] not in recorded for row in fresh):
+        if any(row["id"] not in recorded for row in pending):
             raise ValueError("paper_ledger_incomplete_write")
     return {"closed_seen": len(rows), "newly_recorded": len(inserted),
             "recalculated_differs_from_recorded": len(drifted_ids(rows, recorded)),
