@@ -304,7 +304,7 @@ async def supabase_insert_ignore_duplicates(table: str, records: list[dict]) -> 
 async def append_paper_ledger(paper_label: str, trades: list[dict], run_id: str) -> dict:
     """Freeze newly closed paper trades. Already recorded trades are never changed."""
     async def read_existing(label: str) -> list[dict]:
-        return await supabase_get("paper_trade_ledger", f"select=id,profit_usdt&paper_label=eq.{label}&limit=10000")
+        return await supabase_get("paper_trade_ledger", f"select=id,pair,opened_at,closed_at,profit_usdt&paper_label=eq.{label}&limit=10000")
 
     async def insert_new(rows: list[dict]) -> list[dict]:
         return await supabase_insert_ignore_duplicates("paper_trade_ledger", rows)
@@ -2234,6 +2234,8 @@ async def pick_market_universe(request: UniversePickRequest):
 @app.post("/api/simulations/run")
 async def run_standalone_simulation(request: SimulationRequest):
     """Run a complete backtest from public OKX candles without Freqtrade."""
+    if request.paper_label and request.force_close_at_end:
+        raise HTTPException(422, "Paper test nesmie nútene uzatvárať pozície na konci.")
     settings = request.settings.model_dump()
     pairs = settings["selected_pairs"]
     if not pairs:
@@ -4121,7 +4123,7 @@ async def optimizer_entry_path_audit(job_id: str):
     candles = unpack_snapshot(snapshot)
     trades = [
         trade for trade in (row.get("trades") or result.get("trades") or [])
-        if trade.get("window") in {"wf1", "wf2", "wf3"}
+        if str(trade.get("window", "")).startswith("wf")
     ]
     expected = int((row.get("walk_forward_metrics") or {}).get("closed_trades") or 0)
     if len(trades) != expected:

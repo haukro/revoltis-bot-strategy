@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 
 from app.costs import book_costs, net_return
 from app.main import app, return_correlation, buy_hold_risk_metrics, load_okx_candles, okx_candle_cache
-from app.optimizer import present_optimizer_record
+from app.optimizer import SELECTION_POLICY_VERSION, present_optimizer_record
 from app.simulation import simulate
 from test_simulation import candles, settings
 
@@ -82,9 +82,9 @@ def test_diagnostic_moves_to_uni_17_positive_without_running_or_promoting_anythi
         rows.append({'pair': pair, 'timeframe': bar, 'variant': 2, 'variant_id': f'{pair}:{bar}:v2',
                      'validation_passed': False, 'holdout_evaluated': False,
                      'walk_forward_metrics': {'closed_trades': n, 'realized_profit': pnl, 'max_drawdown_percent': 4},
-                     'validation_windows': [{'realized_profit': 2}, {'realized_profit': -.1}, {'realized_profit': 2}],
-                     'rejection_reasons': ['malo_obchodov'] if n < 20 else ['zaporny_pnl']})
-    record = {'result': {'selection_policy_version': 3, 'pair': 'XRP/USDT', 'qualified': False, 'variant_results': rows, 'locked_pairs': ['UNI/USDT', 'ZEC/USDT', 'XRP/USDT']}}
+                     'validation_windows': [{'realized_profit': 2}, {'realized_profit': -.1}, {'realized_profit': 2}, {'realized_profit': -.1}, {'realized_profit': -.1}],
+                     'rejection_reasons': ['malo_obchodov', 'nestabilita'] if pnl > 0 else ['malo_obchodov', 'zaporny_pnl', 'nestabilita']})
+    record = {'result': {'selection_policy_version': SELECTION_POLICY_VERSION, 'pair': 'XRP/USDT', 'qualified': False, 'variant_results': rows, 'locked_pairs': ['UNI/USDT', 'ZEC/USDT', 'XRP/USDT']}}
     result = present_optimizer_record(record)['result']
     assert result['pair'] == 'UNI/USDT' and result['timeframe'] == '15m'
     assert result['walk_forward_metrics']['closed_trades'] == 17

@@ -266,7 +266,7 @@ def entry_path_summary(trades: list[dict]) -> dict:
 def entry_path_audit(candles: list[dict], trades: list[dict], trail_start_percent: float = 1.6) -> dict:
     enriched = [entry_path_features(candles, trade, trail_start_percent) for trade in trades]
     windows = {}
-    for name in ("wf1", "wf2", "wf3"):
+    for name in sorted({str(t.get("window")) for t in enriched if str(t.get("window", "")).startswith("wf")}):
         group = [t for t in enriched if t.get("window") == name]
         windows[name] = entry_path_summary(group)
     trail_groups = {

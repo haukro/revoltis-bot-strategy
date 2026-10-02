@@ -45,6 +45,11 @@ class PaperLedgerTest(unittest.TestCase):
     def test_open_trades_are_never_recorded(self):
         self.assertEqual(ledger.ledger_rows("official", [trade(0.1, status="open")]), [])
 
+    def test_forced_end_of_test_exit_is_never_recorded(self):
+        forced = trade(0.1)
+        forced["exit_reason"] = "end_of_test"
+        self.assertEqual(ledger.ledger_rows("official", [forced]), [])
+
     def test_key_is_stable_when_list_position_changes(self):
         first = ledger.ledger_rows("official", [trade(0.1)])[0]["id"]
         other = trade(0.1)
@@ -84,9 +89,10 @@ class PaperLedgerTest(unittest.TestCase):
 
 class FakeStore:
     """In-memory stand-in for the database with the same insert-once behaviour."""
-    def __init__(self, fail_insert: bool = False):
+    def __init__(self, fail_insert: bool = False, racing: list[dict] | None = None):
         self.rows: dict[str, dict] = {}
         self.fail_insert = fail_insert
+        self.racing = racing or []
 
     async def read(self, label):
         return [row for row in self.rows.values() if row["paper_label"] == label]
@@ -94,6 +100,9 @@ class FakeStore:
     async def insert(self, rows):
         if self.fail_insert:
             return []
+        for row in self.racing:  # another refresh wins the insert first
+            self.rows[row["id"]] = row
+        self.racing = []
         inserted = []
         for row in rows:
             if row["id"] not in self.rows:
@@ -132,10 +141,53 @@ class RepeatedRefreshTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.run_refresh(FakeStore(fail_insert=True), "official", [trade(0.257)], "a")
 
+    def test_parallel_refresh_that_already_froze_the_row_is_not_an_error(self):
+        rows = ledger.ledger_rows("official", [trade(0.257)], "other-tab")
+        store = FakeStore(racing=rows)
+        result = self.run_refresh(store, "official", [trade(0.257)], "a")
+        self.assertEqual((result["newly_recorded"], len(store.rows)), (0, 1))
+        self.assertEqual(next(iter(store.rows.values()))["run_id"], "other-tab")
+
+    def test_diverged_entry_overlapping_a_frozen_trade_is_not_double_counted(self):
+        store = FakeStore()
+        self.run_refresh(store, "official", [trade(0.257)], "run-1")
+        shifted = trade(-0.4)
+        shifted["opened_at"] = "2026-09-26T21:04:59.999+00:00"  # inside the frozen trade
+        result = self.run_refresh(store, "official", [shifted], "run-2")
+        self.assertEqual((result["newly_recorded"], result["overlaps_frozen_trade"], len(store.rows)), (0, 1, 1))
+
     def test_open_position_is_not_recorded_on_refresh(self):
         store = FakeStore()
         result = self.run_refresh(store, "official", [trade(0.1, status="open")], "a")
         self.assertEqual((result["closed_seen"], result["newly_recorded"], len(store.rows)), (0, 0, 0))
+
+    def test_overlaps_inside_one_batch_keep_only_the_earliest_entry(self):
+        shifted = trade(-0.4)
+        shifted["opened_at"] = "2026-09-26T21:04:59.999+00:00"
+        for batch in ([trade(0.257), shifted], [shifted, trade(0.257)]):
+            store = FakeStore()
+            result = self.run_refresh(store, "official", batch, "batch")
+            self.assertEqual((result["newly_recorded"], result["overlaps_frozen_trade"]), (1, 1))
+            self.assertEqual(next(iter(store.rows.values()))["profit_usdt"], 0.257)
+
+    def test_adjacent_trades_and_other_pairs_do_not_conflict(self):
+        store = FakeStore()
+        self.run_refresh(store, "official", [trade(0.257)], "first")
+        adjacent = trade(0.3)
+        adjacent["opened_at"] = trade(0)["closed_at"]
+        adjacent["closed_at"] = "2026-09-26T23:04:59.999+00:00"
+        other = trade(0.4)
+        other["pair"] = "ETH/USDT"
+        result = self.run_refresh(store, "official", [adjacent, other], "next")
+        self.assertEqual((result["newly_recorded"], result["overlaps_frozen_trade"]), (2, 0))
+
+    def test_parallel_refresh_reports_pnl_drift_against_the_winning_insert(self):
+        winner = ledger.ledger_rows("official", [trade(0.257)], "other-tab")
+        store = FakeStore(racing=winner)
+        result = self.run_refresh(store, "official", [trade(0.1)], "this-tab")
+        self.assertEqual(result["newly_recorded"], 0)
+        self.assertEqual(result["recalculated_differs_from_recorded"], 1)
+        self.assertEqual(next(iter(store.rows.values()))["profit_usdt"], 0.257)
 
 
 if __name__ == "__main__":

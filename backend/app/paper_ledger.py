@@ -32,7 +32,8 @@ def ledger_rows(paper_label: str, trades: list[dict[str, Any]], run_id: str | No
     stamp = recorded_at or datetime.now(UTC).isoformat()
     rows = []
     for trade in trades:
-        if trade.get("status") != "closed":
+        # A forced end-of-test exit is not a real close: the position is still open.
+        if trade.get("status") != "closed" or trade.get("exit_reason") == "end_of_test":
             continue
         raw = trade.get("raw") or {}
         profile = raw.get("cost_components") or {}
@@ -67,6 +68,34 @@ def drifted_ids(rows: list[dict[str, Any]], recorded_profit: dict[str, float], t
             if row["id"] in recorded_profit and abs(float(row["profit_usdt"]) - float(recorded_profit[row["id"]])) > tolerance]
 
 
+def overlapping_ids(rows: list[dict[str, Any]], existing: list[dict[str, Any]]) -> list[str]:
+    """New rows overlapping a frozen trade or an earlier accepted row of the same pair.
+
+    One position per pair is open at a time, so an overlap means the recalculated
+    history diverged from the frozen one; recording it would double-count.
+    """
+    def ms(value: Any) -> float:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+
+    frozen = [(row["pair"], ms(row["opened_at"]), ms(row["closed_at"])) for row in existing
+              if row.get("pair") and row.get("opened_at") and row.get("closed_at")]
+    conflicts = []
+    accepted_ids = set()
+    # Also compare against rows accepted earlier in this batch. The earliest
+    # entry wins deterministically; an existing frozen row always takes priority.
+    for row in sorted(rows, key=lambda item: (ms(item["opened_at"]), ms(item["closed_at"]), item["id"])):
+        if row["id"] in accepted_ids:
+            continue
+        start, end = ms(row["opened_at"]), ms(row["closed_at"])
+        if any(pair == row["pair"] and start < closed and end > opened
+               for pair, opened, closed in frozen):
+            conflicts.append(row["id"])
+        else:
+            frozen.append((row["pair"], start, end))
+            accepted_ids.add(row["id"])
+    return conflicts
+
+
 def ledger_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     pnl = [float(row["profit_usdt"]) for row in rows]
     wins = [value for value in pnl if value > 0]
@@ -85,7 +114,7 @@ async def append_closed_trades(paper_label: str, trades: list[dict[str, Any]], r
                                read_existing, insert_new) -> dict[str, Any]:
     """Freeze newly closed trades using injected storage calls.
 
-    read_existing(paper_label) -> rows with id and profit_usdt
+    read_existing(paper_label) -> rows with id, pair, opened_at, closed_at and profit_usdt
     insert_new(rows) -> rows that were really inserted
 
     Kept free of web framework imports so repeated refreshes can be tested.
@@ -94,8 +123,16 @@ async def append_closed_trades(paper_label: str, trades: list[dict[str, Any]], r
     existing = await read_existing(paper_label)
     recorded = {row["id"]: row.get("profit_usdt") for row in existing}
     fresh = new_rows(rows, set(recorded))
+    conflicts = set(overlapping_ids(fresh, existing))
+    fresh = [row for row in fresh if row["id"] not in conflicts]
     inserted = await insert_new(fresh) if fresh else []
     if len(inserted) != len(fresh):
-        raise ValueError("paper_ledger_incomplete_write")
+        # A parallel refresh may have frozen the same rows first. That is fine;
+        # only rows that are still missing afterwards are a failed write.
+        stored = await read_existing(paper_label)
+        recorded.update({row["id"]: row.get("profit_usdt") for row in stored})
+        if any(row["id"] not in recorded for row in fresh):
+            raise ValueError("paper_ledger_incomplete_write")
     return {"closed_seen": len(rows), "newly_recorded": len(inserted),
-            "recalculated_differs_from_recorded": len(drifted_ids(rows, recorded))}
+            "recalculated_differs_from_recorded": len(drifted_ids(rows, recorded)),
+            "overlaps_frozen_trade": len(conflicts)}
