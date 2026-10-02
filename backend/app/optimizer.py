@@ -92,8 +92,10 @@ def diagnostic_rank(row: dict) -> tuple:
     """Distance to validation gates only; never a candidate or holdout ranking."""
     m = row.get("walk_forward_metrics") or {}
     windows = row.get("validation_windows") or []
-    other_failures = int(not float(m.get("realized_profit", 0)) > 0) + int(float(m.get("max_drawdown_percent", 100)) > 15) + int(sum(float(w.get("realized_profit", 0)) > 0 for w in windows) < 2)
-    return (other_failures, max(0, 20 - int(m.get("closed_trades", 0))),
+    other_failures = (int(not float(m.get("realized_profit", 0)) > 0)
+                      + int(float(m.get("max_drawdown_percent", 100)) > MAX_DRAWDOWN_PERCENT)
+                      + int(sum(float(w.get("realized_profit", 0)) > 0 for w in windows) < MIN_PROFITABLE_WF_WINDOWS))
+    return (other_failures, max(0, MIN_VALIDATION_TRADES - int(m.get("closed_trades", 0))),
             -float(m.get("realized_profit", 0)), float(m.get("max_drawdown_percent", 100)), row.get("variant_id", ""))
 
 
@@ -359,7 +361,7 @@ def optimize(candle_sets: dict[tuple[str, str], list[dict[str, Any]]], base: dic
         if timeframe not in PRIMARY_TIMEFRAMES:
             raise ValueError("Optimalizácia podporuje iba intervaly 15m a 5m.")
         if len(candles) < 200:
-            raise ValueError("Nedostatok sviečok pre tri validačné okná a holdout.")
+            raise ValueError("Nedostatok sviečok pre päť validačných okien a holdout.")
         windows, _ = walk_forward_windows(candles, warmup)
         boundary = max(120, int(len(candles) * .8))
         snapshot_id = f"{pair}:{timeframe}"

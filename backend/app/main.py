@@ -4075,7 +4075,7 @@ async def optimizer_entry_path_audit(job_id: str):
     candles = unpack_snapshot(snapshot)
     trades = [
         trade for trade in (row.get("trades") or result.get("trades") or [])
-        if trade.get("window") in {"wf1", "wf2", "wf3"}
+        if str(trade.get("window", "")).startswith("wf")
     ]
     expected = int((row.get("walk_forward_metrics") or {}).get("closed_trades") or 0)
     if len(trades) != expected:

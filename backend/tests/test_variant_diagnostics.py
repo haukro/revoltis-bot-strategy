@@ -34,16 +34,19 @@ def test_window_aggregation_weights_individual_trades_not_average_of_averages():
     assert combined["expectancy"] == pytest.approx(14 / 12)
 
 
-def test_validation_requires_two_positive_windows_and_positive_total_pnl():
-    windows = [metrics([1] * 8), metrics([.5] * 8), metrics([-.2] * 8)]
+def test_validation_requires_three_of_five_positive_windows_forty_trades_and_positive_total_pnl():
+    windows = [metrics([1] * 8), metrics([.5] * 8), metrics([.5] * 8), metrics([-.2] * 8), metrics([-.2] * 8)]
     check = assess_validation(aggregate_metrics(windows, 100), windows)
     assert check["validation_passed"]
-    assert check["profitable_validation_windows"] == 2
-    windows = [metrics([1] * 8), metrics([-.2] * 8), metrics([-.2] * 8)]
+    assert check["profitable_validation_windows"] == 3
+    windows = [metrics([1] * 8), metrics([1] * 8), metrics([-.2] * 8), metrics([-.2] * 8), metrics([-.2] * 8)]
     check = assess_validation(aggregate_metrics(windows, 100), windows)
     assert check["validation_rejection_reasons"] == ["nestabilita"]
-    windows = [metrics([.1] * 8), metrics([.1] * 8), metrics([-1] * 8, 16)]
-    assert assess_validation(aggregate_metrics(windows, 100), windows)["validation_rejection_reasons"] == ["zaporny_pnl", "drawdown"]
+    windows = [metrics([1] * 8)] * 3
+    check = assess_validation(aggregate_metrics(windows, 100), windows)
+    assert check["validation_rejection_reasons"] == ["malo_obchodov", "nestabilita"]
+    windows = [metrics([.1] * 8)] * 3 + [metrics([-1] * 8), metrics([-1] * 8, 16)]
+    assert assess_validation(aggregate_metrics(windows, 100), windows)["validation_rejection_reasons"] == ["zaporny_pnl", "drawdown", "window_drawdown"]
 
 
 def test_all_twenty_rows_preserve_windows_and_never_touch_holdout_if_validation_fails():
@@ -56,8 +59,8 @@ def test_all_twenty_rows_preserve_windows_and_never_touch_holdout_if_validation_
         assert start != holdout_start, "Failed validation must not read holdout"
         if start is None:
             return {"metrics": metrics([1] * 100)}
-        # 24 trades but two losing windows: still ineligible, no hidden winner.
-        positive = start == data[240]["open_time"]
+        # 40 trades but four losing windows: still ineligible, no hidden winner.
+        positive = start == data[192]["open_time"]
         return {"metrics": metrics([1 if positive else -.1] * 8)}
 
     with patch("app.optimizer.simulate", side_effect=simulation):
@@ -66,8 +69,8 @@ def test_all_twenty_rows_preserve_windows_and_never_touch_holdout_if_validation_
     assert len({row["variant_id"] for row in result["variant_results"]}) == 20
     assert result["winner"] is None
     for row in result["variant_results"]:
-        assert [window["closed_trades"] for window in row["validation_windows"]] == [8, 8, 8]
-        assert row["walk_forward_metrics"]["closed_trades"] == 24
+        assert [window["closed_trades"] for window in row["validation_windows"]] == [8, 8, 8, 8, 8]
+        assert row["walk_forward_metrics"]["closed_trades"] == 40
         assert row["rejection_reasons"] == ["nestabilita"]
         assert row["holdout_metrics"] is None
         assert row["buy_hold_percent"] is None
@@ -94,13 +97,18 @@ def test_eligible_nonfinalists_do_not_get_holdout_and_failed_finalist_has_no_rep
     assert result["winner"] is None
 
 
-def test_expectancy_precedes_payoff_and_insufficient_sample_cannot_rank():
-    low_payoff = {"validation_passed": True, "walk_forward_metrics": metrics([.7] * 16 + [-1] * 4)}
-    high_payoff = {"validation_passed": True, "walk_forward_metrics": metrics([2] * 7 + [-1] * 13)}
-    assert validation_rank(low_payoff) > validation_rank(high_payoff)
-    short = {"validation_passed": True, "walk_forward_metrics": metrics([100] * 8)}
+def test_risk_adjusted_score_ranks_first_and_insufficient_sample_cannot_rank():
+    def row(profits, score, dd=1):
+        return {"validation_passed": True, "walk_forward_metrics": metrics(profits, dd), "risk_adjusted_oos_score": score}
+    higher_score = row([.7] * 32 + [-1] * 8, 2.0)
+    more_trades = row([1] * 60, 1.0)
+    assert validation_rank(higher_score) > validation_rank(more_trades)
+    assert validation_rank(row([1] * 60, 1.0)) > validation_rank(row([1] * 40, 1.0))
+    assert validation_rank(row([1] * 40, 1.0, dd=1)) > validation_rank(row([1] * 40, 1.0, dd=5))
+    short = row([100] * 8, 99.0)
     assert validation_rank(short)[0] == float("-inf")
-    assert payoff_note(low_payoff["walk_forward_metrics"], 10, beats_hold=True) == "slaby_pomer"
+    assert validation_rank({**higher_score, "validation_passed": False})[0] == float("-inf")
+    assert payoff_note(higher_score["walk_forward_metrics"], 10, beats_hold=True) == "slaby_pomer"
     assert payoff_note(short["walk_forward_metrics"], 20) is None
 
 
@@ -139,7 +147,18 @@ def test_optimizer_persists_entry_diagnostics_for_each_wf_window():
 
     for row in result["variant_results"]:
         windows = row["entry_diagnostics_windows"]
-        assert [window["window"] for window in windows] == ["wf1", "wf2", "wf3"]
+        assert [window["window"] for window in windows] == ["wf1", "wf2", "wf3", "wf4", "wf5"]
         assert all(window["skip_rsi"] == 20 for window in windows)
         assert all(window["skip_rebound"] == 40 for window in windows)
         assert all(window["passed_entry"] == 8 for window in windows)
+
+
+def test_diagnostic_rank_uses_policy_v4_gates():
+    from app.optimizer import diagnostic_rank
+    two_positive = {"walk_forward_metrics": {"closed_trades": 40, "realized_profit": 1, "max_drawdown_percent": 1},
+                    "validation_windows": [{"realized_profit": 1}] * 2 + [{"realized_profit": -.1}] * 3}
+    three_positive = {**two_positive, "validation_windows": [{"realized_profit": 1}] * 3 + [{"realized_profit": -.1}] * 2}
+    assert diagnostic_rank(two_positive)[0] == 1
+    assert diagnostic_rank(three_positive)[0] == 0
+    short = {**three_positive, "walk_forward_metrics": {**three_positive["walk_forward_metrics"], "closed_trades": 25}}
+    assert diagnostic_rank(short)[1] == 15
