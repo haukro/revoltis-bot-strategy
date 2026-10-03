@@ -88,6 +88,15 @@ $func$;
 revoke all on function public.append_paper_trade_ledger(jsonb) from public;
 do $grant$
 begin
+  -- Supabase default privileges also grant these roles EXECUTE explicitly.
+  -- Revoking PUBLIC alone leaves those grants intact. Check each role because
+  -- a plain PostgreSQL installation does not have the Supabase roles.
+  if exists (select 1 from pg_roles where rolname = 'anon') then
+    revoke all on function public.append_paper_trade_ledger(jsonb) from anon;
+  end if;
+  if exists (select 1 from pg_roles where rolname = 'authenticated') then
+    revoke all on function public.append_paper_trade_ledger(jsonb) from authenticated;
+  end if;
   if exists (select 1 from pg_roles where rolname = 'service_role') then
     grant execute on function public.append_paper_trade_ledger(jsonb) to service_role;
   end if;

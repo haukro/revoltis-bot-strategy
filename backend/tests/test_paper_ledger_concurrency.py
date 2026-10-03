@@ -25,6 +25,7 @@ if not DSN:
                 allow_module_level=True)
 
 import psycopg  # noqa: E402
+from psycopg import sql  # noqa: E402
 from psycopg.types.json import Jsonb  # noqa: E402
 
 from app.paper_ledger import append_closed_trades, ledger_rows  # noqa: E402
@@ -34,19 +35,73 @@ MIGRATIONS = Path(__file__).parents[2] / "supabase" / "migrations"
 
 
 @pytest.fixture
-def db():
+def empty_db():
     name = f"ledger_{uuid.uuid4().hex[:12]}"
     with psycopg.connect(DSN, autocommit=True) as admin:
         admin.execute(f'create database "{name}"')
     dsn = psycopg.conninfo.make_conninfo(DSN, dbname=name)
     try:
-        with psycopg.connect(dsn, autocommit=True) as conn:
-            for migration in ("028_paper_trade_ledger.sql", "029_paper_trade_ledger_no_overlap.sql"):
-                conn.execute((MIGRATIONS / migration).read_text())
         yield dsn
     finally:
         with psycopg.connect(DSN, autocommit=True) as admin:
             admin.execute(f'drop database if exists "{name}" with (force)')
+
+
+def apply_migrations(conn):
+    for migration in ("028_paper_trade_ledger.sql", "029_paper_trade_ledger_no_overlap.sql"):
+        conn.execute((MIGRATIONS / migration).read_text())
+
+
+@pytest.fixture
+def db(empty_db):
+    with psycopg.connect(empty_db, autocommit=True) as conn:
+        apply_migrations(conn)
+    return empty_db
+
+
+def test_rpc_permissions_override_supabase_default_grants(empty_db):
+    roles = ("anon", "authenticated", "service_role")
+    with psycopg.connect(empty_db) as conn:
+        try:
+            # Roles are cluster-wide. Roll this transaction back even on success
+            # so this test cannot populate the clean-Postgres case below.
+            for role in roles:
+                if not conn.execute("select 1 from pg_roles where rolname = %s", [role]).fetchone():
+                    conn.execute(sql.SQL("create role {} nologin").format(sql.Identifier(role)))
+            conn.execute("alter default privileges in schema public "
+                         "grant execute on functions to anon, authenticated, service_role")
+            apply_migrations(conn)
+
+            for role in roles:
+                allowed = conn.execute(
+                    "select has_function_privilege(%s, 'public.append_paper_trade_ledger(jsonb)', 'EXECUTE')",
+                    [role],
+                ).fetchone()[0]
+                assert allowed is (role == "service_role"), f"Unexpected EXECUTE privilege for {role}"
+
+            for role in ("anon", "authenticated"):
+                with pytest.raises(psycopg.errors.InsufficientPrivilege,
+                                   match="permission denied for function append_paper_trade_ledger"):
+                    with conn.transaction():
+                        conn.execute(sql.SQL("set local role {}").format(sql.Identifier(role)))
+                        assert conn.execute("select current_user").fetchone()[0] == role
+                        # Empty input must be denied at EXECUTE, before RLS is involved.
+                        append(conn, [])
+
+            conn.execute("set local role service_role")
+            assert conn.execute("select current_user").fetchone()[0] == "service_role"
+            assert append(conn, []) == {}
+        finally:
+            conn.rollback()
+
+
+def test_migrations_work_without_supabase_roles(empty_db):
+    with psycopg.connect(empty_db) as conn:
+        assert conn.execute(
+            "select rolname from pg_roles where rolname in ('anon', 'authenticated', 'service_role')"
+        ).fetchall() == [], "This regression requires a clean PostgreSQL server without Supabase roles"
+        apply_migrations(conn)
+        assert append(conn, []) == {}
 
 
 def row(label="official", pair="HYPE/USDT", opened="2026-09-26T20:49:59.999+00:00",
