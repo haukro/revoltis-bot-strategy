@@ -54,7 +54,7 @@ function diagnosticResult(raw: any): any {
   if (!usable.length) return raw;
   const distance = (r: any) => {
     const m = r.walk_forward_metrics;
-    return [Number(!(Number(m.realized_profit) > 0)) + Number(Number(m.max_drawdown_percent) > 15) + Number(r.validation_windows.filter((w: any) => Number(w.realized_profit) > 0).length < 2),
+    return [Number(!(Number(m.realized_profit) > 0)) + Number(Number(m.max_drawdown_percent) > 15) + Number(r.validation_windows.filter((w: any) => Number(w.realized_profit) > 0).length < (raw.selection_policy_version === 4 ? 3 : 2)),
       Math.max(0, (raw.selection_policy_version === 4 ? 40 : 20) - Number(m.closed_trades)), -Number(m.realized_profit), Number(m.max_drawdown_percent)];
   };
   const selected = [...usable].sort((a, b) => { const x = distance(a), y = distance(b); return x[0] - y[0] || x[1] - y[1] || x[2] - y[2] || x[3] - y[3] || String(a.variant_id).localeCompare(String(b.variant_id)); })[0];

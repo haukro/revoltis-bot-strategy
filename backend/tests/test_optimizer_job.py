@@ -112,7 +112,7 @@ def test_combine_optimizer_lock_results_keeps_current_lock_and_all_coin_rows():
     assert combined["qualified"] is False
     assert combined["winner"] is None
     assert combined["strategy_code"] is None
-    assert combined["job_verdict"] == "ŽIADNY PLATNÝ VARIANT"
+    assert combined["job_verdict"] == "REJECTED"
 
 
 def test_optimizer_candle_downloads_are_bounded_and_concurrent():

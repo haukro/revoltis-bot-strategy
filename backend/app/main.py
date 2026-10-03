@@ -19,6 +19,7 @@ from .simulation import simulate
 from .optimizer import optimize, present_optimizer_record, assess_candidate, aggregate_metrics, walk_forward_windows
 from .trade_audit import matches_target, prepare_replay, replay_validation, unpack_snapshot, trade_tape, tape_summary, entry_path_audit
 from .costs import book_costs, FEE_SCHEDULE, FEE_TAKER, FEE_MAKER, net_return
+from .paper_ledger import append_closed_trades, closed_candles_only, ledger_summary, overlapping_ids
 from .tsmom_b_v1 import (
     pack_ohlc_snapshot,
     unpack_ohlc_snapshot,
@@ -283,6 +284,42 @@ async def supabase_upsert_many(table: str, records: list[dict]) -> list[dict]:
         response = await client.post(f"{url}/rest/v1/{table}?on_conflict=id", headers=headers, json=records)
         response.raise_for_status()
         return response.json()
+
+
+# Local demo mode has no database constraint; one process-wide lock gives the
+# same check-and-insert atomicity that migration 029 gives Supabase.
+local_paper_ledger_lock = asyncio.Lock()
+
+
+async def insert_paper_ledger_rows(rows: list[dict]) -> dict:
+    """Freeze rows atomically. Duplicate ids keep the first value; overlaps are rejected."""
+    if not rows:
+        return {"inserted": [], "overlapping": []}
+    url = os.getenv("SUPABASE_URL")
+    if not url or not os.getenv("SUPABASE_SERVICE_ROLE_KEY"):
+        async with local_paper_ledger_lock:
+            existing = local_store.get("paper_trade_ledger")
+            known = {row["id"] for row in existing}
+            candidates = [row for row in rows if row["id"] not in known]
+            overlapping = overlapping_ids(candidates, existing)
+            accepted = [row for row in candidates if row["id"] not in set(overlapping)]
+            if accepted:
+                local_store.upsert("paper_trade_ledger", accepted)
+            return {"inserted": accepted, "overlapping": overlapping}
+    outcomes = await supabase_rpc("append_paper_trade_ledger", {"p_rows": rows})
+    by_id = {row["id"]: row for row in rows}
+    if not isinstance(outcomes, list) or {item.get("ledger_id") for item in outcomes} != set(by_id):
+        raise ValueError("paper_ledger_rpc_incomplete")
+    return {"inserted": [by_id[item["ledger_id"]] for item in outcomes if item.get("outcome") == "inserted"],
+            "overlapping": [item["ledger_id"] for item in outcomes if item.get("outcome") == "overlap"]}
+
+
+async def append_paper_ledger(paper_label: str, trades: list[dict], run_id: str) -> dict:
+    """Freeze newly closed paper trades. Already recorded trades are never changed."""
+    async def read_existing(label: str) -> list[dict]:
+        return await supabase_get("paper_trade_ledger", f"select=id,paper_label,pair,opened_at,closed_at,profit_usdt&paper_label=eq.{label}&limit=10000")
+
+    return await append_closed_trades(paper_label, trades, run_id, read_existing, insert_paper_ledger_rows)
 
 
 async def supabase_rpc(function_name: str, payload: dict[str, Any]) -> Any:
@@ -2207,6 +2244,8 @@ async def pick_market_universe(request: UniversePickRequest):
 @app.post("/api/simulations/run")
 async def run_standalone_simulation(request: SimulationRequest):
     """Run a complete backtest from public OKX candles without Freqtrade."""
+    if request.paper_label and request.force_close_at_end:
+        raise HTTPException(422, "Paper test nesmie nútene uzatvárať pozície na konci.")
     settings = request.settings.model_dump()
     pairs = settings["selected_pairs"]
     if not pairs:
@@ -2217,6 +2256,9 @@ async def run_standalone_simulation(request: SimulationRequest):
         candle_sets = await asyncio.gather(*(load_okx_candles(pair, settings["timeframe"], request.candle_limit, request.start_time, request.end_time) for pair in pairs))
     except httpx.HTTPError as error:
         raise HTTPException(502, f"Simuláciu nebolo možné načítať z OKX: {error}")
+    if request.paper_label:
+        now_ms = int(datetime.now(UTC).timestamp() * 1000)
+        candle_sets = [closed_candles_only(candles, now_ms, request.end_time) for candles in candle_sets]
     expected_count = request.candle_limit
     if request.start_time is not None and request.end_time is not None:
         expected_count = min(request.candle_limit, max(1, (request.end_time - request.start_time + TIMEFRAME_MILLISECONDS[settings["timeframe"]] - 1) // TIMEFRAME_MILLISECONDS[settings["timeframe"]]))
@@ -2262,8 +2304,24 @@ async def run_standalone_simulation(request: SimulationRequest):
         await supabase_upsert_many("simulated_trades", result["trades"])
     now = datetime.now(UTC).isoformat()
     record = {"id": str(uuid4()), "status": "completed", "started_at": now, "finished_at": now, "test_start": request.start_time, "test_end": request.end_time, "timeframe": settings["timeframe"], "pairs": pairs, "summary": result["metrics"], "progress": {"equity_curve": result["equity_curve"], "per_pair_metrics": result["per_pair_metrics"], "per_pair_equity_curves": result["per_pair_equity_curves"], "data_coverage": data_coverage, "rejections": result["rejections"], "trading_start_time": request.trading_start_time, "paper_forward": bool(request.trading_start_time), "paper_label": request.paper_label, "paper_initial_capital": settings["initial_capital"] if request.paper_label else None, "paper_stake_amount": settings["stake_amount"] if request.paper_label else None, "cost_model": "current_okx_book" if request.use_current_cost_model else "simulation_default"}}
+    ledger = None
+    if request.paper_label and request.use_current_cost_model:
+        try:
+            ledger = await append_paper_ledger(request.paper_label, result["trades"], record["id"])
+        except (httpx.HTTPError, KeyError, ValueError) as error:
+            # Do not report a completed paper run whose results were not frozen.
+            raise HTTPException(502, f"paper_ledger_write_failed: {error}")
     await supabase_upsert("simulation_runs", record)
-    return {"source": "OKX public spot API", "timeframe": settings["timeframe"], "mode": "simulation", "live_trading": False, "data_coverage": data_coverage, "run": record, **result}
+    return {"source": "OKX public spot API", "timeframe": settings["timeframe"], "mode": "simulation", "live_trading": False, "data_coverage": data_coverage, "run": record, "paper_ledger": ledger, **result}
+
+
+@app.get("/api/paper/ledger")
+async def paper_trade_ledger(label: Literal["official", "scale_300_150"]):
+    """Frozen closed paper trades. Rows are append-only and never recalculated."""
+    rows = await supabase_get("paper_trade_ledger", f"select=*&paper_label=eq.{label}&order=closed_at.asc&limit=10000")
+    rows = [row for row in rows if row.get("paper_label") == label]
+    rows.sort(key=lambda row: row.get("closed_at") or "")
+    return {"paper_label": label, "live_trading": False, "summary": ledger_summary(rows), "trades": rows}
 
 
 def universe_version(versions: list[dict]) -> dict | None:
@@ -4075,7 +4133,7 @@ async def optimizer_entry_path_audit(job_id: str):
     candles = unpack_snapshot(snapshot)
     trades = [
         trade for trade in (row.get("trades") or result.get("trades") or [])
-        if trade.get("window") in {"wf1", "wf2", "wf3"}
+        if str(trade.get("window", "")).startswith("wf")
     ]
     expected = int((row.get("walk_forward_metrics") or {}).get("closed_trades") or 0)
     if len(trades) != expected:

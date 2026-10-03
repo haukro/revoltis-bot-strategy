@@ -13,7 +13,7 @@ from typing import Any
 
 
 class LocalStore:
-    tables = ("strategy_settings", "simulated_trades", "sync_events", "strategy_versions", "backtest_runs", "signal_diagnostics", "simulation_runs", "optimizer_runs")
+    tables = ("strategy_settings", "simulated_trades", "sync_events", "strategy_versions", "backtest_runs", "signal_diagnostics", "simulation_runs", "optimizer_runs", "paper_trade_ledger")
 
     def __init__(self) -> None:
         # Vercel functions may write only to their temporary directory.  Real
