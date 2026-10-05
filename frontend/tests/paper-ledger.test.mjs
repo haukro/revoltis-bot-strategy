@@ -1,9 +1,30 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { fetchPaperLedger, ledgerMetrics } from '../src/paper-ledger.ts';
+import { fetchPaperLedger, ledgerMetrics, legacyPaperTransition } from '../src/paper-ledger.ts';
 
 const row = (profit, closedAt) => ({ id: `official|HYPE/USDT|${closedAt}`, paper_label: 'official', pair: 'HYPE/USDT', opened_at: closedAt, closed_at: closedAt, entry_rate: 90, exit_rate: 91, stake_amount: 50, profit_usdt: profit, exit_reason: 'trailing_profit' });
 const reply = (ok, body) => async () => ({ ok, json: async () => body });
+
+test('legacy summaries must match the label, pair and exact original start', () => {
+  const saved = { started_at: 1790407139654, pair: 'HYPE/USDT' };
+  const run = { pairs: ['HYPE/USDT'], finished_at: '2026-10-05T17:55:49Z',
+    summary: { closed_trades: 8, realized_profit: .5726 },
+    progress: { paper_forward: true, paper_label: 'official', trading_start_time: saved.started_at } };
+  assert.equal(legacyPaperTransition([], false, saved, run, 'official').snapshot.pnl, .5726);
+  assert.equal(legacyPaperTransition([], false, saved, run, 'scale_300_150'), null);
+  assert.equal(legacyPaperTransition([], false, { ...saved, started_at: saved.started_at + 1 }, run, 'official'), null);
+  assert.equal(legacyPaperTransition([], false, { ...saved, pair: 'BTC/USDT' }, run, 'official'), null);
+  assert.equal(legacyPaperTransition([], false, saved, { ...run, summary: { closed_trades: 8, realized_profit: null } }, 'official'), null);
+});
+
+test('older unlabelled official summaries cannot become Scale results', () => {
+  const saved = { started_at: 1790407139654, pair: 'HYPE/USDT' };
+  const run = { pairs: ['HYPE/USDT'], finished_at: '2026-10-05T17:55:49Z',
+    summary: { closed_trades: 8, realized_profit: .5726 },
+    progress: { paper_forward: true, trading_start_time: saved.started_at } };
+  assert.equal(legacyPaperTransition([], false, saved, run, 'official').snapshot.trades, 8);
+  assert.equal(legacyPaperTransition([], false, saved, run, 'scale_300_150'), null);
+});
 
 test('metrics come only from frozen ledger rows', () => {
   const rows = [row(0.257, '2026-09-26T22:39:59Z'), row(-0.365, '2026-09-27T21:09:59Z'), row(0.744, '2026-09-28T16:44:59Z')];

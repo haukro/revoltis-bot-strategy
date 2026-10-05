@@ -16,6 +16,37 @@ export type LedgerRow = {
   status?: string;
 };
 
+type SavedPaper = { started_at?: number; completed_at?: number; pair?: string };
+type SavedRun = {
+  finished_at?: string;
+  progress?: { paper_forward?: boolean; paper_label?: string | null; trading_start_time?: number };
+  summary?: { closed_trades?: number; realized_profit?: number };
+  pairs?: string[];
+};
+export type LegacyPaperTransition = {
+  completed: boolean;
+  snapshot: { finished_at: string; trades: number; pnl: number } | null;
+};
+
+// A pre-ledger summary is an archive, never a substitute for ledger metrics.
+// Bind it to this test's start and label, not just the latest dashboard run.
+export const legacyPaperTransition = (rows: LedgerRow[] | null, failed: boolean,
+  saved: SavedPaper | null, run: SavedRun | null, label: PaperLabel): LegacyPaperTransition | null => {
+  if (!saved || rows === null || rows.length > 0 || failed) return null;
+  const progress = run?.progress;
+  const sameLabel = progress?.paper_label === label || (label === 'official' && progress?.paper_label == null);
+  const matches = Boolean(progress?.paper_forward && sameLabel && Number(saved.started_at) > 0
+    && Number(progress.trading_start_time) === Number(saved.started_at) && saved.pair && run?.pairs?.includes(saved.pair));
+  const trades = Number(run?.summary?.closed_trades);
+  const pnl = Number(run?.summary?.realized_profit);
+  const hasSnapshot = matches && Number.isInteger(trades) && trades > 0
+    && run?.summary?.realized_profit != null && Number.isFinite(pnl)
+    && Boolean(run?.finished_at && Number.isFinite(Date.parse(run.finished_at)));
+  if (!saved.completed_at && !hasSnapshot) return null;
+  return { completed: Boolean(saved.completed_at),
+    snapshot: hasSnapshot ? { finished_at: run!.finished_at!, trades, pnl } : null };
+};
+
 export const fetchPaperLedger = async (label: PaperLabel, request: typeof fetch = fetch): Promise<LedgerRow[]> => {
   const response = await request(`/api/paper/ledger?label=${label}`);
   if (!response.ok) throw new Error('paper_ledger_unavailable');
