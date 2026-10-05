@@ -18,7 +18,7 @@ async function until(predicate) {
   assert.fail('Panel did not reach the expected state');
 }
 
-async function panel(t, labels = ['official', 'scale_300_150']) {
+async function panel(t, labels = ['official', 'scale_300_150'], scenario = {}) {
   const dom = new JSDOM('<!doctype html><html><head></head><body><div id="root"></div></body></html>', { url: 'http://localhost/', runScripts: 'outside-only', pretendToBeVisual: true });
   t.after(() => dom.window.close());
   const w = dom.window;
@@ -29,6 +29,10 @@ async function panel(t, labels = ['official', 'scale_300_150']) {
   style.textContent = css;
   w.document.head.append(style);
   const saved = { version_id: 'fixture', pair: 'HYPE/USDT', timeframe: '5m', variant: 8, started_at: Date.now() - 35 * 86400000, settings: config, paused_by_user: true };
+  if (scenario.completed) {
+    saved.completed_at = Date.now() - 86400000;
+    saved.paused_by_user = false;
+  }
   if (labels.includes('official')) w.localStorage.setItem('nofomo-paper-forward-v1', JSON.stringify(saved));
   if (labels.includes('scale_300_150')) w.localStorage.setItem('nofomo-paper-scale-v1', JSON.stringify(saved));
   const pending = {};
@@ -43,7 +47,13 @@ async function panel(t, labels = ['official', 'scale_300_150']) {
     if (path === '/api/dashboard') {
       const metrics = { initial_capital: 100, portfolio_value: 199.9, realized_profit: 99.9, unrealized_profit: 0, closed_trades: 99, win_rate: 90, max_drawdown_percent: 0 };
       const run = { id: 'recalculated', summary: metrics, finished_at: '2026-10-01T23:00:00Z', progress: { paper_forward: true, per_pair_metrics: { 'HYPE/USDT': metrics } } };
-      data = { strategy: config, metrics, trades: [], last_simulation: run, last_scale_simulation: run, persistence: { durable: true, production_ready: true } };
+      if (scenario.legacy) {
+        run.pairs = ['HYPE/USDT'];
+        run.progress.trading_start_time = saved.started_at + (scenario.mismatchedStart ? 1 : 0);
+        run.progress.paper_label = 'official';
+      }
+      const scaleRun = scenario.legacy ? { ...run, progress: { ...run.progress, paper_label: 'scale_300_150' } } : run;
+      data = { strategy: config, metrics, trades: [], last_simulation: run, last_scale_simulation: scaleRun, persistence: { durable: true, production_ready: true } };
     } else if (path === '/api/strategy-versions' || path === '/api/backtests') data = [];
     else if (path === '/api/optimizer-latest') data = null;
     else if (path.startsWith('/api/market/scan')) data = { markets: [] };
@@ -56,14 +66,71 @@ async function panel(t, labels = ['official', 'scale_300_150']) {
   const alert = label => card(label).querySelector('[role="alert"]');
   const loading = label => card(label).querySelector('[role="status"]');
   function respond(label, status = 200, count) {
-    let profits = label === 'official' ? [0.257, -0.365, 0.744] : [1.908];
+    let profits = scenario.empty ? [] : label === 'official' ? [0.257, -0.365, 0.744] : [1.908];
     if (count) profits = profits.concat(Array(count - profits.length).fill(0));
     const trades = profits.map((profit, i) => ({ id: `${label}|HYPE/USDT|${i}`, paper_label: label, pair: 'HYPE/USDT', opened_at: `2026-09-${String(i + 1).padStart(2, '0')}T10:00:00Z`, closed_at: `2026-09-${String(i + 1).padStart(2, '0')}T11:00:00Z`, entry_rate: 90, exit_rate: 91, stake_amount: 50, profit_usdt: profit, exit_reason: 'trailing_profit' }));
     assert.ok(pending[label]?.length, `No pending ${label} request`);
     pending[label].shift()(new Response(JSON.stringify(status === 200 ? { trades } : { detail: 'unavailable' }), { status }));
   }
-  return { w, card, alert, loading, respond, pending };
+  return { w, card, alert, loading, respond, pending, saved };
 }
+
+test('paused legacy tests with an empty ledger show a separate archive, not zero results', async t => {
+  const p = await panel(t, undefined, { legacy: true, empty: true });
+  p.respond('official'); p.respond('scale_300_150');
+  await until(() => p.w.document.querySelectorAll('.paper-history-note').length === 2);
+  for (const label of ['official', 'scale_300_150']) {
+    assert.match(p.card(label).textContent, /99 obchodov.*\+99\.9000 USDT/);
+    assert.match(p.card(label).textContent, /nie o nemenný záznam/);
+    assert.doesNotMatch(p.card(label).textContent, /0\/30 obchodov/);
+  }
+  assert.equal(p.w.document.querySelector('.metric-grid'), null);
+  assert.equal(p.w.document.querySelector('.scale-metrics'), null);
+  for (const key of ['nofomo-paper-forward-v1', 'nofomo-paper-scale-v1'])
+    assert.deepEqual(JSON.parse(p.w.localStorage.getItem(key)), p.saved);
+});
+
+test('completed pre-ledger tests remain completed without a resume action', async t => {
+  const p = await panel(t, undefined, { legacy: true, empty: true, completed: true });
+  p.respond('official'); p.respond('scale_300_150');
+  await until(() => p.w.document.querySelectorAll('.paper-history-note').length === 2);
+  for (const label of ['official', 'scale_300_150']) {
+    assert.match(p.card(label).textContent, /Predošlý.*test ukončený/);
+    assert.match(p.card(label).textContent, /automaticky sa znovu nespustí/);
+    assert.equal(p.card(label).querySelector('.run-button'), null);
+    assert.doesNotMatch(p.card(label).textContent, /0\/30 obchodov/);
+  }
+  await new Promise(resolve => setTimeout(resolve, 650));
+  for (const key of ['nofomo-paper-forward-v1', 'nofomo-paper-scale-v1'])
+    assert.deepEqual(JSON.parse(p.w.localStorage.getItem(key)), p.saved);
+});
+
+test('a completed test never borrows another test start summary', async t => {
+  const p = await panel(t, undefined, { legacy: true, empty: true, completed: true, mismatchedStart: true });
+  p.respond('official'); p.respond('scale_300_150');
+  await until(() => p.w.document.querySelectorAll('.paper-history-note').length === 2);
+  for (const label of ['official', 'scale_300_150']) {
+    assert.match(p.card(label).textContent, /nepodarilo jednoznačne priradiť/);
+    assert.doesNotMatch(p.card(label).textContent, /99 obchodov|99\.9000/);
+    assert.equal(p.card(label).querySelector('.run-button'), null);
+  }
+});
+
+test('populated ledgers take precedence over matching legacy summaries', async t => {
+  const p = await panel(t, undefined, { legacy: true });
+  p.respond('official'); p.respond('scale_300_150');
+  await until(() => !p.loading('official') && !p.loading('scale_300_150'));
+  assert.equal(p.w.document.querySelector('.paper-history-note'), null);
+  assert.match(p.w.document.querySelector('.metric-grid').textContent, /\+0\.636 USDT/);
+  assert.match(p.card('scale_300_150').textContent, /\+1\.9080 USDT/);
+});
+
+test('a failed ledger read cannot be disguised as a legacy transition', async t => {
+  const p = await panel(t, undefined, { legacy: true, empty: true, completed: true });
+  p.respond('official', 503); p.respond('scale_300_150', 503);
+  await until(() => p.alert('official') && p.alert('scale_300_150'));
+  assert.equal(p.w.document.querySelector('.paper-history-note'), null);
+});
 
 test('both panels show loading while their first responses are pending', async t => {
   const p = await panel(t);
