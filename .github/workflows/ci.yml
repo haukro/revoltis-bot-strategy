@@ -40,3 +40,4 @@ jobs:
           cache-dependency-path: frontend/pnpm-lock.yaml
       - run: pnpm install --frozen-lockfile
       - run: pnpm run build
+      - run: node --test tests/*.test.mjs

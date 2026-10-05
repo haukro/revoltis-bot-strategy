@@ -71,10 +71,13 @@ async function optimizerHarness(context, selected = defaults) {
     setOptimizerRunning: value => { state.running = value; }, setOptimizer: value => { state.optimizer = value; },
     setActiveUniverse: value => { state.lock = value; }, setConfig: value => { state.config = value; },
     setMarketPair: update => { state.pair = update('BONK/USDT'); }, setMessage: value => { state.message = value; },
-    combineOptimizerResults: () => ({ job_verdict: 'ŽIADNY PLATNÝ VARIANT', winner: null }),
+    combineOptimizerResults: () => ({ job_verdict: 'REJECTED', winner: null }),
     fetch: async (url, options) => {
       calls.push({ url, body: options?.body ? JSON.parse(options.body) : null });
-      return response(url === '/api/strategy-context' ? context : { status: 'completed', result: {} });
+      if (url === '/api/strategy-context') return response(context);
+      if (url === '/api/optimizer/run') return response({ id: `job-${calls.length}`, status: 'completed', result: {} });
+      if (url === '/api/optimizer/finalize') return response({ id: 'finalized', status: 'completed', result: { job_verdict: 'REJECTED', winner: null } });
+      throw new Error(`Unexpected request: ${url}`);
     },
   });
   await start();
@@ -84,8 +87,12 @@ async function optimizerHarness(context, selected = defaults) {
 test('matching cards run only the five server-locked coins with one version id', async () => {
   const { calls, state } = await optimizerHarness({ active_universe: lock }, pairs);
   assert.equal(calls[0].url, '/api/strategy-context');
-  assert.deepEqual(calls.slice(1).flatMap(call => call.body.pairs), pairs);
-  for (const call of calls.slice(1)) {
+  assert.deepEqual(calls.map(call => call.url), ['/api/strategy-context', ...pairs.map(() => '/api/optimizer/run'), '/api/optimizer/finalize']);
+  const runCalls = calls.filter(call => call.url === '/api/optimizer/run');
+  assert.deepEqual(runCalls.flatMap(call => call.body.pairs), pairs);
+  assert.equal(calls.at(-1).body.version_id, lock.version_id);
+  assert.deepEqual(calls.at(-1).body.source_job_ids, ['job-2', 'job-3', 'job-4', 'job-5', 'job-6']);
+  for (const call of runCalls) {
     assert.equal(call.body.version_id, lock.version_id);
     assert.deepEqual(call.body.settings.selected_pairs, pairs);
     assert.deepEqual(call.body.timeframes, ['15m', '5m']);
@@ -110,7 +117,8 @@ test('missing server lock stops before requesting any optimizer job', async () =
 });
 
 test('UNI and NEAR stay visible, checked and locked after proposal is dismissed', async () => {
-  const declaration = source.split('\n').find(line => line.includes('const availableCoins ='));
+  const declarationStart = source.indexOf('  const availableCoins =');
+  const declaration = source.slice(declarationStart, source.indexOf('  if (!config || !dashboard) return', declarationStart));
   const gridStart = source.indexOf('<div className="coin-grid">');
   const grid = source.slice(gridStart, source.indexOf('{groups.map', gridStart));
   const compiled = (await transformWithOxc(`${declaration}\nreturn (${grid});`, 'coin-grid.tsx', { jsx: { runtime: 'classic' } })).code;

@@ -19,6 +19,7 @@ A variant is validation-eligible only when all are true:
 - total after-cost validation PnL is positive;
 - aggregate OOS maximum drawdown is at most 15%;
 - no individual WF window exceeds the 15% drawdown budget;
+- validation and per-window trade count, PnL and drawdown must be present and finite; missing or non-finite window drawdown is rejected, never treated as zero;
 - at least 3 of 5 WF windows have positive after-cost PnL.
 
 Forty trades is an eligibility floor, not a statistical proof of durable edge. Results remain research evidence.
@@ -46,6 +47,7 @@ A frozen finalist is `QUALIFIED` only if all are true:
 - holdout maximum drawdown ≤ 15%;
 - holdout expectancy > 0;
 - holdout expectancy is at least 50% of validation expectancy;
+- validation expectancy must be present, finite and positive before this comparison; missing or invalid evidence cannot pass the holdout gate;
 - holdout return is at least the exposure-matched buy-and-hold return;
 - pair is still a member of the frozen locked universe.
 

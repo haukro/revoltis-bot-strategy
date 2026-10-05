@@ -92,8 +92,10 @@ def diagnostic_rank(row: dict) -> tuple:
     """Distance to validation gates only; never a candidate or holdout ranking."""
     m = row.get("walk_forward_metrics") or {}
     windows = row.get("validation_windows") or []
-    other_failures = int(not float(m.get("realized_profit", 0)) > 0) + int(float(m.get("max_drawdown_percent", 100)) > 15) + int(sum(float(w.get("realized_profit", 0)) > 0 for w in windows) < 2)
-    return (other_failures, max(0, 20 - int(m.get("closed_trades", 0))),
+    other_failures = (int(not float(m.get("realized_profit", 0)) > 0)
+                      + int(float(m.get("max_drawdown_percent", 100)) > MAX_DRAWDOWN_PERCENT)
+                      + int(sum(float(w.get("realized_profit", 0)) > 0 for w in windows) < MIN_PROFITABLE_WF_WINDOWS))
+    return (other_failures, max(0, MIN_VALIDATION_TRADES - int(m.get("closed_trades", 0))),
             -float(m.get("realized_profit", 0)), float(m.get("max_drawdown_percent", 100)), row.get("variant_id", ""))
 
 
@@ -143,19 +145,35 @@ def risk_adjusted_score(strategy_return_percent: float, benchmark_return_percent
     return round(excess / max(drawdown_percent, 1.0), 6)
 
 
+def finite_metric(metrics: dict[str, Any], key: str) -> float:
+    """Missing, malformed and non-finite numbers cannot satisfy a gate."""
+    try:
+        return float(metrics[key])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return float("nan")
+
+
 def assess_validation(metrics: dict[str, Any], windows: list[dict[str, Any]]) -> dict[str, Any]:
     """Policy v4 eligibility uses stitched OOS validation only."""
-    profitable = sum(float(window["realized_profit"]) > 0 for window in windows)
+    profitable = sum(isfinite(finite_metric(window, "realized_profit"))
+                     and finite_metric(window, "realized_profit") > 0 for window in windows)
     reasons = []
-    if int(metrics["closed_trades"]) < MIN_VALIDATION_TRADES:
+    required_metrics = ("closed_trades", "realized_profit", "max_drawdown_percent")
+    if any(not isfinite(finite_metric(item, key)) for item in [metrics, *windows] for key in required_metrics):
+        reasons.append("invalid_metrics")
+    if any(item.get(key) is not None and not isfinite(finite_metric(item, key))
+           for item in [metrics, *windows] for key in ("expectancy", "win_rate", "payoff")):
+        reasons.append("invalid_metrics")
+    trades = finite_metric(metrics, "closed_trades")
+    if not isfinite(trades) or int(trades) < MIN_VALIDATION_TRADES:
         reasons.append("malo_obchodov")
-    if not float(metrics["realized_profit"]) > 0:
+    if not finite_metric(metrics, "realized_profit") > 0:
         reasons.append("zaporny_pnl")
-    if not 0 <= float(metrics["max_drawdown_percent"]) <= MAX_DRAWDOWN_PERCENT:
+    if not 0 <= finite_metric(metrics, "max_drawdown_percent") <= MAX_DRAWDOWN_PERCENT:
         reasons.append("drawdown")
     if len(windows) != WF_WINDOW_COUNT or profitable < MIN_PROFITABLE_WF_WINDOWS:
         reasons.append("nestabilita")
-    if any(float(window.get("max_drawdown_percent", 0)) > MAX_DRAWDOWN_PERCENT for window in windows):
+    if any(not 0 <= finite_metric(window, "max_drawdown_percent") <= MAX_DRAWDOWN_PERCENT for window in windows):
         reasons.append("window_drawdown")
     return {"validation_passed": not reasons, "validation_rejection_reasons": list(dict.fromkeys(reasons)),
             "profitable_validation_windows": profitable}
@@ -188,7 +206,7 @@ def assess_candidate(row: dict[str, Any], locked_pairs: list[str]) -> dict[str, 
     profit = float(holdout.get("realized_profit", float("nan")))
     drawdown = float(holdout.get("max_drawdown_percent", float("nan")))
     profit_pct = profit / capital * 100 if capital > 0 else float("nan")
-    validation_expectancy = validation.get("expectancy")
+    validation_expectancy = finite_metric(validation, "expectancy")
     holdout_expectancy = holdout.get("expectancy")
     exposure_benchmark = row.get("holdout_exposure_matched_bh_percent")
     reasons = []
@@ -206,6 +224,8 @@ def assess_candidate(row: dict[str, Any], locked_pairs: list[str]) -> dict[str, 
         finite_values.append(float(exposure_benchmark))
     if not all(isfinite(value) for value in finite_values):
         reasons.append("invalid_metrics")
+    if not isfinite(validation_expectancy) or validation_expectancy <= 0:
+        reasons.append("invalid_validation_expectancy")
     if not profit > 0:
         reasons.append("non_positive_holdout_pnl")
     if not 0 <= drawdown <= MAX_DRAWDOWN_PERCENT:
@@ -359,7 +379,7 @@ def optimize(candle_sets: dict[tuple[str, str], list[dict[str, Any]]], base: dic
         if timeframe not in PRIMARY_TIMEFRAMES:
             raise ValueError("Optimalizácia podporuje iba intervaly 15m a 5m.")
         if len(candles) < 200:
-            raise ValueError("Nedostatok sviečok pre tri validačné okná a holdout.")
+            raise ValueError("Nedostatok sviečok pre päť validačných okien a holdout.")
         windows, _ = walk_forward_windows(candles, warmup)
         boundary = max(120, int(len(candles) * .8))
         snapshot_id = f"{pair}:{timeframe}"

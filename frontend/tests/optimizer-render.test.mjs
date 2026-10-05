@@ -11,14 +11,14 @@ import { normalizeOptimizerResult } from '../src/optimizer-result.ts';
 const source = readFileSync(new URL('../src/main.tsx', import.meta.url), 'utf8');
 const component = source.slice(source.indexOf('function FreqtradeVisual('), source.indexOf('function Metric('));
 assert.ok(component.length > 0);
-const compiled = (await transformWithOxc(component + '\nexports.View = AlgorithmResult; exports.ReplayNotice = ReplayAvailabilityNotice; exports.Freqtrade = FreqtradeVisual;', 'optimizer-view.tsx', {
+const compiled = (await transformWithOxc(component + '\nexports.View = AlgorithmResult; exports.ReplayNotice = ReplayAvailabilityNotice; exports.Freqtrade = FreqtradeVisual; exports.CurrentAudit = CurrentTradeAuditPanel;', 'optimizer-view.tsx', {
   jsx: { runtime: 'classic' },
 })).code;
 const exports = {};
 new Function('React', 'normalizeOptimizerResult', 'fields', 'exports', compiled)(React, normalizeOptimizerResult, {}, exports);
 
 test('Freqtrade stays unevaluated until the current lock has a matching result', () => {
-  const html = renderToStaticMarkup(React.createElement(exports.Freqtrade, { result: null, activeVersionId: 'lock-1' }));
+  const html = renderToStaticMarkup(React.createElement(exports.Freqtrade, { result: null, activeVersionId: 'lock-1', activePairs: [], timeframe: '5m' }));
   assert.match(html, /ZABLOKOVANÉ — NEVYHODNOTENÉ/);
   assert.match(html, /NEVYHODNOTENÉ/);
   assert.doesNotMatch(html, /PRIPRAVENÉ|NEPREŠIEL/);
@@ -28,7 +28,7 @@ test('Freqtrade stays unevaluated until the current lock has a matching result',
 test('Freqtrade ignores a result from a different lock version', () => {
   const html = renderToStaticMarkup(React.createElement(exports.Freqtrade, {
     result: { version_id: 'old-lock', qualified: false },
-    activeVersionId: 'current-lock',
+    activeVersionId: 'current-lock', activePairs: [], timeframe: '5m',
   }));
   assert.match(html, /ZABLOKOVANÉ — NEVYHODNOTENÉ/);
   assert.doesNotMatch(html, /NEPREŠIEL/);
@@ -42,24 +42,25 @@ test('actual old NEAR markup has no winner, n/a and a disabled copy button', () 
     validation_windows: [{ closed_trades: 8 }, { closed_trades: 7 }, { closed_trades: 5 }],
     strategy_code: 'LEGACY_CODE_MUST_NOT_RENDER',
   } }));
-  assert.match(html, /ŽIADNY PLATNÝ VARIANT/);
-  assert.match(html, /NEDOSTATOK OBCHODOV/);
+  assert.match(html, /REJECTED/);
+  assert.match(html, /STARÝ VÝSLEDOK — vyžaduje nové overenie/);
   assert.match(html, /Víťaz: žiadny/);
   assert.match(html, /<b>n\/a<\/b>/);
-  assert.match(html, /<button disabled="">Kopírovať algoritmus<\/button>/);
+  assert.match(html, /<button[^>]*disabled=""[^>]*>Kopírovať algoritmus<\/button>/);
   assert.doesNotMatch(html, /LEGACY_CODE|100 %|NAJLEPŠÍ/);
 });
 
-test('candidate markup enables copy, but ten trades still show n/a win rate', () => {
+test('QUALIFIED v4 markup enables copy, but ten trades still show n/a win rate', () => {
   const html = renderToStaticMarkup(React.createElement(exports.View, { onCopy() {}, result: {
     pair: 'SUI/USDT', timeframe: '15m', qualified: true, validation_passed: true,
-    selection_policy_version: 3, holdout_evaluated: true, profitable_validation_windows: 3, winner: { pair: 'SUI/USDT' }, locked_pairs: ['SUI/USDT'],
-    holdout_metrics: { closed_trades: 10, realized_profit: 8, win_rate: 100, max_drawdown_percent: 15 },
-    walk_forward_metrics: { closed_trades: 20 }, settings: { initial_capital: 100 }, buy_hold_percent: 8,
+    selection_policy_version: 4, holdout_evaluated: true, profitable_validation_windows: 3, winner: { pair: 'SUI/USDT' }, locked_pairs: ['SUI/USDT'],
+    holdout_metrics: { closed_trades: 10, realized_profit: 8, expectancy: .8, win_rate: 100, max_drawdown_percent: 15 },
+    walk_forward_metrics: { closed_trades: 40, expectancy: .2 }, settings: { initial_capital: 100 }, buy_hold_percent: 8,
+    holdout_exposure_matched_bh_percent: 4,
     strategy_code: 'CANDIDATE_CODE',
   } }));
-  assert.match(html, /KANDIDÁT/);
-  assert.match(html, /<button>Kopírovať algoritmus<\/button>/);
+  assert.match(html, /QUALIFIED/);
+  assert.match(html, /<button class="ghost">Kopírovať algoritmus<\/button>/);
   assert.match(html, /CANDIDATE_CODE/);
   assert.match(html, /<b>n\/a<\/b>/);
 });
@@ -84,7 +85,7 @@ test('all twenty table rows render and failed validation hides every holdout fie
   assert.match(html, /nestabilita/);
   assert.match(html, /Expectancy validácie/);
   assert.doesNotMatch(html, /999999|DO_NOT_COPY|skoro prešlo/);
-  assert.match(html, /<button disabled="">Kopírovať algoritmus<\/button>/);
+  assert.match(html, /<button[^>]*disabled=""[^>]*>Kopírovať algoritmus<\/button>/);
 });
 
 test('requested legacy trade tapes stay visibly unavailable without launching replay', () => {
@@ -98,12 +99,12 @@ test('requested legacy trade tapes stay visibly unavailable without launching re
   assert.match(html, /replay_unavailable/);
   assert.equal((html.match(/Páska sa v pôvodnom behu neuložila/g) || []).length, 2);
   assert.doesNotMatch(html, /<table class="trade-tape">/);
-  assert.match(html, /<button disabled="">Kopírovať algoritmus/);
+  assert.match(html, /<button[^>]*disabled=""[^>]*>Kopírovať algoritmus/);
 });
 
 test('missing original report is labeled as historical diagnostics, not current verdict', () => {
   const html = renderToStaticMarkup(React.createElement(exports.ReplayNotice, { availability: { status: 'replay_unavailable' } }));
-  assert.match(html, /Historická diagnostika UNI\/ZEC nedostupná/);
+  assert.match(html, /Legacy replay diagnostika nedostupná/);
   assert.match(html, /nie je verdiktom aktuálneho locku/);
   assert.doesNotMatch(html, /Verdikt ostáva NEPREŠIEL|<button|<table/);
 });
@@ -124,12 +125,12 @@ test('recorded tape renders all 44 validation trades and no train or holdout tra
   assert.match(html, /MAE %/);
   assert.match(html, /SL pred trailingom/);
   assert.doesNotMatch(html, /HOLDOUT_MUST_NOT_RENDER|TRAIN_MUST_NOT_RENDER/);
-  assert.match(html, /<button disabled="">Kopírovať algoritmus/);
+  assert.match(html, /<button[^>]*disabled=""[^>]*>Kopírovať algoritmus/);
 });
 
 
 test('read-only current trade audit summarizes stored tape without starting work', () => {
-  const html = renderToStaticMarkup(React.createElement(exports.View, { onCopy() {}, result: {
+  const html = renderToStaticMarkup(React.createElement(exports.CurrentAudit, { view: normalizeOptimizerResult({
     pair: 'ZEC/USDT', timeframe: '5m', variant: 2, qualified: false,
     selection_policy_version: 3, validation_passed: true, holdout_evaluated: true,
     walk_forward_metrics: { closed_trades: 25 }, holdout_metrics: { closed_trades: 12 },
@@ -139,11 +140,56 @@ test('read-only current trade audit summarizes stored tape without starting work
       { window: 'wf2', entry_ts: 'C', exit_ts: 'D', pnl_net: -3, mae: -4, mfe: 2, exit_reason: 'stop_loss', mfe_reached_trailing_start: true },
       { window: 'holdout', entry_ts: 'E', exit_ts: 'F', pnl_net: 1, mae: -.5, mfe: 3, exit_reason: 'window_end', mfe_reached_trailing_start: true },
     ],
-  } }));
+  }) }));
   assert.match(html, /Read-only audit aktuálneho výsledku/);
   assert.match(html, /Straty s MFE ≥ trailing start a následným stop-lossom:/);
   assert.match(html, /1\/1/);
   assert.match(html, /Medián MFE výhier/);
   assert.match(html, /medián \|MAE\| strát/);
   assert.doesNotMatch(html, /Spustiť|optimizer\/run/);
+});
+
+
+for (const [policy, windowCount] of [[3, 3], [4, 5]]) {
+  test(`policy ${policy} UNI candidate is labeled as diagnostics and cannot promote or export`, () => {
+    const rows = [['XRP/USDT', 5, 1.0137], ['UNI/USDT', 17, 4.146]].map(([pair, trades, pnl]) => ({
+      pair, timeframe: '15m', variant_id: pair, validation_passed: false,
+      walk_forward_metrics: { closed_trades: trades, realized_profit: pnl, max_drawdown_percent: 4 },
+      validation_windows: Array.from({ length: windowCount }, () => ({ realized_profit: 1 })),
+      rejection_reasons: ['malo_obchodov'],
+    }));
+    const raw = { selection_policy_version: policy, pair: 'XRP/USDT', qualified: false, variant_results: rows };
+    const view = normalizeOptimizerResult(raw);
+    assert.equal(view.diagnostic_only, true);
+    assert.equal(view.pair, 'UNI/USDT');
+    assert.equal(view.winner, null);
+    assert.equal(view.qualified, false);
+    const html = renderToStaticMarkup(React.createElement(exports.View, { result: raw, onCopy() {} }));
+    assert.match(html, /Víťaz: žiadny\. Diagnostika variantu: UNI\/USDT/);
+    assert.match(html, /Diagnostické nastavenia — nepoužiť/);
+    assert.match(html, /disabled="">▶ Spustiť paper test/);
+    assert.match(html, /disabled="">Kopírovať algoritmus/);
+    assert.doesNotMatch(html, /QUALIFIED|KANDIDÁT/);
+  });
+}
+
+
+test('underpowered v4 result renders UNPROVEN without allowing export', () => {
+  const html = renderToStaticMarkup(React.createElement(exports.View, { onCopy() {}, result: {
+    selection_policy_version: 4, pair: 'UNI/USDT', validation_passed: false,
+    walk_forward_metrics: { closed_trades: 39 }, qualified: false,
+  } }));
+  assert.match(html, /UNPROVEN/);
+  assert.match(html, /disabled="">Kopírovať algoritmus/);
+});
+
+
+test('substantive v4 failure renders REJECTED without allowing export', () => {
+  const html = renderToStaticMarkup(React.createElement(exports.View, { onCopy() {}, result: {
+    selection_policy_version: 4, pair: 'UNI/USDT', validation_passed: false,
+    walk_forward_metrics: { closed_trades: 40 }, qualified: false,
+    result_status: 'rejected', verdict: 'REJECTED — drawdown',
+  } }));
+  assert.match(html, /REJECTED — drawdown/);
+  assert.match(html, /disabled="">Kopírovať algoritmus/);
 });
