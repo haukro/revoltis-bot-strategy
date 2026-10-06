@@ -2456,8 +2456,43 @@ async def start_optimizer(request: OptimizerRequest):
 @app.get("/api/optimizer/validation-replay")
 async def validation_replay_availability():
     """Read-only preflight for the user's two historical rows, never starts a job."""
-    records = await supabase_get("optimizer_runs", "order=finished_at.desc&limit=100")
-    originals = [r for r in records if any(matches_target(row) for row in r.get("result", {}).get("variant_results", []))]
+    import json
+    from urllib.parse import urlencode
+    from .trade_audit import AUDIT_TARGETS
+
+    shortlist = await supabase_get("optimizer_runs", "select=id,finished_at&order=finished_at.desc&limit=100")
+    ids = [record["id"] for record in shortlist[:100]]
+    target_ids = set()
+    if ids:
+        # JSON containment only narrows the metadata read. matches_target still
+        # checks the exact window order and all original report conditions.
+        for pair, expected in AUDIT_TARGETS.items():
+            target = {"pair": pair, "timeframe": "5m", "variant": 2,
+                      "validation_passed": False,
+                      "walk_forward_metrics": {"closed_trades": expected["closed_trades"],
+                                               "realized_profit": expected["realized_profit"]}}
+            metadata = await supabase_get("optimizer_runs", urlencode({
+                "select": "id,variant_results:result->variant_results",
+                "id": f"in.({','.join(ids)})",
+                "result->variant_results": "cs." + json.dumps([target], separators=(",", ":")),
+                "order": "finished_at.desc", "limit": "100",
+            }))
+            for record in metadata:
+                variants = record.get("variant_results") if "variant_results" in record else (record.get("result") or {}).get("variant_results")
+                if record.get("id") in ids and any(matches_target(row) for row in variants or []):
+                    target_ids.add(record["id"])
+    originals = []
+    for job_id in ids:
+        if job_id not in target_ids:
+            continue
+        # Fetch archives only for exact targets, never for the other shortlist
+        # rows. Enforce identity here too because LocalStore ignores filters.
+        stored = await supabase_get("optimizer_runs", urlencode({
+            "select": "id,result", "id": f"eq.{job_id}", "order": "finished_at.desc", "limit": "100",
+        }))
+        original = next((record for record in stored if record.get("id") == job_id), None)
+        if original is not None:
+            originals.append(original)
     try:
         prepared = prepare_replay(originals)
     except (ValueError, KeyError, TypeError) as error:
@@ -4908,13 +4943,37 @@ async def compare_backtests(left: str, right: str):
 @app.post("/api/export/freqtrade")
 async def export_freqtrade(settings: StrategySettings):
     """Export a research configuration only from a verified stored candidate."""
-    records = await supabase_get("optimizer_runs", "order=finished_at.desc&limit=100")
     context = await strategy_context()
     lock = context["active_universe"]
+    if not lock:
+        raise HTTPException(409, "Freqtrade export je vypnutý: žiadny KANDIDÁT. Tento lock ostáva NEPREŠIEL.")
+    shortlist = await supabase_get("optimizer_runs", "select=id,finished_at&order=finished_at.desc&limit=100")
+    ids = [record["id"] for record in shortlist[:100]]
+    fields = ("version_id", "selection_policy_version", "qualified", "winner", "holdout_evaluated",
+              "validation_passed", "validation_rejection_reasons", "walk_forward_metrics", "holdout_metrics",
+              "holdout_exposure_matched_bh_percent", "pair", "locked_pairs", "settings")
+    records = []
+    if ids:
+        from urllib.parse import urlencode
+        records = await supabase_get("optimizer_runs", urlencode({
+            "select": "id," + ",".join(f"{field}:result->{field}" for field in fields),
+            "id": f"in.({','.join(ids)})", "order": "finished_at.desc", "limit": "100",
+        }))
+    by_id = {record["id"]: record for record in records if record.get("id") in ids}
     candidate = None
-    for record in records:
-        row = (present_optimizer_record(record) or {}).get("result") or {}
-        if lock and row.get("version_id") == lock["version_id"] and row.get("selection_policy_version") == 4 and row.get("qualified") and row.get("winner") and row.get("holdout_evaluated") and assess_candidate(row, row.get("locked_pairs", []))["qualified"]:
+    # Preserve the first query's order even if the projected response is shuffled.
+    for job_id in ids:
+        record = by_id.get(job_id)
+        if record is None:
+            continue
+        row = record.get("result") or {field: record.get(field) for field in fields}
+        # Legacy and unqualified rows cannot become export candidates through
+        # presentation; their diagnostic payload is intentionally not fetched.
+        if not (row.get("version_id") == lock["version_id"] and row.get("selection_policy_version") == 4
+                and row.get("qualified") and row.get("winner") and row.get("holdout_evaluated")):
+            continue
+        row = (present_optimizer_record({"result": row}) or {}).get("result") or {}
+        if assess_candidate(row, row.get("locked_pairs", []))["qualified"]:
             candidate = row
             break
     if candidate is None:
