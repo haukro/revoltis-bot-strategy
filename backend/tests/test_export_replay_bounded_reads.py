@@ -104,6 +104,7 @@ def export(rows, lock=LOCK, reverse_details=False):
     'no_holdout', 'missing_holdout', 'missing_pnl', 'missing_drawdown', 'nan_pnl', 'nan_drawdown',
     'missing_validation_expectancy', 'nan_validation_expectancy', 'insufficient_holdout',
     'missing_validation', 'nan_holdout_expectancy', 'missing_holdout_expectancy', 'missing_benchmark',
+    'missing_settings', 'missing_locked_pairs',
 ])
 def test_export_selection_and_assessment_equal_original(problem):
     newest = stored_candidate('newest')
@@ -126,6 +127,8 @@ def test_export_selection_and_assessment_equal_original(problem):
     elif problem == 'nan_holdout_expectancy': row['holdout_metrics']['expectancy'] = float('nan')
     elif problem == 'missing_holdout_expectancy': row['holdout_metrics'].pop('expectancy')
     elif problem == 'missing_benchmark': row.pop('holdout_exposure_matched_bh_percent')
+    elif problem == 'missing_settings': row.pop('settings')
+    elif problem == 'missing_locked_pairs': row.pop('locked_pairs')
     expected = original_selection([newest], LOCK)
     output, store, assessment = export([newest])
     assert (output is not None) == (expected is not None)
@@ -135,7 +138,7 @@ def test_export_selection_and_assessment_equal_original(problem):
     assert all('result' not in response and 'replay_snapshots' not in response for rows in store.responses for response in rows)
     if assessment.called:
         projected_row, pairs = assessment.call_args.args
-        assert assess_candidate(projected_row, pairs) == assess_candidate(row, row['locked_pairs'])
+        assert assess_candidate(projected_row, pairs) == assess_candidate(row, row.get('locked_pairs', []))
     if expected:
         assert output['stake_amount'] == expected['settings']['stake_amount'] == 20
         assert output['dry_run'] is True and output['initial_state'] == 'stopped'

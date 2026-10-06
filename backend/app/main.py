@@ -4966,7 +4966,7 @@ async def export_freqtrade(settings: StrategySettings):
         record = by_id.get(job_id)
         if record is None:
             continue
-        row = record.get("result") or {field: record.get(field) for field in fields}
+        row = record.get("result") or {field: record[field] for field in fields if record.get(field) is not None}
         # Legacy and unqualified rows cannot become export candidates through
         # presentation; their diagnostic payload is intentionally not fetched.
         if not (row.get("version_id") == lock["version_id"] and row.get("selection_policy_version") == 4
