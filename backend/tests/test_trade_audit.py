@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from app.optimizer import aggregate_metrics, optimize, walk_forward_windows
+from app.optimizer import aggregate_metrics, optimize
 from app.simulation import simulate
 from app.trade_audit import (AUDIT_TARGETS, digest, entry_path_audit, pack_snapshot, replay_validation,
                              tape_summary, trade_tape, unpack_snapshot)
@@ -115,7 +115,7 @@ def test_optimizer_keeps_validation_tape_but_never_training_or_rejected_holdout(
     row = result['variant_results'][0]
     assert not row['validation_passed']
     assert len(row['trades']) == row['walk_forward_metrics']['closed_trades']
-    assert {t['window'] for t in row['trades']} <= {'wf1', 'wf2', 'wf3'}
+    assert {t['window'] for t in row['trades']} <= {'wf1', 'wf2', 'wf3', 'wf4', 'wf5'}
     for b in row['validation_boundaries']:
         assert sum(t['window'] == b['window'] for t in row['trades']) == row['validation_windows'][int(b['window'][-1]) - 1]['closed_trades']
     snapshot = result['replay_snapshots'][row['snapshot_id']]
@@ -124,10 +124,21 @@ def test_optimizer_keeps_validation_tape_but_never_training_or_rejected_holdout(
     assert all(c['close_time'] < data[480]['open_time'] for c in restored)
 
 
+def legacy_v3_windows(data, warmup=40):
+    """The audited reports predate policy v4 and were cut into three WF windows."""
+    development = data[:480]
+    windows = []
+    for train_ratio, validation_ratio in ((0.50, 2 / 3), (2 / 3, 5 / 6), (5 / 6, 1.0)):
+        train_end = int(len(development) * train_ratio)
+        validation_end = int(len(development) * validation_ratio)
+        windows.append((development[:train_end], development[train_end - warmup:validation_end]))
+    return windows
+
+
 def replay_fixture():
     """Synthetic tapes with the requested aggregate shapes; never market data."""
     data = candles([100.] * 600)
-    windows, _ = walk_forward_windows(data)
+    windows = legacy_v3_windows(data)
     records, runs = [], {}
     for pair, expected in AUDIT_TARGETS.items():
         metrics = []
@@ -175,8 +186,16 @@ def test_replay_only_six_validation_calls_keeps_originals_and_cannot_promote_can
     assert records == original
 
 
-@pytest.mark.parametrize('problem', ['missing_snapshot', 'settings_changed', 'hash_changed', 'missing_window', 'wrong_variant', 'extra_holdout', 'different_version'])
-def test_both_targets_preflight_before_simulation_and_never_download(problem):
+@pytest.mark.parametrize('problem,reason', [
+    ('missing_snapshot', 'ZEC/USDT: original_candle_snapshot_missing'),
+    ('settings_changed', 'ZEC/USDT: settings_or_cost_mismatch'),
+    ('hash_changed', 'snapshot_hash_mismatch'),
+    ('missing_window', 'ZEC/USDT: original_windows_missing'),
+    ('wrong_variant', 'ZEC/USDT: original_report_missing_or_ambiguous'),
+    ('extra_holdout', 'ZEC/USDT: invalid_window_boundaries'),
+    ('different_version', 'original_versions_differ'),
+])
+def test_both_targets_preflight_before_simulation_and_never_download(problem, reason):
     records, _ = replay_fixture()
     result = records[1]['result']
     row = result['variant_results'][0]
@@ -188,7 +207,9 @@ def test_both_targets_preflight_before_simulation_and_never_download(problem):
     if problem == 'extra_holdout': row['validation_boundaries'][-1]['stop_index'] += 1
     if problem == 'different_version': result['version_id'] = 'new-version'
     with patch('app.trade_audit.simulate') as sim, patch('app.main.load_okx_candles', new=AsyncMock()) as fetch:
-        assert replay_validation(records)['status'] == 'blocked'
+        replay = replay_validation(records)
+        assert replay['status'] == 'blocked'
+        assert replay['reason'] == reason
     sim.assert_not_called()
     fetch.assert_not_called()
 
@@ -245,3 +266,17 @@ def test_api_replay_is_cached_and_cannot_change_strategy_or_start_optimizer():
     validation_replay_attempts.clear()
     with pytest.raises(ValueError):
         ValidationReplayRequest(source_job_ids=['a'], settings={'stop_loss_percent': 1})
+
+
+def test_entry_path_audit_reports_every_policy_v4_window():
+    from datetime import UTC, datetime
+    data = candles([100 + i * .1 for i in range(320)])
+    def trade(window, index):
+        return {"window": window,
+                "entry_ts": datetime.fromtimestamp(data[index]["close_time"] / 1000, UTC).isoformat(),
+                "exit_ts": datetime.fromtimestamp(data[index + 1]["close_time"] / 1000, UTC).isoformat(),
+                "entry_px": float(data[index]["close"]), "exit_px": float(data[index + 1]["close"]),
+                "pnl_net": .1, "mfe": 1.0, "mae": -.5}
+    result = entry_path_audit(data, [trade(f"wf{n}", 290 + n) for n in range(1, 6)], 1.6)
+    assert list(result["windows"]) == ["wf1", "wf2", "wf3", "wf4", "wf5"]
+    assert all(result["windows"][name]["n"] == 1 for name in result["windows"])

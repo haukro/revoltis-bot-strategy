@@ -4,10 +4,12 @@ import pytest
 
 from app.optimizer import assess_candidate, optimize, walk_forward_windows, present_optimizer_record
 from test_simulation import candles, settings
+from app.simulation import trade_statistics
 
 
 def metrics(trades=40, profit=8.0, dd=1.0):
     return {
+        **trade_statistics([{ "status": "closed", "profit_usdt": profit / trades } for _ in range(trades)]),
         "initial_capital": 100, "closed_trades": trades, "realized_profit": profit,
         "max_drawdown_percent": dd, "win_rate": 60,
         "expectancy": profit / trades if trades else None, "payoff": 1.1,
@@ -52,6 +54,27 @@ def test_expectancy_decay_gate():
     ), ["NEAR/USDT"])
     assert not result["qualified"]
     assert "expectancy_decay" in result["rejection_reasons"]
+
+
+@pytest.mark.parametrize("expectancy", ["missing", None, float("nan"), float("inf"), float("-inf"), 0, -.1, "invalid"])
+def test_holdout_rejects_missing_or_invalid_validation_expectancy(expectancy):
+    row = candidate()
+    if expectancy == "missing":
+        row["walk_forward_metrics"].pop("expectancy")
+    else:
+        row["walk_forward_metrics"]["expectancy"] = expectancy
+    result = assess_candidate(row, ["NEAR/USDT"])
+    assert result["qualified"] is False
+    assert result["result_status"] == "rejected"
+    assert "invalid_validation_expectancy" in result["rejection_reasons"]
+
+
+def test_expectancy_decay_accepts_exact_half_and_rejects_below_half():
+    row = candidate(walk_forward_metrics=metrics(40, 8),
+                    holdout_metrics=metrics(10, 1), holdout_exposure_matched_bh_percent=1)
+    assert assess_candidate(row, ["NEAR/USDT"])["qualified"]
+    row["holdout_metrics"]["expectancy"] = .0999
+    assert "expectancy_decay" in assess_candidate(row, ["NEAR/USDT"])["rejection_reasons"]
 
 
 def test_underpowered_only_is_unproven():
