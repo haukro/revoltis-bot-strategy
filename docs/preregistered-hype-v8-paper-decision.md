@@ -10,8 +10,8 @@ the tests, their settings, the cost model or the runtime.
 
 | Test | Pair / TF | Capital / stake | Started (UTC) | Earliest end |
 |---|---|---|---|---|
-| Official paper forward | HYPE/USDT 5m v8 | 100 / 50 USDT | 2026-09-26 | 2026-10-26 |
-| Parallel scale test | HYPE/USDT 5m v8 | 300 / 150 USDT | 2026-09-27 | 2026-10-27 |
+| Official paper forward | HYPE/USDT 5m v8 | 100 / 50 USDT | 2026-09-25 22:58 | 2026-10-26 (per UI gate) |
+| Parallel scale test | HYPE/USDT 5m v8 | 300 / 150 USDT | 2026-09-26 23:20 | 2026-10-27 (per UI gate) |
 
 Strategy family: 5m mean reversion (Bollinger lower band + RSI oversold +
 rebound confirmation, exit by stop-loss / trailing profit / max-no-trail
