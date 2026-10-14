@@ -3,7 +3,8 @@
 Status: **PROPOSAL FOR REVIEW — NOT IMPLEMENTED, NO POLICY CHANGE**
 
 Grok feedback on the initial draft is recorded in
-`GROK-REVIEW-DISPOSITION-TEST-SPEC-004.md`. Gemini roadmap review is pending.
+`GROK-REVIEW-DISPOSITION-TEST-SPEC-004.md`. Gemini's later roadmap response
+and consistency check are in `GEMINI-REVIEW-DISPOSITION-TEST-SPEC-004.md`.
 No scanner, optimizer, qualification, ranking, UI or runtime change is approved.
 
 ## Problem and boundary
@@ -56,7 +57,10 @@ QUALIFIED, policy v4 gates, ranking or paper eligibility under this proposal.
 A new mandatory qualification gate or fresh-forward-fold requirement is a
 separate policy decision and implementation scope requiring Roman's approval.
 This resolves the original "gates unchanged" versus "cannot be QUALIFIED"
-contradiction without silently introducing a new gate.
+contradiction without silently introducing a new gate. Gemini's suggestion
+to integrate that superseded undefined gate into central policy v4 is
+DISAGREED-MODIFIED: a diagnostic proposal is not authority to change policy.
+Central qualification documentation and runtime policy remain unchanged.
 
 ## Not changed
 

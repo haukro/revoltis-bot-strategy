@@ -5,7 +5,9 @@ Status: **DRAFT FOR REVIEW — NOT LOCKED, NOT IMPLEMENTED, BLOCKED BEFORE LOCK*
 Grok reviewed the initial draft at `dcd4552f5290592c28564970af16f95f3565a1af`.
 His verdict is **not clean enough to lock as written**. See
 `GROK-REVIEW-DISPOSITION-TEST-SPEC-004.md` for individual dispositions.
-Gemini roadmap review is pending. This documentation update does not approve
+Gemini roadmap review is processed in
+`GEMINI-REVIEW-DISPOSITION-TEST-SPEC-004.md`: appropriate draft candidate,
+with Grok methodology blockers still open. This documentation update does not approve
 a lock, implementation, data download, performance run, merge or deploy.
 
 ## Research boundary and hypothesis
@@ -16,10 +18,12 @@ This is a hypothesis, not evidence of profitability. Slower bars, lower
 turnover and volatility scaling do not establish an edge by themselves.
 
 The proposed design differs from the failed 1h N=24 / Wilder ATR(24) / 2xATR
-coin-by-coin replication, but remains trend/momentum research. Gemini must
-assess its family boundary before lock. `RESEARCH-ROADMAP.md` currently lists
-a predeclared **futures** basket as an example; this proposal is **spot**.
-That scope difference is unresolved, not a silent roadmap amendment.
+coin-by-coin replication, but remains trend/momentum research. Gemini's
+family verdict is accepted as roadmap suitability for a draft, not proof of
+a distinct profitable economic edge. `RESEARCH-ROADMAP.md` now explicitly
+permits spot or futures basket directions; this proposal remains **spot-only**.
+No shorts, leverage or perpetuals are added. The remaining methodology and
+final lock decisions are not resolved by the roadmap alignment.
 
 No rescue of closed A/C branches, parameter grid or result-driven retuning.
 TEST-SPEC-002 ZEC TSMOM B remains unchanged and blind through
@@ -228,7 +232,9 @@ prescription without a rescue variant on its used folds.
 G1 universe design/manifest; G2 dates, warmup and contamination certificate;
 G3 causal timeline/filter/band semantics; G4 deterministic sizing;
 G5 costs/accounting; G6 inference/sample design; G7 computable trial/DSR rules;
-Gemini roadmap/family decision. "Recorded requirement" is not "resolved".
+final methodological clearance and Roman's explicit lock decision.
+Gemini's suitable-draft verdict does not close Grok's blockers.
+"Recorded requirement" is not "resolved".
 Only a separately authorized final spec lock can close this checklist.
 
 ## Out of scope

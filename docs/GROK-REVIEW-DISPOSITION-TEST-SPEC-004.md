@@ -5,7 +5,9 @@ Date: 2026-10-14 Europe/Bratislava.
 Reviewed initial HEAD: `dcd4552f5290592c28564970af16f95f3565a1af`.
 Review source: Grok response returned by Roman in chat; copied below.
 Initial reviewer line references refer to that HEAD, not the expanded revision.
-Gemini response has not been received. No agent vote or this document approves
+At the time of this Grok disposition, Gemini response had not been received.
+Its later disposition is in `GEMINI-REVIEW-DISPOSITION-TEST-SPEC-004.md`.
+No agent vote or this document approves
 a lock, research run, implementation, merge or deploy.
 
 ## ACCEPTED
@@ -56,7 +58,8 @@ documentation commit; no application Preview is exercised by this workflow.
 
 ## Next state
 
-**NOT CLEAN ENOUGH TO LOCK.** Gemini roadmap review remains pending.
+**NOT CLEAN ENOUGH TO LOCK.** Gemini's later review accepts D as a suitable
+draft roadmap candidate; the methodology blockers and missing inputs remain.
 Before any lock: choose universe/statistical design, finalize causal/sizing/cost
 rules and data/fold provenance in a separately authorized documentation review.
 No future data/performance action is authorized merely by accepting this review.
