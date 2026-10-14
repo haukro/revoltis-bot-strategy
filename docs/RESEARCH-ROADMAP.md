@@ -57,10 +57,12 @@ Status: **RUNNING — NO TERMINAL ECONOMIC VERDICT**
 - Ledger cutover remains both-tests30/30 plus Roman's new explicit instruction.
 
 ### TEST-SPEC-004 — Strategy D v1
-Status: **DRAFT FOR REVIEW — NOT LOCKED, NOT IMPLEMENTED, BLOCKED BEFORE LOCK**
+Status: **DRAFT R2 FOR REVIEW — NOT LOCKED, NOT IMPLEMENTED**
 
-- Hypothesis: daily long-only volatility-scaled multi-horizon trend on a
-  predeclared spot basket.
+- Hypothesis: daily long-only volatility-scaled20/60/120day trend on a fixed
+  BTC/ETH spot basket. Roman confirmed this documentary direction on2026-10-14.
+- Core choices: fixed6calendar-month forward, daily statistics/monthly reports,
+  cap40% per asset, weekly rebalance, original5pp band. Capped targets max80%.
 - Roadmap alignment: accepted as an appropriate draft candidate for slower
   multi-market trend research, distinct from cycling the failed C prescription
   through another coin. Spot limits are explicitly permitted as a research
@@ -68,12 +70,18 @@ Status: **DRAFT FOR REVIEW — NOT LOCKED, NOT IMPLEMENTED, BLOCKED BEFORE LOCK*
 - Reviews: Gemini's roadmap disposition is recorded in
   `GEMINI-REVIEW-DISPOSITION-TEST-SPEC-004.md`; Grok's methodology verdict
   remains not clean enough to lock.
-- Dependencies: unresolved universe choice, causal timing, warmup, deterministic
-  sizing/costs, contamination inventory/certificate and computable statistics.
-  Requirements recorded in a document are not yet resolved inputs.
-- The candidate monthly unit and 12-month holdout yield at most 12 full monthly
-  observations; independence is not assumed. Sample/design adequacy remains
-  a methodological blocker, not a reviewer-vote override.
+- R2 candidate prescriptions, decision dispositions and new review packet are in
+  `TEST-SPEC-004-basket-tsmom-d-v1.md`, `DECISIONS-TEST-SPEC-004-R2.md` and
+  `FOR-GROK-REVIEW-TEST-SPEC-004-R2.md`.
+- Dependencies: second Grok clearance for newly completed timing/sizing/cost
+  and statistical proposals, actual continuity/inspection/cost manifests and
+  final Roman lock instruction. No certificate or observed cost is fabricated.
+- Historical development is conditional on today's fixed BTC/ETH choice and
+  includes inspected history. The prior historical-final12month holdout is
+  replaced by a forward fold after a future authorized lock/readiness/launch.
+  Exact T0/T1 are frozen before outcomes; no result-driven extension.
+- Daily observations are not automatically independent or sufficient. Proposed
+  DSR/trial inputs and dependence safeguard still require R2 methodology review.
 - No performance test, market-data job, optimizer run or runtime implementation
   is approved by this draft inclusion or by external review.
 
@@ -81,7 +89,7 @@ Status: **DRAFT FOR REVIEW — NOT LOCKED, NOT IMPLEMENTED, BLOCKED BEFORE LOCK*
 
 | Stage | Required condition | Separate authorization / boundary |
 |---|---|---|
-| Current documentation review | Recorded Grok/Gemini dispositions; draft blockers explicit | Docs edits in PR70 only. PR70 merge is not authorized here and, if later approved, is not a final D lock while blockers remain. |
+| Current documentation review | Recorded Grok/Gemini dispositions, direction decisions and revised R2 prescription | Docs edits in PR70 only. PR70 merge is not authorized here and, if later approved, is not a final D lock while blockers remain. |
 | Future metadata/archive repair | PR69 remains PARKED(C); structural metadata/archive repair is its future replacement, not merge of current PR69 | Separate scope/authorization for implementation, data-only access/backfill, schema changes and production actions after freeze release. No change to frozen trading B or HYPE. |
 | D final spec lock | Complete deterministic spec, universe/folds/provenance and statistical decisions; methodology cleared | Roman explicitly authorizes a final lock commit/version. A general docs merge does not authorize implementation or data acquisition. |
 | D implementation/synthetic verification | Final locked D spec; independent runner/data/cost IDs and behavior isolation | Separate authorization to write code and run isolated synthetic tests. No official performance data inspection. |

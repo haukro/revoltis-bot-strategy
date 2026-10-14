@@ -1,29 +1,35 @@
 # Pre-terminal decision rule — HYPE v8 paper forward
 
-Status: **NOT EVALUATED — DOCUMENT CLARIFICATIONS PENDING**
+Status: **NOT EVALUATED — R2 CUTOFF PROPOSAL, EVIDENCE CHECKS PENDING**
 
 Filename retained for continuity: `preregistered-hype-v8-paper-decision.md`.
 The numerical rule was documented after an interim result was observed and
 before the terminal gate. It is a **pre-terminal decision rule**, not a blind
 preregistration before the experiment. Grok's review and dispositions are in
 `GROK-REVIEW-DISPOSITION-TEST-SPEC-004.md`.
+The revised cutoff/accounting proposal is tracked in
+`DECISIONS-TEST-SPEC-004-R2.md` and requires R2 consistency review.
 
 This document changes no test settings, cost model, scheduler, strategy,
 runtime or ledger. No early stop, restart or final verdict is authorized.
 
 ## Scope and timestamp provenance
 
-| Test | Pair / TF | Capital / stake | Initially reported start (UTC; role unverified) | Reported earliest end (UI gate) |
+| Test | Pair / TF | Capital / stake | Trading-start source (UTC/ms) | Reported earliest end (UI gate) |
 |---|---|---|---|---|
-| Official paper forward | HYPE/USDT 5m v8 | 100 / 50 USDT | 2026-09-25 22:58 | 2026-10-26 |
-| Parallel scale test | HYPE/USDT 5m v8 | 300 / 150 USDT | 2026-09-26 23:20 | 2026-10-27 |
+| Official paper forward | HYPE/USDT 5m v8 | 100 / 50 USDT | Existing run.progress.trading_start_time; actual value not read in this revision | 2026-10-26 (previously reported UI date) |
+| Parallel scale test | HYPE/USDT 5m v8 | 300 / 150 USDT | Existing run.progress.trading_start_time; actual value not read in this revision | 2026-10-27 (previously reported UI date) |
 
-The reported UTC timestamps have not been reconciled with warmup/run/trading
-start semantics or the UI date gate. Do not infer elapsed trading days from
-this table. Before terminal evaluation, record the existing stored trading
-start and exact time gate with their field/source identity by authorized
-read-only access. Do not alter runtime timestamps to fit this document.
-The UI dates are the earliest possible time condition, not an end guarantee.
+The initial September25/26 timestamps were not certified trading starts and
+are removed from the trading-start table rather than replaced with guessed dates.
+Source verification at main b200950: frontend saved.started_at -> startedAt ->
+request.trading_start_time (main.tsx406,448; Scale502,538); backend stores that
+value in simulation_runs.progress.trading_start_time (main.py2264).
+The frontend gate is startedAt +30*24hours, not a warmup start or the run's
+started_at/finished_at. Values must be recorded for each test from its existing
+source by separately authorized read-only inspection before evaluation.
+No DB, browser localStorage or application endpoint was read for this revision.
+The previously reported UI dates are context only, not verified exact deadlines.
 
 Strategy family: 5m mean reversion (Bollinger lower band + RSI oversold +
 rebound confirmation; stop-loss / trailing profit / max-no-trail exit).
@@ -46,28 +52,42 @@ not a new verification by this review. No setting may change because of them.
 | Realized PnL | -3.673 USDT | -11.897 USDT |
 | Max DD | 7.45% | 7.49% |
 
-## Eligibility and single terminal observation
+## Eligibility, exact cutoff and evidence availability
 
-Each test's eligibility requires **at least 30 trading days AND at least
-30 closed trades**, using its own verified existing trading start/time gate.
-Until both conditions hold, its state is NOT_EVALUATED, not FAIL.
+For EACH test independently, let S be its verified existing trading_start_time.
+Let c30 be the30th closed trade's timestamp in the single certified test tape,
+sorted by closed_at then immutable trade ID; do not mix differently costed runs.
+T*=max(S+30*24hours,c30). If fewer than30closed trades, T* is not yet eligible.
+Before the verified time AND trade conditions hold, status is NOT_EVALUATED.
 
-For Official, use the first valid existing result snapshot observed after
-both conditions hold. Identify its run ID, as-of time, verified time gate and
-complete input/output identities. Include all closed trades from the test's
-trading start through that snapshot; do not truncate to the first 30 trades or
-choose a later, more favorable snapshot. If more than 30 trades have closed
-before the first eligible observation, include them. This is an assessment
-convention; it does not stop or alter the running scheduler.
+Proposed terminal sample: all trades closed in [S,T*], including more than30
+if those closed before the time gate. An open position at T* is excluded from
+closed-trade expectancy/PF and recorded separately, but remains relevant to
+marked equity/DD. No forced close, parameter change or scheduler change.
 
-A first eligible but incomplete/corrupt snapshot is INVALID. Preserve its
-identity and reason; do not search later results until a PASS appears. Any
-recovery/evaluation procedure needs a documented non-strategy validity reason
-and separate authorization. Once a valid economic verdict is recorded, do not
-reevaluate it with newly favorable costs or additional trades.
+Exact T* is a precision requirement subject to evidence availability. Record:
+S,c30,T*, source run/tape IDs and hashes, run.test_end / evaluation as-of,
+cost profile IDs/book times, actual recalculation and finished times.
+Do not assert that a later current-book recalculation occurred "at T*".
+The existing scheduler usually evaluates after the mathematical gate; code alone
+does not guarantee a persisted exact-cutoff result, DD path or historical cost book.
+If no existing evidence supports the exact sample/DD/cost convention, record
+INVALID with reason exact_cutoff_not_reproducible and seek a separate decision.
+No fallback to a later favorable run and no new simulation/OKX call is authorized.
 
-Scale is assessed diagnostically under its own eligibility. It cannot rescue
-Official FAIL. Official eligibility or PASS does not satisfy Scale's gate.
+Use only a single existing certified calculation at/as-of T* if available,
+retaining its ACTUAL cost observation times and full provenance; an archived
+same-cutoff calculation may finish later, which must be distinguished explicitly.
+No freshly fetched cost profile may retroactively represent the T* book.
+No new recalculation is requested by this document. A prospective terminal
+capture/replay or a change to first-observed-snapshot methodology would require
+its own authorization before it is performed. Availability is not certified here.
+
+Official has the economic verdict; Scale has its own terminal diagnostic.
+A valid completed verdict is not repeated with additional trades/favorable costs.
+An unavailable/invalid assessment is not economic FAIL and cannot be used to
+close a family as if it were valid. Ledger eligibility remains BOTH tests30/30
+plus a separate Roman instruction, independent of Official verdict.
 
 ## Numerical economic rule — unchanged
 
@@ -88,25 +108,31 @@ of negative net closed-trade PnL; zero-PnL trades remain in the trade count
 and expectancy denominator. Positive profit with zero losses gives infinite
 PF; all-zero PnL has undefined PF and already fails positive expectancy.
 
-## Accounting requirements still open before evaluation
+## Accounting provenance and remaining validity checks
 
-The DD gate's equity definition and sampling (including fees and unrealized
-positions) must be reconciled with the existing tested calculation and recorded.
-Do not substitute realized-only drawdown for total-equity drawdown, or vice
-versa, without an explicit documented decision before terminal outcomes.
+Authoritative DD proposal is the backend stored run.summary.max_drawdown_percent
+for the certified exact-cutoff run, not a frontend reconstructed fallback.
+Source b200950 simulation.py143-148,198-204,335: cash plus marked open positions
+using cost-aware position_return, updated at simulation events; summary DD is
+rounded to2decimals. Record that precision, value and source as stored.
+Open positions are outside closed-trade PF/expectancy, not outside this DD.
+A sparse equity chart is not proof of the exact intervening DD.
 
-Closed-trade expectancy/PF do not invent terminal closes of open positions.
-Record open-position exposure separately. Terminal valuation, DD and the
-existing cost-calculation provenance must be specified consistently before
-evaluation; no new forced exit or simulation is authorized.
+main.tsx62 also contains a closed-trade-only fallback DD. It is a different
+calculation; do not substitute it for backend marked-equity DD in this verdict.
+No source code is changed and no claim of a live UI discrepancy is made here.
 
-Identify whether each reported cost component is stored/frozen or recomputed
-from a current book. Record the model, timestamps, source, rates and result
-identity used at the single terminal observation. Do not describe today's
-results as historically immutable, replace existing running costs, obtain a
-new cost model to rescue the result, or implement a ledger through this rule.
-Missing/nonfinite metrics or unverifiable cost/accounting provenance block
-evaluation as INVALID until a properly authorized validity resolution.
+Source b200950 main.py2232-2254 loads pair costs anew when
+use_current_cost_model=true; main.tsx448-450 and538-540 request this for paper.
+Trade raw.cost_components are recorded by simulation.py131-141.
+Thus an existing single recalculation can have stored cost components while
+later recalculations use a different current model. This is not an immutable
+trade ledger. Require the actual cost profile/source timestamps for the chosen
+run and sufficient same-cutoff evidence, never infer them from a model label.
+
+DD/cost/tape identity and actual S values still need evidence verification.
+No new cost observation, market-data request, DB query or calculation occurred
+in this revision. Missing/nonfinite/unverifiable inputs block the assessment.
 
 ## Consequences
 
@@ -116,8 +142,8 @@ alongside closed Strategy A. This is a research-budget policy, not proof
 that all possible 5m mean-reversion strategies are impossible.
 No rescue coin/timeframe/exit grid or post-hoc filter on the used evidence.
 
-PASS permits only consideration of a new separately preregistered forward
-experiment on a fresh period, subject to Roman's separate authorization.
+PASS permits only drafting a new separately preregistered experiment on a
+fresh period. Starting it requires Roman's separate authorization.
 It does not start that experiment, approve live trading, release the freeze
 or authorize ledger cutover.
 
