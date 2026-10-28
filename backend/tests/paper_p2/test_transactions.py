@@ -40,15 +40,15 @@ class Database:
         self.dsn = dsn
 
     def connect(self):
-        return psycopg.connect(self.dsn, autocommit=True)
+        return psycopg.connect(self.dsn, autocommit=True, options='-c statement_timeout=30000')
 
     def query(self, query, params=()):
         with self.connect() as c:
-            return c.execute(query, params).fetchall()
+            return c.execute(query, params or None).fetchall()
 
     def execute(self, query, params=()):
         with self.connect() as c:
-            c.execute(query, params)
+            c.execute(query, params or None)
 
     def rpc(self, name, **kwargs):
         with self.connect() as c:
@@ -114,7 +114,8 @@ def db():
     with psycopg.connect(DSN, autocommit=True) as admin:
         for role in ('anon', 'authenticated', 'service_role'):
             if not admin.execute('select 1 from pg_roles where rolname=%s', (role,)).fetchone():
-                admin.execute(sql.SQL('create role {} nologin').format(sql.Identifier(role)))
+                admin.execute(sql.SQL('create role {} nologin {}').format(
+                    sql.Identifier(role), sql.SQL('bypassrls' if role == 'service_role' else 'nobypassrls')))
         admin.execute(sql.SQL('create database {}').format(sql.Identifier(name)))
     instance = Database(make_conninfo(DSN, dbname=name))
     try:
