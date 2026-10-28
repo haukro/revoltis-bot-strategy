@@ -199,7 +199,7 @@ begin
   if owner_tx is distinct from txid_current() then raise exception 'run_sealed'; end if;
   return new;
 end $$;
-create function paper_private.complete_run() returns trigger language plpgsql set search_path = '' as $$
+create function paper_private.complete_run() returns trigger language plpgsql security definer set search_path = '' as $$
 declare n integer; o integer;
 begin
   if tg_table_name = 'paper_diagnostic_runs' then
@@ -215,6 +215,17 @@ begin
   end if;
   return null;
 end $$;
+create function paper_private.run_identity() returns trigger language plpgsql set search_path = '' as $$
+declare c public.paper_run_claims;
+begin
+  select * into strict c from public.paper_run_claims where id=new.claim_id;
+  if (new.test_id,new.tick_id,new.boundary_ms,new.test_end_ms,new.last_candle_open_ms)
+    is distinct from (c.test_id,c.tick_id,c.boundary_ms,c.test_end_ms,c.last_candle_open_ms)
+    or new.created_txid <> txid_current() then raise exception 'claim_identity_mismatch'; end if;
+  return new;
+end $$;
+create trigger claim_identity before insert on public.paper_runs
+  for each row execute function paper_private.run_identity();
 create function paper_private.test_transition() returns trigger language plpgsql set search_path = '' as $$
 declare v public.paper_verdicts;
 begin
@@ -229,7 +240,7 @@ begin
   else
     select * into v from public.paper_verdicts where id = new.authoritative_verdict_id;
     if old.shadow or v.test_id is distinct from old.id or v.kind <> 'authoritative' or
-      new.status <> case when v.verdict = 'INVALID' then 'invalid' else 'completed' end then
+      new.status <> (case when v.verdict = 'INVALID' then 'invalid' else 'completed' end) then
       raise exception 'invalid_transition';
     end if;
   end if;
@@ -364,8 +375,8 @@ begin
     p_run->>'book_ts_ms' is null or p_run->>'cost_fetched_at_ms' is null then why := 'cost_profile_unavailable';
   elsif (p_run->>'cost_fetched_at_ms')::bigint-(p_run->>'book_ts_ms')::bigint<0 then why := 'book_from_future';
   elsif (p_run->>'cost_fetched_at_ms')::bigint-(p_run->>'book_ts_ms')::bigint>60000 then why := 'book_too_old';
-  elsif p_trades is null or p_trades='null'::jsonb then why := 'missing_run_specific_tape';
-  elsif p_positions is null or p_positions='null'::jsonb then why := 'missing_open_positions';
+  elsif p_trades is null or p_trades='null'::jsonb or p_run->>'trade_count' is null then why := 'missing_run_specific_tape';
+  elsif p_positions is null or p_positions='null'::jsonb or p_run->>'open_count' is null then why := 'missing_open_positions';
   elsif p_run->>'status' = 'invalid' then why := coalesce(p_run->>'invalid_reason','invalid_run'); end if;
   r := jsonb_populate_record(null::public.paper_runs,p_run || jsonb_build_object(
     'test_id',t.id,'claim_id',c.id,'tick_id',c.tick_id,'seq',
