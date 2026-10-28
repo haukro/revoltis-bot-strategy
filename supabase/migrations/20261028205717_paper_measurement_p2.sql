@@ -147,15 +147,15 @@ create table public.candle_archive (
   primary key (source, pair, timeframe, open_time_ms)
 );
 create table public.paper_diagnostic_runs (
-  id uuid primary key default gen_random_uuid(), test_id uuid not null references public.paper_tests,
-  test_end_ms bigint not null, boundary_ms bigint not null,
-  payload jsonb not null, created_txid bigint not null, created_at timestamptz not null default clock_timestamp(),
-  trade_count integer not null check (trade_count >= 0)
+  like public.paper_runs including defaults including constraints,
+  open_positions jsonb not null check (jsonb_typeof(open_positions)='array')
 );
+alter table public.paper_diagnostic_runs drop column claim_id, drop column tick_id, drop column seq;
+alter table public.paper_diagnostic_runs add primary key (id),
+  add foreign key (test_id) references public.paper_tests;
 create table public.paper_diagnostic_trades (
-  run_id uuid not null references public.paper_diagnostic_runs,
-  ordinal integer not null check (ordinal >= 0), evidence jsonb not null,
-  primary key (run_id, ordinal)
+  like public.paper_run_trades including defaults including constraints,
+  primary key (run_id, ordinal), foreign key (run_id) references public.paper_diagnostic_runs
 );
 create table public.paper_verdicts (
   id uuid primary key default gen_random_uuid(), test_id uuid not null references public.paper_tests,
@@ -204,7 +204,8 @@ declare n integer; o integer;
 begin
   if tg_table_name = 'paper_diagnostic_runs' then
     select count(*) into n from public.paper_diagnostic_trades where run_id = new.id;
-    if n <> new.trade_count then raise exception 'tape_count_mismatch'; end if;
+    if n <> new.trade_count or jsonb_array_length(new.open_positions) <> new.open_count then
+      raise exception 'tape_count_mismatch'; end if;
   else
     select count(*) into n from public.paper_run_trades where run_id = new.id;
     select count(*) into o from public.paper_run_open_positions where run_id = new.id;
@@ -405,6 +406,33 @@ begin
   return jsonb_build_object('outcome','run_created','run',to_jsonb(r));
 end $$;
 
+create function public.paper_persist_diagnostic(p_test_id uuid,p_run jsonb,p_trades jsonb,p_positions jsonb)
+returns jsonb language plpgsql security definer set search_path = '' as $$
+declare r public.paper_diagnostic_runs; item jsonb; stamp bigint; horizon bigint;
+begin
+  perform 1 from public.paper_tests where id=p_test_id;
+  if not found then raise exception 'unknown_test'; end if;
+  if jsonb_typeof(p_run) is distinct from 'object' or jsonb_typeof(p_trades) is distinct from 'array'
+    or jsonb_typeof(p_positions) is distinct from 'array' then raise exception 'invalid_diagnostic_payload'; end if;
+  stamp := paper_private.now_ms();
+  horizon := (p_run->>'test_end_ms')::bigint;
+  r := jsonb_populate_record(null::public.paper_diagnostic_runs,p_run || jsonb_build_object(
+    'test_id',p_test_id,'as_of_ms',horizon,'boundary_ms',floor(horizon::numeric/300000)*300000,
+    'last_candle_open_ms',floor(horizon::numeric/300000)*300000-300000,
+    'persisted_at',paper_private.ts(stamp),'created_txid',txid_current(),
+    'candle_source',coalesce(p_run->>'candle_source','okx'),'raw',coalesce(p_run->'raw','{}'::jsonb),
+    'tape_present',true,'positions_present',true,'open_positions',p_positions));
+  if exists(select from jsonb_array_elements(p_positions) e where (e->>'run_id')::uuid is distinct from r.id) then
+    raise exception 'run_identity_mismatch'; end if;
+  insert into public.paper_diagnostic_runs select r.*;
+  for item in select value from jsonb_array_elements(p_trades) loop
+    if (item->>'run_id')::uuid is distinct from r.id then raise exception 'run_identity_mismatch'; end if;
+    insert into public.paper_diagnostic_trades select x.* from jsonb_populate_record(null::public.paper_diagnostic_trades,
+      item || jsonb_build_object('evidence',item)) x;
+  end loop;
+  return to_jsonb(r);
+end $$;
+
 create function public.paper_stop_shadow(p_test_id uuid) returns jsonb
 language plpgsql security definer set search_path = '' as $$
 declare t public.paper_tests; stamp bigint;
@@ -571,7 +599,7 @@ end $$;
 -- Scope every grant/revoke to the new objects; legacy RPCs/defaults are untouched.
 do $$ declare f record; n text; role_name text;
   rpc_names text[] := array['paper_create_test','paper_claim_run','paper_archive_candles',
-    'paper_persist_run','paper_stop_shadow','paper_read_run','paper_assess_run','paper_audit_run'];
+    'paper_persist_run','paper_persist_diagnostic','paper_stop_shadow','paper_read_run','paper_assess_run','paper_audit_run'];
 begin
   for f in select p.oid::regprocedure signature,p.proname,nspname from pg_proc p
     join pg_namespace n on n.oid=p.pronamespace

@@ -440,11 +440,9 @@ def test_at2_update_delete_and_immutable_grace_on_every_table(db):
     pos = {'ordinal': 0, 'pair': t['pair'], 'opened_at_ms': START, 'entry_rate': 100, 'stake': 50, 'raw': {}}
     result, _ = db.persist(t, db.claim(t), positions=[pos])
     assert db.assess(result['run']['id'])['verdict']['verdict'] == 'PASS'
-    diagnostic = str(uuid4())
-    with db.connect() as c, c.transaction():
-        c.execute("insert into paper_diagnostic_runs(id,test_id,test_end_ms,boundary_ms,payload,created_txid,trade_count) "
-                  "values (%s,%s,%s,%s,'{}',txid_current(),1)", (diagnostic,t['id'],NOW,NOW))
-        c.execute("insert into paper_diagnostic_trades values (%s,0,'{}')", (diagnostic,))
+    diagnostic = evidence(t,run_id=str(uuid4()),as_of=NOW,pnls=[1])
+    db.rpc('paper_persist_diagnostic',p_test_id=t['id'],p_run=diagnostic.run,
+           p_trades=list(diagnostic.trades),p_positions=[])
     for table in TABLES:
         assert db.query(sql.SQL('select count(*) from {}').format(sql.Identifier(table)))[0][0] > 0
         first_col = db.query('select attname from pg_attribute where attrelid=%s::regclass and attnum=1', (table,))[0][0]
@@ -461,7 +459,6 @@ def seed_defensive_claim(db, t, original):
     tick = db.tick(at=NOW+STEP_MS)
     patch = {'id': str(uuid4()), 'tick_id': tick, 'boundary_ms': NOW+STEP_MS,
              'last_candle_open_ms': NOW, 'test_end_ms': NOW+STEP_MS,
-             'claimed_at': '2023-12-14T22:20:00+00:00', 'lease_expires_at': '2023-12-14T22:24:00+00:00',
              'attempt': 1, 'lease_token': str(uuid4())}
     # Derive timestamps from the synthetic numeric clock, not wall time.
     patch['claimed_at'] = db.query('select paper_private.ts(%s)::text', (NOW+STEP_MS,))[0][0]
@@ -526,3 +523,36 @@ def test_at44_actual_concurrent_assess_claim_persist(db):
     assert answers[2]['outcome'] in ('run_created','test_closed')
     assert db.query("select count(*) from paper_verdicts where kind='authoritative'")==[(1,)]
     assert db.query("select count(*) from paper_runs r join paper_tests t on t.id=r.test_id where r.persisted_at>t.completed_at")==[(0,)]
+
+
+def test_at24_storage_diagnostic_does_not_occupy_automatic_boundary(db):
+    t = db.create_test(pre_gate=True)
+    diagnostic = evidence(t,run_id=str(uuid4()),as_of=NOW,pnls=[1])
+    db.rpc('paper_persist_diagnostic',p_test_id=t['id'],p_run=diagnostic.run,
+           p_trades=list(diagnostic.trades),p_positions=[])
+    claim = db.claim(t)
+    assert claim['outcome']=='claimed'
+    automatic, _ = db.persist(t,claim,pnls=[1])
+    assert automatic['run']['seq']==1
+    assert db.query('select count(*) from paper_diagnostic_runs')==[(1,)]
+    assert db.query('select count(*) from paper_runs')==[(1,)]
+    with pytest.raises(psycopg.Error, match='run_sealed'):
+        db.execute("insert into paper_diagnostic_trades(run_id,ordinal,evidence) values (%s,1,'{}')",
+                   (diagnostic.run['id'],))
+
+
+@pytest.mark.parametrize('kind', ['wrong_pid','wrong_role','wrong_job','end_before_tick'])
+def test_origin_requires_the_exact_job_execution(db, kind):
+    t = db.create_test(grace=1000)
+    result, _ = db.persist(t,db.claim(t),pnls=[])
+    if kind=='wrong_pid':
+        db.execute('update cron.job_run_details set job_pid=job_pid+1')
+    elif kind=='wrong_role':
+        db.execute("update cron.job_run_details set username='service_role'")
+    elif kind=='wrong_job':
+        db.execute("update cron.job set jobname='unrelated_job'")
+    else:
+        db.execute('update cron.job_run_details set end_time=paper_private.ts(%s)',(NOW-1,))
+    db.clock(NOW+1001)
+    answer = db.assess(result['run']['id'])
+    assert answer['verdict']['invalid_reason']=='tick_origin_unverified'

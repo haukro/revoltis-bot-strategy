@@ -27,8 +27,11 @@ claim, never worker payload. Test state changes are guarded and immutable test
 settings include `origin_grace_ms`.
 
 RPCs create an explicitly requested test, claim a run, archive candles, persist
-a complete run transaction, read an immutable snapshot, assess it, record an
-audit and stop a shadow test. No function is called by migration installation.
+a complete run transaction, persist a separate manual diagnostic, read an
+immutable snapshot, assess it, record an audit and stop a shadow test. Diagnostic
+metadata mirrors automatic run columns without claim/tick/sequence; open
+positions are sealed in the diagnostic row and its trade rows are run-owned.
+No function is called by migration installation.
 No cron job, extension installation, HTTP dispatch, endpoint, or production
 configuration is added. The tick function only inserts a restricted origin row;
 P4 owns cron scheduling, pg_net dispatch and real session identity verification.
@@ -51,8 +54,9 @@ Origin resolution requires matching job name, database, username, backend PID
 and the tick time inside the successful cron run interval. Pending evidence
 does not write an assessment or extend the immutable grace clock. Failure is
 immediate; a committed INVALID cannot be replaced by late evidence. New claims
-remain blocked until prior post-gate runs are assessed. Every RPC takes the
-test lock before observing the clock or changing test state.
+remain blocked until prior post-gate runs are assessed. Claim, persist, assess
+and stop take the test lock before observing their decision clock or changing
+test state. Claim uses exactly one clock sample for all persisted timing fields.
 
 The migration installs owner roles as NOLOGIN and grants no membership to the
 HTTP worker. Real cron role activation and narrowly scoped read permissions on
@@ -82,8 +86,17 @@ AT36 real lock wait crossing expiry; AT37/44 finalization race and assessment
 order; AT38(a,c,d,e) ACL/origin handling with synthetic logs; AT41/45 shadow
 boundary; AT43 claim gating and concurrent assess; AT46 grace/failure/late proof.
 
-Validation results will be recorded after CI completes. This draft does not
-claim successful Supabase-branch validation or an economic strategy result.
+Local offline result: **240 passed**, with one module-level skip for the
+PostgreSQL integration suite when no test DSN is set (22.37 s). This includes
+all 231 P1/base cases and 9 new snapshot-attestation cases. The existing
+Starlette/AnyIO deprecation warning remains.
+
+The isolated CI job runs **49 PostgreSQL cases plus those 9 adapter cases**.
+Its current-head result is recorded in [PR #72](https://github.com/haukro/revoltis-bot-strategy/pull/72).
+The extra storage case covers diagnostic/automatic isolation (the AT24 HTTP
+endpoint remains P3); four negative origin cases reject a wrong PID, role,
+job name or successful interval. Passing these tests does not certify an
+actual Supabase branch, cron scheduler, or an economic strategy result.
 
 ## Review and later authorization
 
