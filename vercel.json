@@ -2,7 +2,8 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "git": {
     "deploymentEnabled": {
-      "codex/paper-measurement-p1": false
+      "codex/paper-measurement-p1": false,
+      "codex/paper-measurement-p2": false
     }
   },
   "services": {

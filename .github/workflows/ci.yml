@@ -8,6 +8,35 @@ on:
   pull_request:
 
 jobs:
+  paper-p2:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: paper_p2_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      PAPER_P2_TEST_DSN: postgresql://postgres:postgres@127.0.0.1:5432/paper_p2_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt -r requirements-paper-p2.txt pytest
+      - run: python -m pytest -q tests/paper_p2 tests/test_paper_assessment.py
+
   backend:
     runs-on: ubuntu-latest
     defaults:
