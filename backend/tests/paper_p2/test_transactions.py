@@ -556,3 +556,82 @@ def test_origin_requires_the_exact_job_execution(db, kind):
     db.clock(NOW+1001)
     answer = db.assess(result['run']['id'])
     assert answer['verdict']['invalid_reason']=='tick_origin_unverified'
+
+
+@pytest.mark.parametrize('missing', ['shadow_limit', 'warmup'])
+def test_review_required_test_settings_cannot_be_null(db, missing):
+    t = test_config()
+    t.update(id=str(uuid4()), variant='B', strategy_version_id='synthetic-p2',
+             lease_ms=1000, origin_grace_ms=1000, shadow=missing == 'shadow_limit',
+             shadow_until_ms=None)
+    if missing == 'warmup':
+        t['settings']['warmup_bars'] = None
+        t['settings_sha256'] = hash_json(t['settings'])
+    with pytest.raises(psycopg.errors.CheckViolation):
+        db.rpc('paper_create_test', p_test=t)
+    assert db.query('select count(*) from paper_tests') == [(0,)]
+
+
+def test_review_tick_with_recorded_outcome_cannot_be_reused(db):
+    t = db.create_test(pre_gate=True, lease=1000)
+    db.claim(t)
+    second_tick = db.tick()
+    assert db.claim(t, tick=second_tick)['outcome'] == 'lease_held'
+    # Expiry permits a fresh tick, but must not turn the old rejected tick
+    # into a claim whose immutable outcome would still say lease_held.
+    assert db.claim(t, at=NOW+1001, tick=second_tick)['outcome'] == 'tick_already_used'
+    assert db.query('select count(*) from paper_run_claims') == [(1,)]
+    assert db.query('select outcome from paper_tick_outcomes where tick_id=%s',
+                    (second_tick,)) == [('lease_held',)]
+    assert db.claim(t, at=NOW+1001)['outcome'] == 'claimed'
+
+
+@pytest.mark.parametrize('current', ['succeeded', 'running'])
+def test_review_old_failed_job_with_reused_pid_is_not_current_origin(db, current):
+    t = db.create_test(grace=1000)
+    result, _ = db.persist(t, db.claim(t, origin=current), pnls=[])
+    db.execute("insert into cron.job_run_details(jobid,job_pid,database,username,status,start_time,end_time) "
+               "select jobid,job_pid,database,username,'failed',paper_private.ts(%s),paper_private.ts(%s) "
+               "from cron.job_run_details", (NOW-STEP_MS, NOW-1000))
+    answer = db.assess(result['run']['id'])
+    if current == 'running':
+        assert answer['outcome'] == 'origin_pending'
+        assert db.query('select count(*) from paper_run_assessments') == [(0,)]
+    else:
+        assert answer['assessment']['eligibility'] == 'proven_ineligible'
+        assert answer['assessment']['tick_origin_verified'] is True
+    assert db.query('select count(*) from paper_verdicts') == [(0,)]
+
+
+def test_review_snapshot_digest_survives_test_completion_and_audit(db):
+    t = db.create_test()
+    result, _ = db.persist(t, db.claim(t))
+    rid = result['run']['id']
+    before = db.rpc('paper_read_run', p_run_id=rid)
+    assessed = db.assess(rid)
+    after = db.rpc('paper_read_run', p_run_id=rid)
+    assert after == before
+    assert after['evidence_sha256'] == assessed['assessment']['evidence_sha256']
+    assert after['evidence_sha256'] == assessed['verdict']['evidence_sha256']
+    args = prepare_assessment(before, evaluator_commit=COMMIT)
+    args.pop('p_run_id')
+    audit = db.rpc('paper_audit_run', p_verdict_id=assessed['verdict']['id'], **args)
+    assert audit['evidence_sha256'] == assessed['verdict']['evidence_sha256']
+
+
+def test_review_later_archive_insert_cannot_repair_persisted_run_evidence(db):
+    t = db.create_test()
+    claim = db.claim(t)
+    candles = list(evidence(t, as_of=claim['claim']['test_end_ms']).candles)
+    db.rpc('paper_archive_candles', p_source='okx', p_pair=t['pair'], p_timeframe='5m', p_rows=candles[:-1])
+    result, _ = db.persist(t, claim, archive=False)
+    rid = result['run']['id']
+    before = db.rpc('paper_read_run', p_run_id=rid)
+    assert len(before['candles']) == len(candles)-1
+    assert prepare_assessment(before, evaluator_commit=COMMIT)['p_evaluation']['verdict'] == 'INVALID'
+    # Another run may fill the shared archive; this run's sealed input cannot grow.
+    db.rpc('paper_archive_candles', p_source='okx', p_pair=t['pair'], p_timeframe='5m', p_rows=candles[-1:])
+    assert db.rpc('paper_read_run', p_run_id=rid) == before
+    assessed = db.assess(rid)
+    assert assessed['verdict']['verdict'] == 'INVALID'
+    assert assessed['verdict']['invalid_reason'] == 'incomplete_candles'
