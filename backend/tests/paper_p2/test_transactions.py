@@ -133,6 +133,7 @@ def db():
             return result;
           end $clock$;
           alter function paper_private.now_ms() owner to postgres;
+          grant execute on function paper_private.now_ms() to paper_rpc_owner;
           create schema cron;
           create table cron.job(jobid bigint primary key, jobname text, username text, database text);
           insert into cron.job values (1,'paper_tick','paper_cron_owner',current_database());
