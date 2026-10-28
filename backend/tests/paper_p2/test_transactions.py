@@ -587,12 +587,13 @@ def test_review_tick_with_recorded_outcome_cannot_be_reused(db):
 
 
 @pytest.mark.parametrize('current', ['succeeded', 'running'])
-def test_review_old_failed_job_with_reused_pid_is_not_current_origin(db, current):
+@pytest.mark.parametrize('old_end', [NOW-1000, None])
+def test_review_old_failed_job_with_reused_pid_is_not_current_origin(db, current, old_end):
     t = db.create_test(grace=1000)
     result, _ = db.persist(t, db.claim(t, origin=current), pnls=[])
     db.execute("insert into cron.job_run_details(jobid,job_pid,database,username,status,start_time,end_time) "
                "select jobid,job_pid,database,username,'failed',paper_private.ts(%s),paper_private.ts(%s) "
-               "from cron.job_run_details", (NOW-STEP_MS, NOW-1000))
+               "from cron.job_run_details", (NOW-STEP_MS, old_end))
     answer = db.assess(result['run']['id'])
     if current == 'running':
         assert answer['outcome'] == 'origin_pending'
@@ -624,7 +625,8 @@ def test_review_later_archive_insert_cannot_repair_persisted_run_evidence(db):
     claim = db.claim(t)
     candles = list(evidence(t, as_of=claim['claim']['test_end_ms']).candles)
     db.rpc('paper_archive_candles', p_source='okx', p_pair=t['pair'], p_timeframe='5m', p_rows=candles[:-1])
-    result, _ = db.persist(t, claim, archive=False)
+    result, _ = db.persist(t, claim, archive=False,
+                           run_change={'candle_open_times_ms': [c['open_time_ms'] for c in candles]})
     rid = result['run']['id']
     before = db.rpc('paper_read_run', p_run_id=rid)
     assert len(before['candles']) == len(candles)-1

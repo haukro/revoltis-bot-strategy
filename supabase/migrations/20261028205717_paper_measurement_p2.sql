@@ -69,9 +69,10 @@ create table public.paper_tests (
   status text not null default 'running' check (status in ('running','completed','invalid','stopped')),
   authoritative_verdict_id uuid, completed_at timestamptz,
   unique (label, start_ms),
-  check ((shadow and shadow_until_ms > start_ms) or (not shadow and shadow_until_ms is null)),
+  check ((shadow and shadow_until_ms is not null and shadow_until_ms > start_ms) or
+         (not shadow and shadow_until_ms is null)),
   check (settings_sha256 = paper_private.hash_json(settings)),
-  check (settings ? 'warmup_bars' and (settings->>'warmup_bars')::integer >= 0)
+  check (settings->>'warmup_bars' is not null and (settings->>'warmup_bars')::integer >= 0)
 );
 create table public.paper_measure_ticks (
   tick_id uuid primary key default gen_random_uuid(),
@@ -115,6 +116,9 @@ create table public.paper_runs (
   code_commit text, engine_sha256 text, settings_sha256 text, candles_sha256 text,
   candle_source text not null default 'okx', candle_first_open_ms bigint,
   candle_last_open_ms bigint, candle_count integer, expected_count integer,
+  -- Freeze membership in the shared immutable archive, including any gaps.
+  -- A later archive insert must never supplement evidence for an older run.
+  candle_open_times_ms bigint[] not null,
   cost_profile jsonb, cost_profile_sha256 text, book_ts_ms bigint, cost_fetched_at_ms bigint,
   tape_sha256 text, trade_count integer check (trade_count >= 0),
   open_count integer check (open_count >= 0), summary jsonb, raw jsonb not null default '{}',
@@ -314,7 +318,8 @@ begin
     t_claim - paper_private.ms(tick.created_at) not between 0 and 119999 then
     return jsonb_build_object('outcome','invalid_tick');
   end if;
-  if exists(select from public.paper_run_claims where test_id=p_test_id and tick_id=p_tick_id) then
+  if exists(select from public.paper_run_claims where test_id=p_test_id and tick_id=p_tick_id) or
+    exists(select from public.paper_tick_outcomes where test_id=p_test_id and tick_id=p_tick_id) then
     return jsonb_build_object('outcome','tick_already_used');
   end if;
   if t.status <> 'running' or t.authoritative_verdict_id is not null then outcome := 'test_closed';
@@ -385,6 +390,11 @@ begin
     'test_end_ms',c.test_end_ms,'as_of_ms',c.test_end_ms,'boundary_ms',c.boundary_ms,
     'last_candle_open_ms',c.last_candle_open_ms,'persisted_at',paper_private.ts(t_persist),
     'created_txid',txid_current(),'candle_source',coalesce(p_run->>'candle_source','okx'),
+    'candle_open_times_ms',coalesce((select array_agg(a.open_time_ms order by a.open_time_ms)
+      from public.candle_archive a where a.source=coalesce(p_run->>'candle_source','okx')
+        and a.pair=t.pair and a.timeframe=t.timeframe
+        and a.open_time_ms between (p_run->>'candle_first_open_ms')::bigint
+                              and (p_run->>'candle_last_open_ms')::bigint),array[]::bigint[]),
     'raw',coalesce(p_run->'raw','{}'::jsonb),
     'trade_count',case when p_trades is null or p_trades='null'::jsonb then null else p_run->'trade_count' end,
     'open_count',case when p_positions is null or p_positions='null'::jsonb then null else p_run->'open_count' end,
@@ -408,9 +418,9 @@ end $$;
 
 create function public.paper_persist_diagnostic(p_test_id uuid,p_run jsonb,p_trades jsonb,p_positions jsonb)
 returns jsonb language plpgsql security definer set search_path = '' as $$
-declare r public.paper_diagnostic_runs; item jsonb; stamp bigint; horizon bigint;
+declare t public.paper_tests; r public.paper_diagnostic_runs; item jsonb; stamp bigint; horizon bigint;
 begin
-  perform 1 from public.paper_tests where id=p_test_id;
+  select * into t from public.paper_tests where id=p_test_id;
   if not found then raise exception 'unknown_test'; end if;
   if jsonb_typeof(p_run) is distinct from 'object' or jsonb_typeof(p_trades) is distinct from 'array'
     or jsonb_typeof(p_positions) is distinct from 'array' then raise exception 'invalid_diagnostic_payload'; end if;
@@ -421,6 +431,11 @@ begin
     'last_candle_open_ms',floor(horizon::numeric/300000)*300000-300000,
     'persisted_at',paper_private.ts(stamp),'created_txid',txid_current(),
     'candle_source',coalesce(p_run->>'candle_source','okx'),'raw',coalesce(p_run->'raw','{}'::jsonb),
+    'candle_open_times_ms',coalesce((select array_agg(a.open_time_ms order by a.open_time_ms)
+      from public.candle_archive a where a.source=coalesce(p_run->>'candle_source','okx')
+        and a.pair=t.pair and a.timeframe=t.timeframe
+        and a.open_time_ms between (p_run->>'candle_first_open_ms')::bigint
+                              and (p_run->>'candle_last_open_ms')::bigint),array[]::bigint[]),
     'tape_present',true,'positions_present',true,'open_positions',p_positions));
   if exists(select from jsonb_array_elements(p_positions) e where (e->>'run_id')::uuid is distinct from r.id) then
     raise exception 'run_identity_mismatch'; end if;
@@ -452,14 +467,16 @@ declare r public.paper_runs; t public.paper_tests; data jsonb;
 begin
   select * into strict r from public.paper_runs where id=p_run_id;
   select * into strict t from public.paper_tests where id=r.test_id;
-  select jsonb_build_object('test',to_jsonb(t),'run',to_jsonb(r),
+  -- Operational test state is not measurement evidence: completion/stop must
+  -- not change the snapshot digest recorded by an assessment or audit.
+  select jsonb_build_object('test',to_jsonb(t)-array['status','authoritative_verdict_id','completed_at'],'run',to_jsonb(r),
     'trades',case when r.tape_present then coalesce(
       (select jsonb_agg(evidence order by ordinal) from public.paper_run_trades where run_id=r.id),'[]'::jsonb) end,
     'open_positions',case when r.positions_present then coalesce(
       (select jsonb_agg(evidence order by ordinal) from public.paper_run_open_positions where run_id=r.id),'[]'::jsonb) end,
     'candles',coalesce((select jsonb_agg(to_jsonb(c)-array['source','pair','timeframe','fetched_at'] order by open_time_ms)
       from public.candle_archive c where c.source=r.candle_source and c.pair=t.pair and c.timeframe=t.timeframe
-        and c.open_time_ms between r.candle_first_open_ms and r.candle_last_open_ms),'[]'::jsonb)) into data;
+        and c.open_time_ms=any(r.candle_open_times_ms)),'[]'::jsonb)) into data;
   return data;
 end $$;
 create function public.paper_read_run(p_run_id uuid) returns jsonb
@@ -474,14 +491,16 @@ declare t public.paper_measure_ticks; succeeded boolean := false; failed boolean
 begin
   select * into strict t from public.paper_measure_ticks where tick_id=p_tick_id;
   if to_regclass('cron.job') is not null and to_regclass('cron.job_run_details') is not null then
-    -- PID, job name, database, role and time interval all bind the originating job.
+    -- Bind the most recent matching execution. PIDs can be reused; an older
+    -- failed execution must not contaminate the current successful/pending one.
     execute $query$
-      select coalesce(bool_or(d.status='succeeded' and d.end_time >= $1),false),
-        coalesce(bool_or(d.status='failed'),false)
+      select d.status='succeeded' and d.end_time >= $1, d.status='failed'
       from cron.job_run_details d join cron.job j using (jobid)
       where j.jobname='paper_tick' and j.username='paper_cron_owner'
         and j.database=current_database() and d.username='paper_cron_owner'
         and d.database=current_database() and d.job_pid=$2 and d.start_time <= $1
+        and (d.end_time is null or d.end_time >= $1)
+      order by d.start_time desc, d.runid desc limit 1
     $query$ into succeeded,failed using t.created_at,t.backend_pid;
   end if;
   if failed then return 'unverifiable'; end if;
