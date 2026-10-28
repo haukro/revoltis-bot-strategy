@@ -36,11 +36,26 @@ Branch: `codex/paper-measurement-p1`. PR for review only, without merge.
 
 The evaluator accepts `RunEvidence.origin` only from a trusted future adapter:
 `verified`, `pending`, or `unverifiable`. P1 does not certify cron records.
-`chronology_verified` defaults to false; the presence of a sequence number
-alone cannot certify first-run priority. Missing evidence yields INVALID with
+`chronology_verified` defaults to false and requires the boolean `True` for
+post-gate runs; truthy strings/numbers are not certificates. The presence of a
+sequence number alone cannot certify first-run priority. Pre-gate runs are
+excluded before checking sequence metadata. Missing evidence yields INVALID with
 `reason=unverifiable_candidate`, the specific `invalid_reason`, and the same
 specific reason in the eligibility trace. A pending origin returns
 NOT_EVALUATED / origin_pending before classifying or skipping that run.
+
+Code identity fields require a lowercase 40-character commit SHA and a
+64-character engine SHA-256. This validates their representation; the future
+trusted adapter must bind them to the actual deployed source. Open-position
+rows require run ownership, ordinal, pair, opened timestamp, positive entry
+rate/stake, and a raw object, with no closed timestamp. They remain open and
+are not included in closed-trade metrics.
+
+Metric sums and threshold comparisons use an isolated decimal context sized
+to the input values. PF/expectancy do not depend on the caller's decimal
+precision. Numeric outputs must remain finite and must not turn a nonzero
+decimal into floating-point zero; otherwise the candidate is INVALID with
+`unrepresentable_metrics`. DD uses explicit half-even rounding to two decimals.
 
 No existing runtime path imports the new module. `main.py`, `simulation.py`,
 `costs.py`, `optimizer.py`, ledger, strategies and migrations retain their base
@@ -75,6 +90,23 @@ missing trade fields, unassociated rows, forced/warmup/null-PnL exclusions,
 future trades, pending origin traversal, and the pure Scale classification.
 These unit cases do not claim completion of later DB/cron acceptance tests.
 
+## P1 implementation review — 2026-10-28
+
+Review of the original P1 head `e5182cda` reproduced the following failures.
+All fixes remain in the offline module and preserve the FINAL specification.
+
+| Reproduced issue | Fix and regression coverage |
+| --- | --- |
+| `chronology_verified="false"` and placeholder code hashes could permit PASS. | Strict boolean certificate and full hash syntax; 8 cases. |
+| A pre-gate invalid run without `seq` could invalidate the test. | Apply the time gate before sequence checks; 2 cases, including a later valid candidate. |
+| An open-position row without entry/stake/raw evidence could permit PASS. | Validate essential fields; 3 missing-field cases and 1 complete open-position case. |
+| Null tape/position/candle rows or a list cost profile could raise instead of returning INVALID. | Validate evidence shapes; 4 cases. |
+| A missing replay snapshot raised an uncaught lookup error. | Return INVALID / missing_run_evidence; 1 case. |
+| PF/aggregate overflow could produce Infinity, tiny values could become zero, ambient decimal precision could change PF 1.09 to 1.10, and large DD could fail quantization. | Isolate decimal arithmetic and validate float outputs; 5 cases. |
+
+These 24 regression cases extend the original 56 P1 cases. They do not
+renumber AT1–AT46 or claim completion of any later phase.
+
 ## Validation and reproducibility
 
 Run from `backend` after installing the pinned `requirements.txt` and pytest:
@@ -86,10 +118,11 @@ python -m pytest -q
 Local validation uses Python 3.12 and synthetic data, mocked HTTP/storage for
 legacy endpoint tests, cleared production configuration, and an external
 socket guard. The pre-change backend suite passed 151 cases. The completed
-suite contains those 151 cases plus 56 P1 cases. CI runs the existing workflow
+suite contains those 151 cases plus 80 P1 cases. CI runs the existing workflow
 on the PR. This record does not certify P2–P7 or an economic strategy result.
 
-Local result on 2026-10-28: **207 passed, 0 failed, 0 skipped** (13.03 s).
+Local result after review on 2026-10-28: **231 passed, 0 failed, 0 skipped**
+(19.42 s). The original P1 validation passed 207 cases before these additions.
 One pre-existing Starlette/AnyIO deprecation warning remains. `git diff --check`
 passed. The only changed pre-existing file is the branch-specific Vercel guard.
 

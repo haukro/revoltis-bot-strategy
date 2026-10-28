@@ -5,6 +5,7 @@ from dataclasses import replace
 from functools import lru_cache
 from pathlib import Path
 import json
+from decimal import Decimal, localcontext
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -405,3 +406,100 @@ def legacy_outputs():
 def test_at18_legacy_endpoint_and_optimizer_match_b200950():
     expected = json.loads((Path(__file__).parent / "fixtures/paper_p1_legacy_b200950.json").read_text())
     assert legacy_outputs() == expected
+
+
+@pytest.mark.parametrize("certificate", ["false", "true", 1, None])
+def test_review_chronology_requires_boolean_true(certificate):
+    result = evaluate_test(test_config(), [evidence()], chronology_verified=certificate)
+    assert result["verdict"] == "INVALID"
+    assert result["reason"] == "first_run_unverifiable"
+
+
+@pytest.mark.parametrize("field,value", [("code_commit", "unknown"), ("engine_sha256", "unknown"),
+                                         ("code_commit", True), ("engine_sha256", 123)])
+def test_review_code_identity_requires_full_hashes(field, value):
+    item = evidence()
+    result = evaluate([replace(item, run={**item.run, field: value})])
+    assert result["verdict"] == "INVALID"
+    assert result["invalid_reason"] == "unknown_code_version"
+
+
+@pytest.mark.parametrize("with_later_candidate", [False, True])
+def test_review_pre_gate_missing_sequence_does_not_block_test(with_later_candidate):
+    pre = RunEvidence({"id": "pre", "test_end_ms": START + GATE_MS - 1,
+                       "status": "invalid"}, None, None, None)
+    result = evaluate([pre] + ([evidence(seq=2)] if with_later_candidate else []))
+    assert result["verdict"] == ("PASS" if with_later_candidate else "NOT_EVALUATED")
+    assert all(row["run_id"] != "pre" for row in result["eligibility_trace"])
+
+
+def open_position():
+    return {"run_id": "run-1", "ordinal": 0, "pair": PAIR, "opened_at_ms": START,
+            "entry_rate": 100, "stake": 50, "closed_at_ms": None, "raw": {}}
+
+
+@pytest.mark.parametrize("field", ["entry_rate", "stake", "raw"])
+def test_review_partial_open_position_is_missing_evidence(field):
+    item = evidence()
+    position = open_position()
+    position.pop(field)
+    result = evaluate([replace(item, open_positions=[position], run={**item.run, "open_count": 1})])
+    assert result["verdict"] == "INVALID"
+    assert result["invalid_reason"] == "incomplete_open_position_evidence"
+
+
+def test_review_complete_open_position_is_accepted_without_forced_exit():
+    item = evidence()
+    result = evaluate([replace(item, open_positions=[open_position()], run={**item.run, "open_count": 1})])
+    assert result["verdict"] == "PASS" and result["trades_count"] == 30
+
+
+@pytest.mark.parametrize("kind", ["null_trade", "null_position", "null_candle", "list_profile"])
+def test_review_malformed_evidence_returns_invalid_instead_of_raising(kind):
+    item = evidence()
+    if kind == "null_trade":
+        item = replace(item, trades=[None] + list(item.trades[1:]))
+    elif kind == "null_position":
+        item = replace(item, open_positions=[None], run={**item.run, "open_count": 1})
+    elif kind == "null_candle":
+        item = replace(item, candles=[None] + list(item.candles[1:]))
+    else:
+        item = replace(item, run={**item.run, "cost_profile": [1], "cost_profile_sha256": hash_json([1])})
+    result = evaluate([item])
+    assert result["verdict"] == "INVALID"
+    assert result["eligibility_trace"][0]["eligibility"] == "unverifiable"
+
+
+def test_review_missing_replay_snapshot_returns_invalid():
+    result = replay_run("missing", read_snapshot=lambda run_id: {}[run_id])
+    assert result == {"run_id": "missing", "status": "invalid", "reason": "missing_run_evidence"}
+
+
+@pytest.mark.parametrize("profits", [[1e308, -1e-308] + [0] * 28,
+                                     [1e308] * 30,
+                                     [Decimal("1e-400")] * 30])
+def test_review_metrics_must_remain_finite_and_preserve_nonzero_values(profits):
+    item = evidence()
+    trades = deepcopy(item.trades)
+    for row, profit in zip(trades, profits):
+        row["profit_usdt"] = profit
+    result = evaluate([with_tape(item, trades)])
+    assert result["verdict"] == "INVALID"
+    assert result["invalid_reason"] == "unrepresentable_metrics"
+    assert result["eligibility_trace"][0]["eligibility"] == "unverifiable"
+    json.dumps(result, allow_nan=False)
+
+
+def test_review_decimal_context_cannot_change_pf_boundary():
+    item = evidence(pnls=[1.09, -1] + [0] * 28)
+    with localcontext() as context:
+        context.prec = 2
+        result = evaluate([item])
+    assert result["verdict"] == "FAIL"
+    assert result["profit_factor"] == 1.09
+
+
+def test_review_large_finite_drawdown_does_not_crash_quantization():
+    result = evaluate([evidence(dd=1e30)])
+    assert result["verdict"] == "FAIL"
+    assert result["dd_value"] == 1e30
