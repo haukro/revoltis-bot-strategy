@@ -10,6 +10,52 @@ branch creation because it requires Pro or higher. No test branch, connected
 database SQL, migration, or strategic run was executed. No paid-plan upgrade
 is authorized; actual Supabase branch acceptance remains deferred.
 
+Roman subsequently authorized **additional local Supabase integration in CI**,
+as a separate commit on this draft. This is supplementary evidence, not a
+replacement acceptance gate: P2 managed-branch acceptance and P3/P4 remain open.
+
+## Additional local Supabase CI
+
+The `paper-p2-supabase` job pins Supabase CLI 2.122.0 and starts an unlinked,
+temporary project with the actual Supabase Postgres 17 image, Auth, PostgREST
+and API gateway. It never loads repository CLI state, hosted credentials or a
+project ref. API/DB URLs must be loopback addresses on the dedicated local ports;
+the Docker database must have the expected project label before test SQL runs.
+The stack and volumes are removed even after a failed test.
+
+The CLI applies the **exact P2 migration bytes**, preceded by two explicitly
+synthetic `001`/`029` ordering probes. This verifies mixed numeric/timestamp
+filenames, installation identity and local migration history. It does not replay
+legacy migrations 001–029 or reconcile production migration history. The known
+remote `20261005175015_paper_ledger_028_029_ec15a24` record has no corresponding
+file on this branch; a production application plan must resolve that mismatch
+before any eventual `db push`. No repair or renaming is performed here.
+
+The integration cases check real Supabase roles and RLS, Auth-issued tokens,
+`authenticator` sessions switching to anon/authenticated/service_role, denial
+of table access and tick manufacture, and server RPC creation/shadow stop.
+One actual minutely cron job runs as `paper_cron_owner`, records its session/PID,
+and sends a `pg_net` POST to an echo container on the same Docker network (no
+published HTTP port). The test links the real succeeded log interval to the
+tick and verifies the HTTP response. It then exercises claim, archive, persist,
+read and idempotent assess through PostgREST with synthetic candles and no trades.
+There is no strategy run or economic verdict.
+
+Cron extension activation, LOGIN/CONNECT, metadata grants and narrow metadata
+RLS policies are **CI-only P4 setup candidates**, outside the P2 migration.
+The test first demonstrates origin_pending without the metadata RLS policies,
+then proven_ineligible with verified origin after those policies are installed.
+No fake clock, hand-inserted cron catalog row, or application-function replacement
+is used. Extension versions, role flags and the cron connection mode are reported
+by the test. Proposed production grace/lease values remain unapproved; the fixture
+uses explicit 120000-ms values only for this short integration check.
+
+Passing this job would not establish managed-platform compatibility, deployed
+code identity, Vercel preview protection bypass, 24-hour scheduling continuity,
+or suitability of the proposed production timing settings. Those remain future
+phase acceptance requirements. Startup/service and test results must be read from
+the exact commit's CI run before claiming this new integration has passed.
+
 ## Read-only preflight
 
 Project `revoltis-bot-strategy` (`vdglyxhlmukxeqynguke`): migration history has
