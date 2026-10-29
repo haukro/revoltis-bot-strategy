@@ -30,8 +30,10 @@ def now_ms(stack):
 
 
 def create_case(stack, kind, stamp):
+    # The actual test identity is (label, start_ms), not the pair or UUID.
+    offset = ('CONT', 'SIGNAL', 'FLAT', 'GAP', 'LAG', 'SHADOW').index(kind)
     t = test_config(label='scale' if kind in ('SIGNAL', 'FLAT', 'GAP') else 'official',
-                    start_ms=stamp // STEP_MS * STEP_MS - GATE_MS - 10 * STEP_MS)
+                    start_ms=stamp // STEP_MS * STEP_MS - GATE_MS - (10 + offset) * STEP_MS)
     pair = 'P4' + kind + uuid4().hex[:8].upper() + '/USDT'
     t['pair'] = pair
     t['settings'].update(selected_pairs=[pair], initial_capital=10000., stop_loss_percent=5.)
