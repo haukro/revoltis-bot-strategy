@@ -4,7 +4,8 @@
     "deploymentEnabled": {
       "codex/paper-measurement-p1": false,
       "codex/paper-measurement-p2": false,
-      "codex/paper-measurement-p3": false
+      "codex/paper-measurement-p3": false,
+      "codex/paper-measurement-p4-ci": false
     }
   },
   "services": {
