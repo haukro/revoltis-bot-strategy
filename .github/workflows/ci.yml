@@ -56,7 +56,7 @@ jobs:
           path = Path(os.environ.get('PAPER_P2_STACK_DIR', '/nonexistent')) / 'start.log'
           if path.exists():
               for line in path.read_text(errors='replace').splitlines()[-100:]:
-                  if re.search(r'key|token|secret|password|authorization|jwt|postgres(ql)?://', line, re.I):
+                  if re.search(r'key|token|secret|password|authorization|jwt|publishable|sb_|eyJ|postgres(ql)?://', line, re.I):
                       continue
                   print(line)
       - name: Remove disposable local services

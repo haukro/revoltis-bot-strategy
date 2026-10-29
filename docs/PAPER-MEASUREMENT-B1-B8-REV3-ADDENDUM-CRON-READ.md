@@ -20,6 +20,11 @@ To nedokazuje, že rovnaké DDL bude povolené spravovanou platformou Supabase.
 Pôvodné politiky CI #124 filtrovali iba `username`; nasledujúce pravidlá
 vyžadujú aj konkrétny job a zohľadnenie ostatných politík.
 
+Rozšírené CI #125 zachytilo aj zdedené zápisové oprávnenie: 15 prípadov
+prešlo, AT50 zlyhal. pg_cron udeľuje DELETE na `cron.job_run_details`
+cez PUBLIC. Navyše USAGE na `cron` sprístupňuje funkcie s existujúcim
+PUBLIC EXECUTE. Samotná SELECT politika preto nevytvorí rolu iba na čítanie.
+
 ## A1.1 Príjemca a oprávnenia
 
 Prístup k dôkazom sa pridáva iba vlastníkovi assess RPC, aktuálne
@@ -38,8 +43,18 @@ Granty, členstvá a existujúce politiky sa posudzujú spoločne.
 Ide o obmedzenie prístupu aplikačných rolí a rozsahu nového oprávnenia.
 Neodoberá existujúce administrátorské práva PostgreSQL ani existujúce oprávnenia
 vlastníka rozšírenia. Tvrdenie „žiadna iná rola“ sa nevzťahuje na superusera.
-Tento dodatok tiež neudeľuje práva na plánovanie alebo správu cron jobov;
-existujúce EXECUTE granty funkcií rozšírenia sa preveria osobitne pri P4.
+Čítacia rola nesmie získať ani EXECUTE na plánovanie alebo správu cron jobov
+(`schedule`, `schedule_in_database`, `alter_job`, `unschedule`).
+
+Per-role REVOKE nezruší oprávnenie zdedené z PUBLIC. Kandidát v CI preto
+odoberá PUBLIC DELETE na logoch a PUBLIC EXECUTE uvedených správcovských
+funkcií; potrebné správcovské oprávnenia výslovne ponecháva `postgres`.
+**To je širšia zmena ACL rozšírenia, nie iba nová RLS politika.** Pred
+spravovaným nasadením sa musí identifikovať každý existujúci oprávnený
+správca a používateľ cronu, posúdiť dopad a schváliť presný zoznam grantov.
+CI nastavenie sa nesmie bez tejto kontroly preniesť do existujúceho projektu.
+Ak sa bezpečné obmedzenie nedá dosiahnuť, použije sa až samostatne schválený
+alternatívny mechanizmus podľa A1.4.
 
 ## A1.2 Povolené záznamy
 
@@ -82,13 +97,14 @@ Supabase prostredí overí:
 
 1. Kto vlastní cron tabuľky a či dostupná administračná rola môže vytvoriť
    potrebné granty a politiky bez superuser prístupu.
-2. Efektívne ACL/RLS, členstvá rolí a obmedzenie na jediný povolený job.
+2. Efektívne ACL/RLS, PUBLIC a zdedené práva, členstvá rolí, obmedzenie na
+   jediný povolený job a zachovanie schválených práv existujúcich správcov.
 3. Zachovanie alebo riadená obnova grantov a politík po podporovanom upgrade
    alebo obnove rozšírenia. Zaznamenajú sa verzie a výsledky kontrol pred/po.
 
 **Toto riziko zostáva otvorené.** Lokálne úspešné DDL ani pripnutá verzia
 rozšírenia nepreukazujú podporu či trvácnosť nastavení na spravovanej platforme.
-Ak priame politiky nie sú povolené, samostatne sa navrhne a preskúma napríklad
+Ak priame politiky alebo potrebné obmedzenie ACL nie sú možné, samostatne sa navrhne a preskúma napríklad
 privátna SECURITY DEFINER funkcia s legitímnym prístupom ku cron dôkazu,
 pevným `search_path`, úzkym výstupom a EXECUTE iba pre vlastníka assess RPC.
 Nesmie sprístupniť všeobecné čítanie cron logov HTTP workerovi. Tento fallback
@@ -103,7 +119,7 @@ nie je týmto dodatkom automaticky schválený ani implementovaný.
 | AT47 | Vlastník assess RPC prečíta skutočný `paper_tick` a jeho log; assess overí pôvod. | Doplnkové P2 CI; zopakovať v spravovanom prostredí pred uzavretím P4. |
 | AT48 | `anon`, `authenticated`, `service_role` a `authenticator` neprečítajú cron dôkaz a nemajú SET/USAGE členstvo čítacej roly. | Doplnkové P2 CI + spravované prostredie. |
 | AT49 | (a) iný job rovnakého vlastníka, (b) rovnaký názov pod iným vlastníkom, (c) job čítacej roly a (d) iná databáza sú neviditeľné. | CI overuje (a)–(c); (d) zostáva samostatnou kontrolou v povolenom prostredí. |
-| AT50 | Čítacia rola nemá INSERT/UPDATE/DELETE/TRUNCATE/REFERENCES/TRIGGER na cron tabuľkách; pokus o DELETE je odmietnutý. | Doplnkové P2 CI + spravované prostredie. |
+| AT50 | (a) Čítacia rola nemá INSERT/UPDATE/DELETE/TRUNCATE/REFERENCES/TRIGGER na cron tabuľkách; DELETE je odmietnutý. (b) Nemá EXECUTE na správu jobov; administrátorovi zostanú explicitné potrebné práva. | Doplnkové P2 CI + kontrola dopadu ACL v spravovanom prostredí. |
 | AT51 | Granty/politiky možno nainštalovať oprávnenou administrátorskou rolou na spravovanej platforme; po upgrade/obnove zostáva úzky prístup a odmietnutie ostatných rolí. | Otvorená brána spravovaného prostredia; lokálne CI ju nenahrádza. |
 
 ## CI a ďalší postup
@@ -124,6 +140,7 @@ vyžaduje aspoň 24 h v schválenom izolovanom prostredí s preview.
 | Dátum | Zmena | Stav |
 | --- | --- | --- |
 | 29. 10. 2026 | Návrh A1: čítanie cron dôkazov, rozsah jobu, ACL/RLS, testy AT47–AT51 a riziko spravovanej platformy. | Čaká na Romanovo schválenie; FINAL rev3 zostáva nezmenená. |
+| 29. 10. 2026 | CI #125 odhalilo PUBLIC zápisové právo. Návrh doplnený o zdedené DELETE/EXECUTE, kontrolu administrátorských grantov a nutnosť posúdiť širší dopad ACL. | Kandidát iba v CI; nejde o povolenie meniť ACL spravovaného projektu. |
 
 Podklady: [CI #124](https://github.com/haukro/revoltis-bot-strategy/actions/runs/40883584779),
 [PostgreSQL 17 CREATE POLICY](https://www.postgresql.org/docs/17/sql-createpolicy.html),

@@ -58,6 +58,12 @@ inactive reader-owned job is hidden too. Separate cases deny access to four
 other application roles and verify that the reader has no cron-table write
 privileges. This is CI-only policy DDL performed by `supabase_admin`; it does
 not prove the managed platform permits the same DDL or preserves it on upgrade.
+CI #125 exposed pg_cron's inherited PUBLIC DELETE on run details. The revised
+CI candidate removes that PUBLIC privilege and PUBLIC execution of scheduler
+management functions, preserving explicit administrator grants to postgres.
+A new case checks the reader cannot invoke those functions. These are broader
+extension ACL changes: their effect on existing cron users must be reviewed
+before any managed deployment. They are not in the P2 application migration.
 No fake clock, hand-inserted cron catalog row, or application-function replacement
 is used. Extension versions, role flags and the cron connection mode are reported
 by the test. Proposed production grace/lease values remain unapproved; the fixture

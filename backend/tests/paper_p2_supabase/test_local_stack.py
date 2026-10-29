@@ -278,6 +278,28 @@ def cron_case(stack):
         pending = stack.rpc('paper_assess_run', **args)
         assert pending == {'outcome': 'origin_pending'}
         assert stack.rows(f"select count(*) as n from paper_run_assessments where run_id='{item.run['id']}'") == [{'n': 0}]
+        # pg_cron grants DELETE on run details to PUBLIC. Granting cron USAGE
+        # also exposes public scheduler functions. Per-role REVOKE cannot deny
+        # rights inherited from PUBLIC. This CI-only candidate removes those
+        # public rights and explicitly preserves the local postgres administrator;
+        # managed deployment requires a separate impact/permission review.
+        inherited_delete = stack.rows("select exists(select from pg_class c, lateral aclexplode(c.relacl) a "
+            "where c.oid='cron.job_run_details'::regclass and a.grantee=0 and a.privilege_type='DELETE') as allowed")
+        assert inherited_delete == [{'allowed': True}]
+        print('Observed pg_cron PUBLIC DELETE on cron.job_run_details; restricting CI reader privileges.')
+        stack.admin('''
+          revoke delete on cron.job_run_details from public;
+          grant delete on cron.job_run_details to postgres;
+          do $$ declare f record; begin
+            for f in select p.oid::regprocedure signature from pg_proc p
+              where p.pronamespace='cron'::regnamespace
+                and p.proname in ('schedule','schedule_in_database','alter_job','unschedule')
+            loop
+              execute format('revoke execute on function %s from public',f.signature);
+              execute format('grant execute on function %s to postgres',f.signature);
+            end loop;
+          end $$;
+        ''')
         # Narrow CI-only metadata policies. No synthetic cron rows, owner changes,
         # BYPASSRLS grant, or modification of the application origin function.
         selectors = {
@@ -343,9 +365,22 @@ def test_at48_other_application_roles_cannot_read_cron_evidence(stack, cron_case
 def test_at50_assess_owner_has_no_cron_table_write_privileges(stack, cron_case):
     for table in ('job', 'job_run_details'):
         for privilege in ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER'):
-            assert stack.rows(f"select has_table_privilege('paper_rpc_owner','cron.{table}','{privilege}') as allowed") == [{'allowed': False}]
+            assert stack.rows(f"select has_table_privilege('paper_rpc_owner','cron.{table}','{privilege}') as allowed") == [{'allowed': False}], (table, privilege)
         with pytest.raises(subprocess.CalledProcessError) as failure:
             stack.admin(f'set role paper_rpc_owner; delete from cron.{table} where false;')
         assert 'permission denied' in failure.value.stderr
     assert stack.rows("select rolsuper,rolbypassrls,rolcanlogin from pg_roles where rolname='paper_rpc_owner'") == [
         {'rolsuper': False, 'rolbypassrls': False, 'rolcanlogin': False}]
+
+
+def test_at50_reader_cannot_call_cron_management_functions(stack, cron_case):
+    functions = stack.rows("select p.oid::regprocedure::text as signature, "
+        "has_function_privilege('paper_rpc_owner',p.oid,'EXECUTE') as reader, "
+        "has_function_privilege('postgres',p.oid,'EXECUTE') as administrator "
+        "from pg_proc p where p.pronamespace='cron'::regnamespace "
+        "and p.proname in ('schedule','schedule_in_database','alter_job','unschedule')")
+    assert functions and all(not f['reader'] and f['administrator'] for f in functions), functions
+    assert stack.rows("select has_table_privilege('postgres','cron.job_run_details','DELETE') as allowed") == [{'allowed': True}]
+    with pytest.raises(subprocess.CalledProcessError) as failure:
+        stack.admin('set role paper_rpc_owner; select cron.unschedule(-1::bigint);')
+    assert 'permission denied' in failure.value.stderr
