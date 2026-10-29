@@ -5,6 +5,11 @@ read-only preflight. This is a stacked draft over PR #71, head `212353d4`.
 No connected Supabase database is changed. This does not complete the
 specification's acceptance gate on an actual Supabase branch.
 
+On 2026-10-29 Roman selected continued CI validation after Supabase rejected
+branch creation because it requires Pro or higher. No test branch, connected
+database SQL, migration, or strategic run was executed. No paid-plan upgrade
+is authorized; actual Supabase branch acceptance remains deferred.
+
 ## Read-only preflight
 
 Project `revoltis-bot-strategy` (`vdglyxhlmukxeqynguke`): migration history has
@@ -92,6 +97,13 @@ all 231 P1/base cases and 9 new snapshot-attestation cases. The existing
 Starlette/AnyIO deprecation warning remains.
 
 The isolated CI job runs **58 PostgreSQL cases plus those 9 adapter cases**.
+Before that suite, a separate installation case runs the exact migration with
+both session and current role set to a non-superuser installer (CREATEROLE,
+CREATEDB, BYPASSRLS). It checks ownership transfer, removal of temporary runtime
+membership, RLS/worker permissions, a server RPC smoke test and preservation of
+a synthetic legacy table's ACL and the installer's default privileges. A fresh
+CI database and roles are removed before the transaction suite starts. This
+models a privilege boundary, not all managed Supabase platform behavior.
 Its current-head result is recorded in [PR #72](https://github.com/haukro/revoltis-bot-strategy/pull/72).
 The extra storage case covers diagnostic/automatic isolation (the AT24 HTTP
 endpoint remains P3); four negative origin cases reject a wrong PID, role,
@@ -126,5 +138,7 @@ branch is published. Both rules require an explicit disposition before merge.
 Approved FINAL rev3, the P1 engine/evaluator, legacy paths, migrations 001–029,
 HYPE v8, rev13 and Strategy D DRAFT R2 remain unchanged.
 
-Applying this migration to a Supabase branch, enabling extensions/cron, any
-merge/deploy, and a new strategic test remain separate authorization steps.
+Branch application and synthetic tests were authorized, but Roman subsequently
+selected CI because branching requires a paid plan. Enabling extensions/cron,
+any merge/deploy, a paid-plan change and a new strategic test remain separate
+authorization steps. Passing CI does not close the actual-branch P2 gate.

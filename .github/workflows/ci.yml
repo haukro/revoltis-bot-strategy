@@ -36,6 +36,10 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt -r requirements-paper-p2.txt pytest
+      - name: Install migration without superuser
+        run: python -m pytest -q --tb=short tests/paper_p2_install
+        env:
+          PAPER_P2_INSTALL_TEST_DSN: postgresql://postgres:postgres@127.0.0.1:5432/paper_p2_test
       - run: python -m pytest -q tests/paper_p2 tests/test_paper_assessment.py
 
   backend:
