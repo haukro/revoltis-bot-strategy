@@ -127,18 +127,57 @@ def test_at8_two_concurrent_ticks_persist_one_run(env):
     assert run_row(env, t)['id'] == row['id']
 
 
-@pytest.mark.parametrize('prefix,reason', [('GAP','incomplete_candles'), ('NOCOST','cost_profile_unavailable'), ('OPEN','missing_open_positions')])
+@pytest.mark.parametrize('prefix,reason', [('GAP','incomplete_candles'), ('NOCOST','cost_profile_unavailable')])
 def test_at3_at11_invalid_evidence_remains_missing_in_database(env, prefix, reason):
     t = create(env, prefix)
     tick(env)
     row = run_row(env, t)
     assert row['status'] == 'invalid' and row['invalid_reason'] == reason
-    if prefix == 'OPEN':
-        assert row['raw']['engine_open_count'] > 0
-        assert row['positions_present'] is False and row['open_count'] is None
-    else:
-        assert row['tape_present'] is False and row['trade_count'] is None
+    assert row['tape_present'] is False and row['trade_count'] is None
     assert env[0].rows(f"select id from paper_verdicts where test_id='{t['id']}'") == []
+
+
+@pytest.mark.parametrize('after_gate', [False, True])
+def test_open_positions_are_complete_persisted_and_reproducible(env, after_gate):
+    from app.paper_measurement import RunEvidence, replay_run
+    from app.paper_positions import simulation_open_positions
+    from app.simulation import simulate
+    t = create(env, 'OPEN', after_gate=after_gate)
+    # Manual diagnostics at the same B do not reserve an automatic measurement.
+    response = env[1].post('/api/paper/diagnostic/run', json={'test_id': t['id']},
+                           headers={'Authorization': 'Bearer '+env[3]})
+    assert response.status_code == 200 and response.json()['status'] == 'valid', response.text
+    diagnostic = env[0].rows(f"select * from paper_diagnostic_runs where test_id='{t['id']}'")[0]
+    assert diagnostic['positions_present'] and diagnostic['open_count'] == len(diagnostic['open_positions']) == 1
+    assert diagnostic['open_positions'][0]['run_id'] == diagnostic['id']
+    tick(env)
+    row = run_row(env, t)
+    assert row['status'] == 'valid' and row['invalid_reason'] is None
+    assert row['open_count'] == row['raw']['engine_open_count'] == 1 and row['positions_present']
+    assert row['trade_count'] == 0 and row['tape_present']
+    snapshot = env[0].rpc('paper_read_run', p_run_id=row['id'])
+    positions = snapshot['open_positions']
+    stored = env[0].rows(f"select evidence from paper_run_open_positions where run_id='{row['id']}' order by ordinal")
+    assert positions == [x['evidence'] for x in stored] and len(positions) == row['open_count']
+    assert positions[0]['run_id'] == row['id'] and positions[0]['ordinal'] == 0
+    assert positions[0]['closed_at_ms'] is None
+    assert t['start_ms'] <= positions[0]['opened_at_ms'] <= row['test_end_ms']
+    assert positions[0]['entry_rate'] == positions[0]['raw']['entry_rate'] == 91
+    assert positions[0]['stake'] == positions[0]['raw']['stake'] == 50
+    assert row['summary']['closed_trades'] == 0
+    # P1 replay verifies the existing tape/summary/count contract. Independently
+    # compare the entire new position evidence against an opt-in archive replay.
+    item = RunEvidence(row, snapshot['candles'], snapshot['trades'], positions, 'verified')
+    assert replay_run(row['id'], read_snapshot=lambda _: (snapshot['test'], item))['reason'] == 'replay_match'
+    candles = [{'open_time': c['open_time_ms'], 'close_time': c['close_time_raw_ms'],
+                **{k:c[k] for k in ('open','high','low','close','volume','quote_volume')}} for c in snapshot['candles']]
+    replayed = simulate({t['pair']:candles}, t['settings'], trading_start_time=t['start_ms'],
+                        force_close_at_end=False, cost_models={t['pair']:row['cost_profile']}, include_open_positions=True)
+    assert simulation_open_positions(row['id'], replayed, pair=t['pair'], start_ms=t['start_ms'],
+                                      as_of_ms=row['test_end_ms']) == positions
+    assessments = env[0].rows(f"select eligibility,tick_origin_verified,valid_trade_count from paper_run_assessments where run_id='{row['id']}'")
+    assert assessments == ([{'eligibility':'proven_ineligible','tick_origin_verified':True,'valid_trade_count':0}] if after_gate else [])
+    assert env[0].rows(f"select status,authoritative_verdict_id from paper_tests where id='{t['id']}'") == [{'status':'running','authoritative_verdict_id':None}]
 
 
 def test_at35_http_caller_cannot_choose_horizon(env):

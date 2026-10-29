@@ -15,6 +15,7 @@ from .paper_measurement import (
     engine_sha256, hash_json, simulation_tape,
 )
 from .simulation import simulate
+from .paper_positions import simulation_open_positions
 
 
 class RpcError(RuntimeError):
@@ -103,16 +104,16 @@ class PaperWorker:
                 # The thread only computes. Cancellation can never perform a late persist.
                 result = await asyncio.to_thread(simulate, {test["pair"]: engine_rows}, deepcopy(test["settings"]),
                     trading_start_time=test["start_ms"], force_close_at_end=False,
-                    cost_models={test["pair"]: deepcopy(run["cost_profile"])})
+                    cost_models={test["pair"]: deepcopy(run["cost_profile"])},
+                    include_open_positions=True)
                 trades = simulation_tape(run_id, result)
                 run.update(summary=result["metrics"], trade_count=len(trades), tape_sha256=hash_json(trades))
                 run["raw"]["engine_open_count"] = result["open_positions"]
-                if result["open_positions"] == 0:
-                    positions, run["open_count"] = [], 0
-                else:
-                    # Frozen engine exposes only the count. Never fabricate rows
-                    # or force-close positions to obtain an apparently valid run.
-                    reasons.append("missing_open_positions")
+                positions = simulation_open_positions(run_id, result, pair=test["pair"],
+                    start_ms=test["start_ms"], as_of_ms=horizon)
+                run["open_count"] = len(positions)
+            except MeasurementError as error:
+                reasons.append(str(error))
             except (ValueError, KeyError, TypeError, ArithmeticError):
                 reasons.append("simulation_failed")
         if reasons:

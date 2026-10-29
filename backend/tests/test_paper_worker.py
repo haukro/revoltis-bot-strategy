@@ -13,6 +13,7 @@ from app.paper_measurement import MeasurementError, STEP_MS, candle_window, hash
 from app.paper_routes import PaperConfig, make_paper_router
 from app.paper_source import PaperMarket
 from app.paper_worker import PaperWorker
+from app.paper_positions import simulation_open_positions
 from test_paper_measurement import START, profile, source_candles, test_config
 
 COMMIT = "a" * 40
@@ -79,6 +80,54 @@ def test_open_position_count_is_not_a_complete_position_tape():
     assert run["invalid_reason"] == "missing_open_positions"
     assert trades == [] and positions is None and run["open_count"] is None
     assert run["raw"]["engine_open_count"] == 1
+
+
+def test_worker_stores_actual_open_position_without_forced_close():
+    class PositionMarket(Market):
+        async def candles(self, pair, window):
+            return source_candles([100.] * 25 + [90., 91., 91., 91.], window.first_open_ms)
+    config = test_config()
+    run, trades, positions = asyncio.run(PaperWorker(AsyncMock(), PositionMarket(), code_commit=COMMIT).build(
+        config, START+5*STEP_MS))
+    assert run["status"] == "valid" and run["invalid_reason"] is None
+    assert run["open_count"] == run["raw"]["engine_open_count"] == len(positions) == 1
+    assert trades == [] and run["trade_count"] == 0
+    position = positions[0]
+    assert position["run_id"] == run["id"] and position["ordinal"] == 0
+    assert position["pair"] == config["pair"] and position["closed_at_ms"] is None
+    assert position["opened_at_ms"] == START+3*STEP_MS-1
+    assert position["entry_rate"] == 91 and position["stake"] == 50
+    assert position["raw"]["entry_ts_ms"] == position["opened_at_ms"]
+    assert run["summary"]["closed_trades"] == 0
+
+
+@pytest.mark.parametrize("problem,reason", [
+    ("missing_zero", "missing_open_positions"), ("count", "missing_open_positions"),
+    ("bool_count", "missing_open_positions"), ("null_row", "incomplete_open_position_evidence"),
+    ("stake", "incomplete_open_position_evidence"), ("pair", "incomplete_open_position_evidence"),
+    ("future", "incomplete_open_position_evidence"), ("naive", "incomplete_open_position_evidence"),
+    ("duplicate", "incomplete_open_position_evidence"), ("watermark", "incomplete_open_position_evidence"),
+    ("nonfinite", "incomplete_open_position_evidence"),
+])
+def test_incomplete_open_position_observations_are_rejected(problem, reason):
+    from datetime import UTC, datetime
+    position = {"pair": "TEST/USDT", "entry_ts_ms": START, "entry_index": 0,
+                "opened_at": datetime.fromtimestamp(START/1000, UTC).isoformat(),
+                "entry_rate": 91., "stake": 50., "high_watermark": 92., "low_watermark": 90.}
+    result = {"open_positions": 1, "open_position_rows": [position]}
+    if problem == "missing_zero": result = {"open_positions": 0}
+    elif problem == "count": result["open_positions"] = 2
+    elif problem == "bool_count": result["open_positions"] = True
+    elif problem == "null_row": result["open_position_rows"] = [None]
+    elif problem == "stake": position.pop("stake")
+    elif problem == "pair": position["pair"] = "OTHER/USDT"
+    elif problem == "future": position["entry_ts_ms"] = START+STEP_MS+1
+    elif problem == "naive": position["opened_at"] = position["opened_at"].removesuffix("+00:00")
+    elif problem == "duplicate": result = {"open_positions": 2, "open_position_rows": [position, deepcopy(position)]}
+    elif problem == "watermark": position["low_watermark"] = 93.
+    elif problem == "nonfinite": position["entry_rate"] = float("nan")
+    with pytest.raises(MeasurementError, match=reason):
+        simulation_open_positions("run", result, pair="TEST/USDT", start_ms=START, as_of_ms=START+STEP_MS)
 
 
 def test_at35_worker_passes_db_horizon_to_build_but_never_sends_it_to_persist():
