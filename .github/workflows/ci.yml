@@ -8,8 +8,99 @@ on:
   pull_request:
 
 jobs:
+  paper-p2-supabase:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    env:
+      PAPER_P2_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r backend/requirements.txt -r backend/requirements-paper-p2.txt pytest
+      - name: Prepare unlinked local Supabase
+        shell: bash
+        run: |
+          set -euo pipefail
+          ci_stack_dir=$(mktemp -d "$RUNNER_TEMP/paper-p2-supabase.XXXXXX")
+          echo "PAPER_P2_STACK_DIR=$ci_stack_dir" >> "$GITHUB_ENV"
+          echo "PAPER_P2_SUPABASE_STATUS=$ci_stack_dir/status.json" >> "$GITHUB_ENV"
+          npx --yes supabase@2.122.0 --version
+          npx --yes supabase@2.122.0 --workdir "$ci_stack_dir" init
+          python ci/paper-supabase/prepare.py "$ci_stack_dir"
+      - name: Start actual Supabase services and apply exact migration
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx --yes supabase@2.122.0 --workdir "$PAPER_P2_STACK_DIR" start \
+            --exclude studio,postgres-meta,realtime,storage-api,imgproxy,mailpit,edge-runtime,logflare,vector,supavisor \
+            > "$PAPER_P2_STACK_DIR/start.log" 2>&1
+          npx --yes supabase@2.122.0 --workdir "$PAPER_P2_STACK_DIR" status -o json > "$PAPER_P2_SUPABASE_STATUS"
+          npx --yes supabase@2.122.0 --workdir "$PAPER_P2_STACK_DIR" migration list --local
+          npx --yes supabase@2.122.0 --workdir "$PAPER_P2_STACK_DIR" db push --local --dry-run
+      - name: Test real roles, PostgREST, cron origin and pg_net
+        working-directory: backend
+        run: python -m pytest -q -s --tb=short tests/paper_p2_supabase
+      - name: Sanitized startup diagnostics
+        if: failure()
+        shell: python
+        run: |
+          import os, re
+          from pathlib import Path
+          path = Path(os.environ.get('PAPER_P2_STACK_DIR', '/nonexistent')) / 'start.log'
+          if path.exists():
+              for line in path.read_text(errors='replace').splitlines()[-100:]:
+                  if re.search(r'key|token|secret|password|authorization|jwt|publishable|sb_|eyJ|postgres(ql)?://', line, re.I):
+                      continue
+                  print(line)
+      - name: Remove disposable local services
+        if: always() && env.PAPER_P2_STACK_DIR != ''
+        run: |
+          docker rm -f paper-p2-ci-http 2>/dev/null || true
+          npx --yes supabase@2.122.0 --workdir "$PAPER_P2_STACK_DIR" stop --no-backup
+
+  paper-p2:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: paper_p2_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d paper_p2_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      PAPER_P2_TEST_DSN: postgresql://postgres:postgres@127.0.0.1:5432/paper_p2_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt -r requirements-paper-p2.txt pytest
+      - name: Install migration without superuser
+        run: python -m pytest -q --tb=short tests/paper_p2_install
+        env:
+          PAPER_P2_INSTALL_TEST_DSN: postgresql://postgres:postgres@127.0.0.1:5432/paper_p2_test
+      - run: python -m pytest -q tests/paper_p2 tests/test_paper_assessment.py
+
   backend:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: backend
@@ -24,7 +115,7 @@ jobs:
       - run: python -m pytest -q
 
   frontend:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: frontend
