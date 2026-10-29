@@ -204,6 +204,9 @@ class Previous90dOOSRequest(BaseModel):
 DEFAULT = StrategySettings()
 local_store = LocalStore()
 app = FastAPI(title="NoFomo API", version="1.0.0")
+# Separate P3 router is disabled unless explicitly enabled in isolated CI.
+from .paper_routes import make_paper_router
+app.include_router(make_paper_router())
 origins = os.getenv("CORS_ORIGINS", "http://localhost:5173,http://localhost:8080").split(",")
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 OKX_BASE_URL = "https://www.okx.com"
