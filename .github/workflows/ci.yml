@@ -9,7 +9,7 @@ on:
 
 jobs:
   paper-p2-supabase:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     permissions:
       contents: read
@@ -66,7 +66,7 @@ jobs:
           npx --yes supabase@2.122.0 --workdir "$PAPER_P2_STACK_DIR" stop --no-backup
 
   paper-p2:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     services:
       postgres:
@@ -100,7 +100,7 @@ jobs:
       - run: python -m pytest -q tests/paper_p2 tests/test_paper_assessment.py
 
   backend:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: backend
@@ -115,7 +115,7 @@ jobs:
       - run: python -m pytest -q
 
   frontend:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: frontend

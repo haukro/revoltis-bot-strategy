@@ -14,6 +14,11 @@ Roman subsequently authorized **additional local Supabase integration in CI**,
 as a separate commit on this draft. This is supplementary evidence, not a
 replacement acceptance gate: P2 managed-branch acceptance and P3/P4 remain open.
 
+The subsequent review is captured in the separate
+[proposed rev3 addendum A1](PAPER-MEASUREMENT-B1-B8-REV3-ADDENDUM-CRON-READ.md).
+It awaits Roman's approval; FINAL rev3 itself is unchanged. CI now pins every
+job to `ubuntu-24.04`; the Supabase CLI was already pinned to 2.122.0.
+
 ## Additional local Supabase CI
 
 The `paper-p2-supabase` job pins Supabase CLI 2.122.0 and starts an unlinked,
@@ -45,6 +50,14 @@ Cron extension activation, LOGIN/CONNECT, metadata grants and narrow metadata
 RLS policies are **CI-only P4 setup candidates**, outside the P2 migration.
 The test first demonstrates origin_pending without the metadata RLS policies,
 then proven_ineligible with verified origin after those policies are installed.
+The policies now restrict both job name and owner/database, bind log rows by
+jobid, and include restrictive counterparts so pg_cron's existing permissive
+own-job policy cannot widen access. Actual decoy cron runs verify that other
+jobs of the same owner and the same name under another owner are hidden; an
+inactive reader-owned job is hidden too. Separate cases deny access to four
+other application roles and verify that the reader has no cron-table write
+privileges. This is CI-only policy DDL performed by `supabase_admin`; it does
+not prove the managed platform permits the same DDL or preserves it on upgrade.
 No fake clock, hand-inserted cron catalog row, or application-function replacement
 is used. Extension versions, role flags and the cron connection mode are reported
 by the test. Proposed production grace/lease values remain unapproved; the fixture
@@ -185,6 +198,7 @@ Approved FINAL rev3, the P1 engine/evaluator, legacy paths, migrations 001–029
 HYPE v8, rev13 and Strategy D DRAFT R2 remain unchanged.
 
 Branch application and synthetic tests were authorized, but Roman subsequently
-selected CI because branching requires a paid plan. Enabling extensions/cron,
+selected CI because branching requires a paid plan. Outside the authorized
+disposable CI fixtures, enabling extensions/cron,
 any merge/deploy, a paid-plan change and a new strategic test remain separate
 authorization steps. Passing CI does not close the actual-branch P2 gate.

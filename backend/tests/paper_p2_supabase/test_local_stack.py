@@ -76,6 +76,12 @@ class Stack:
     def rows(self, statement):
         return json.loads(self.admin("select coalesce(jsonb_agg(to_jsonb(x)), '[]') from (" + statement + ') x;'))
 
+    def rows_as(self, role, statement):
+        # SET ROLE changes the effective privileges even in an administrative
+        # fixture connection. Only fixed test-role names are accepted here.
+        assert role in ('paper_rpc_owner', 'anon', 'authenticated', 'service_role', 'authenticator')
+        return json.loads(self.admin(f"set role {role}; select coalesce(jsonb_agg(to_jsonb(x)), '[]') from (" + statement + ') x;'))
+
     def request(self, method, path, role='service_role', **kwargs):
         return self.client.request(method, path, headers={
             'apikey': self.keys['anon'] if role == 'authenticated' else self.keys[role],
@@ -174,7 +180,8 @@ def test_set_role_does_not_forge_session_user(stack):
     assert 'tick_origin_unverified' in failure.value.stderr
 
 
-def test_real_cron_session_net_delivery_and_assessment_over_postgrest(stack):
+@pytest.fixture(scope='module')
+def cron_case(stack):
     # All setup below is a CI-only candidate for P4 configuration. In particular,
     # metadata SELECT grants alone do not bypass pg_cron's per-user RLS policies.
     stack.admin('''
@@ -189,13 +196,15 @@ def test_real_cron_session_net_delivery_and_assessment_over_postgrest(stack):
       create table paper_ci_support.observed(tick_id uuid, session_name text, current_name text,
                                             pid integer, request_id bigint);
       grant insert on paper_ci_support.observed to paper_cron_owner;
+      create role paper_ci_other_cron_owner login noinherit;
+      grant connect on database postgres to paper_ci_other_cron_owner;
     ''')
     versions = stack.rows("select extname,extversion from pg_extension where extname in ('pg_cron','pg_net') order by extname")
     assert len(versions) == 2
     print('Real extensions:', json.dumps(versions))
     print('Cron connection mode:', stack.rows("select current_setting('cron.use_background_workers') as background_workers"))
     server = Path(__file__).with_name('http_sink.py').resolve()
-    job_id = None
+    job_ids = []
     try:
         command(['docker', 'run', '-d', '--rm', '--name', HTTP_CONTAINER, '--network', stack.network,
                  '--mount', f'type=bind,source={server},target=/http_sink.py,readonly',
@@ -210,14 +219,35 @@ def test_real_cron_session_net_delivery_and_assessment_over_postgrest(stack):
           select id,session_user,current_user,pg_backend_pid(),net.http_post(
             url := 'http://paper-p2-ci-http:8080/tick',
             body := jsonb_build_object('tick_id',id)) from tick'''
-        job_id = int(stack.admin(sql.SQL("select cron.schedule_in_database('paper_tick','* * * * *',{},'postgres','paper_cron_owner');").format(
-            sql.Literal(cron_sql)).as_string()))
+        def schedule(name, owner, statement='select 1', active=True):
+            query = sql.SQL(
+                "select cron.schedule_in_database({},'* * * * *',{},'postgres',{},{});").format(
+                    sql.Literal(name), sql.Literal(statement), sql.Literal(owner), sql.Literal(active)).as_string()
+            if owner == 'paper_rpc_owner':
+                assert not active
+                # pg_cron's scheduling API requires LOGIN even for an inactive
+                # job. Both role changes and creation commit together: LOGIN is
+                # never visible outside this administrative fixture transaction.
+                query = ('begin; alter role paper_rpc_owner login; ' + query
+                         + ' alter role paper_rpc_owner nologin; commit;')
+            job = int(stack.admin(query))
+            job_ids.append(job)
+            return job
+        other_job = schedule('paper_ci_other_job', 'paper_cron_owner')
+        other_owner = schedule('paper_tick', 'paper_ci_other_cron_owner')
+        # pg_cron's default permissive policy exposes a user's own jobs. This
+        # inactive record catches that alternate access path without running it.
+        reader_job = schedule('paper_ci_reader_job', 'paper_rpc_owner', active=False)
+        job_id = schedule('paper_tick', 'paper_cron_owner', cron_sql)
         def cron_evidence():
             rows = stack.rows(f"select status,return_message from cron.job_run_details where jobid={job_id} order by runid desc limit 1")
             assert not rows or rows[0]['status'] != 'failed', rows
             return rows
         eventually(cron_evidence, lambda rows: bool(rows) and rows[0]['status'] == 'succeeded')
-        stack.admin(f'select cron.alter_job({job_id}, active:=false);')
+        for job in (job_id, other_job, other_owner):
+            eventually(lambda: stack.rows(f"select status from cron.job_run_details where jobid={job} order by runid desc limit 1"),
+                       lambda rows: bool(rows) and rows[0]['status'] == 'succeeded', timeout=20)
+            stack.admin(f'select cron.alter_job({job}, active:=false);')
         observed = stack.rows('select * from paper_ci_support.observed')
         assert len(observed) == 1
         observed = observed[0]
@@ -250,12 +280,22 @@ def test_real_cron_session_net_delivery_and_assessment_over_postgrest(stack):
         assert stack.rows(f"select count(*) as n from paper_run_assessments where run_id='{item.run['id']}'") == [{'n': 0}]
         # Narrow CI-only metadata policies. No synthetic cron rows, owner changes,
         # BYPASSRLS grant, or modification of the application origin function.
-        stack.admin('''
-          create policy paper_ci_origin_job on cron.job for select to paper_rpc_owner
-            using (username='paper_cron_owner');
-          create policy paper_ci_origin_run on cron.job_run_details for select to paper_rpc_owner
-            using (username='paper_cron_owner');
-        ''')
+        selectors = {
+            'job': "jobname='paper_tick' and username='paper_cron_owner' and database=current_database()",
+            'job_run_details': """username='paper_cron_owner' and database=current_database()
+                and exists(select from cron.job j where j.jobid=job_run_details.jobid
+                    and j.jobname='paper_tick' and j.username='paper_cron_owner'
+                    and j.database=current_database())""",
+        }
+        for table, predicate in selectors.items():
+            # A restrictive counterpart prevents an existing permissive policy
+            # (including pg_cron's own-job policy) from widening this reader.
+            stack.admin(f'''
+              create policy paper_ci_origin_allow on cron.{table} for select to paper_rpc_owner
+                using ({predicate});
+              create policy paper_ci_origin_limit on cron.{table} as restrictive for select to paper_rpc_owner
+                using ({predicate});
+            ''')
         assessed = stack.rpc('paper_assess_run', **args)
         assert assessed['outcome'] == 'assessed'
         assert assessed['assessment']['eligibility'] == 'proven_ineligible'
@@ -263,7 +303,49 @@ def test_real_cron_session_net_delivery_and_assessment_over_postgrest(stack):
         assert assessed['verdict'] is None
         assert stack.rpc('paper_assess_run', **args) == assessed
         print('Certified local cron session, PID/time interval, pg_net HTTP delivery and idempotent assessment.')
+        yield {'job_id': job_id, 'other_job': other_job, 'other_owner': other_owner,
+               'reader_job': reader_job, 'assessment': assessed}
     finally:
-        if job_id is not None:
-            stack.admin(f'select cron.unschedule({job_id});')
+        for job in job_ids:
+            stack.admin(f'select cron.unschedule({job});')
         subprocess.run(['docker', 'rm', '-f', HTTP_CONTAINER], capture_output=True, timeout=15)
+
+
+def test_real_cron_session_net_delivery_and_assessment_over_postgrest(cron_case):
+    assert cron_case['assessment']['assessment']['tick_origin_verified'] is True
+    assert cron_case['assessment']['assessment']['eligibility'] == 'proven_ineligible'
+
+
+def test_at47_at49_assess_owner_reads_only_the_intended_job(stack, cron_case):
+    expected = [{'jobid': cron_case['job_id']}]
+    assert stack.rows_as('paper_rpc_owner', 'select jobid from cron.job order by jobid') == expected
+    assert stack.rows_as('paper_rpc_owner', 'select distinct jobid from cron.job_run_details order by jobid') == expected
+    # The two negative log samples are actual succeeded cron runs. No catalog
+    # row is manufactured. The third negative job is owned by the reader itself.
+    for key in ('other_job', 'other_owner'):
+        assert stack.rows(f"select count(*) as n from cron.job_run_details where jobid={cron_case[key]} and status='succeeded'")[0]['n'] > 0
+    assert stack.rows(f"select username from cron.job where jobid={cron_case['reader_job']}") == [{'username': 'paper_rpc_owner'}]
+
+
+@pytest.mark.parametrize('role', ['anon', 'authenticated', 'service_role', 'authenticator'])
+def test_at48_other_application_roles_cannot_read_cron_evidence(stack, cron_case, role):
+    assert stack.rows(f"select pg_has_role('{role}','paper_rpc_owner','SET') as can_set, "
+                      f"pg_has_role('{role}','paper_rpc_owner','USAGE') as can_use") == [{'can_set': False, 'can_use': False}]
+    for table in ('job', 'job_run_details'):
+        try:
+            rows = stack.rows_as(role, f'select jobid from cron.{table}')
+        except subprocess.CalledProcessError as error:
+            assert 'permission denied' in error.stderr
+        else:
+            assert rows == [], f'{role} unexpectedly read cron evidence'
+
+
+def test_at50_assess_owner_has_no_cron_table_write_privileges(stack, cron_case):
+    for table in ('job', 'job_run_details'):
+        for privilege in ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER'):
+            assert stack.rows(f"select has_table_privilege('paper_rpc_owner','cron.{table}','{privilege}') as allowed") == [{'allowed': False}]
+        with pytest.raises(subprocess.CalledProcessError) as failure:
+            stack.admin(f'set role paper_rpc_owner; delete from cron.{table} where false;')
+        assert 'permission denied' in failure.value.stderr
+    assert stack.rows("select rolsuper,rolbypassrls,rolcanlogin from pg_roles where rolname='paper_rpc_owner'") == [
+        {'rolsuper': False, 'rolbypassrls': False, 'rolcanlogin': False}]
