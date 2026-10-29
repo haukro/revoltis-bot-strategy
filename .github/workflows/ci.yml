@@ -17,6 +17,8 @@ jobs:
       PAPER_P2_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
@@ -47,6 +49,28 @@ jobs:
       - name: Test real roles, PostgREST, cron origin and pg_net
         working-directory: backend
         run: python -m pytest -q -s --tb=short tests/paper_p2_supabase
+      - name: Apply exact P3 worker migration to disposable local stack
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$PAPER_P2_COMMIT"
+          python - <<'PYCODE'
+          from pathlib import Path
+          import os, shutil
+          source = Path('supabase/migrations/20261029161155_paper_measurement_p3_worker.sql')
+          target = Path(os.environ['PAPER_P2_STACK_DIR']) / 'supabase/migrations' / source.name
+          shutil.copyfile(source, target)
+          assert source.read_bytes() == target.read_bytes()
+          PYCODE
+          npx --yes supabase@2.122.0 --workdir "$PAPER_P2_STACK_DIR" db push --local --yes
+          npx --yes supabase@2.122.0 --workdir "$PAPER_P2_STACK_DIR" migration list --local
+      - name: Local Supabase security advisors
+        run: npx --yes supabase@2.122.0 --workdir "$PAPER_P2_STACK_DIR" db advisors --local --type security --level warn --fail-on error
+      - name: Test P3 HTTP worker against real local Supabase
+        working-directory: backend
+        env:
+          PAPER_P3_SUPABASE: "1"
+        run: python -m pytest -q -s --tb=short tests/paper_p3_supabase
       - name: Sanitized startup diagnostics
         if: failure()
         shell: python

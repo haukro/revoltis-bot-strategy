@@ -1,0 +1,67 @@
+{
+  "source_commit": "5ca2d89696b073a7d34c5ac45c1072260653e556",
+  "engine_blob": "920de5e33e617ab42d71e24ac13694087c301a0d",
+  "simulation_sha256": "629095c63c718614071134ee354e09642a20f832e78a54f47745b28af9e4455e",
+  "cases": {
+    "flat": {
+      "result_sha256": "7454f11c0acdb5f5bd9f216436aaecd7919da9b2e741f08db74bbee7a36bfca8",
+      "open_count": 0,
+      "trade_count": 0
+    },
+    "open": {
+      "result_sha256": "0772654c39e3326a4c8d6eb7c64a1fc6f8e45e4433c671151c7181218feeb35f",
+      "open_count": 1,
+      "trade_count": 0
+    },
+    "closed": {
+      "result_sha256": "982b7f52bc922936ae2f732b3ba3bd125032af910497073789790b7c3a21ea88",
+      "open_count": 0,
+      "trade_count": 1
+    },
+    "mixed": {
+      "result_sha256": "caa272b973c029f945ef837c75beb8a889c3f129bd29d0ae5c565a7e7da8c114",
+      "open_count": 1,
+      "trade_count": 1
+    },
+    "open_costs": {
+      "result_sha256": "26b1c31f4b43dda42eaed52bd48b5b7004ac90016b58d990244175153a353c8c",
+      "open_count": 1,
+      "trade_count": 0
+    },
+    "closed_costs": {
+      "result_sha256": "eb01deabaeeafe77b5642c6c238b08fff1dc968aa0a43d8c88e2f4269a4d30af",
+      "open_count": 0,
+      "trade_count": 1
+    },
+    "mixed_costs": {
+      "result_sha256": "df445116d050e2e6ea7ec92077682b9c771ec8acf33423fbfbbd609ceaca4cb0",
+      "open_count": 1,
+      "trade_count": 1
+    },
+    "forced_costs": {
+      "result_sha256": "e16b300b7b3a80ae5013cd1d04ddbeeb9e6120ade116904157f028980a09c407",
+      "open_count": 0,
+      "trade_count": 1
+    },
+    "two_pairs": {
+      "result_sha256": "3ecd9df20c905c477c85c9fbb3b7cd37b13f82c38e15a42f1da386527a44501a",
+      "open_count": 2,
+      "trade_count": 0
+    },
+    "entry_gate": {
+      "result_sha256": "80ed53133a3664f909748fa5ca1fbcce7d2374b55bdcdde443a355da6c58d6fb",
+      "open_count": 1,
+      "trade_count": 0
+    },
+    "time_exit": {
+      "result_sha256": "0ee33c7a6c3fa75c3b9db8dee6b4385b13eb44e48c7245002d6ed9a86698f5ff",
+      "open_count": 0,
+      "trade_count": 1
+    },
+    "empty": {
+      "result_sha256": "a748fa5a1cef1f6c19171c33ee2958b7c62d6da5b4adbb2e45f54e89f8353e37",
+      "open_count": 0,
+      "trade_count": 0
+    }
+  }
+}

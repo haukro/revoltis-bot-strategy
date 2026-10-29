@@ -8,6 +8,7 @@ from __future__ import annotations
 from .costs import net_return
 
 from collections import defaultdict
+from copy import deepcopy
 from datetime import UTC, datetime
 from math import sqrt
 from typing import Any, Callable
@@ -77,8 +78,14 @@ def simulate(
     cost_models: dict[str, dict] | None = None,
     allowed_entry_times: set[int] | None = None,
     entry_gate: Callable[[str, list[dict[str, Any]], int], bool] | None = None,
+    *,
+    include_open_positions: bool = False,
 ) -> dict[str, Any]:
-    """Run the mean-reversion strategy on public historical candles."""
+    """Run the mean-reversion strategy on public historical candles.
+
+    Opt-in position rows observe the final state after all calculations. The
+    default result and the trading path are unchanged.
+    """
     bb_period = int(settings["bb_period"])
     rsi_period = int(settings["rsi_period"])
     atr_period = int(settings["atr_period"])
@@ -332,4 +339,7 @@ def simulate(
             "open_trades": sum(1 for position in positions if position["pair"] == pair),
         }
         per_pair_equity_curves[pair] = pair_curve
-    return {"trades": trades, "open_positions": len(positions), "metrics": {**trade_statistics(trades), "initial_capital": initial_capital, "portfolio_value": round(portfolio_value, 4), "realized_profit": round(sum(item["profit_usdt"] for item in trades), 4), "unrealized_profit": round(unrealized, 4), "closed_trades": len(trades), "win_rate": round(wins / len(trades) * 100, 1) if trades else 0, "max_drawdown_percent": round(drawdown, 2)}, "per_pair_metrics": per_pair_metrics, "per_pair_equity_curves": per_pair_equity_curves, "equity_curve": equity_curve, "rejections": dict(sorted(rejection_counts.items(), key=lambda item: item[1], reverse=True)[:8]), "entry_diagnostics": entry_diagnostics}
+    result = {"trades": trades, "open_positions": len(positions), "metrics": {**trade_statistics(trades), "initial_capital": initial_capital, "portfolio_value": round(portfolio_value, 4), "realized_profit": round(sum(item["profit_usdt"] for item in trades), 4), "unrealized_profit": round(unrealized, 4), "closed_trades": len(trades), "win_rate": round(wins / len(trades) * 100, 1) if trades else 0, "max_drawdown_percent": round(drawdown, 2)}, "per_pair_metrics": per_pair_metrics, "per_pair_equity_curves": per_pair_equity_curves, "equity_curve": equity_curve, "rejections": dict(sorted(rejection_counts.items(), key=lambda item: item[1], reverse=True)[:8]), "entry_diagnostics": entry_diagnostics}
+    if include_open_positions:
+        result["open_position_rows"] = deepcopy(positions)
+    return result

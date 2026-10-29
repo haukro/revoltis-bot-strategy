@@ -1,6 +1,6 @@
 # B1–B8 rev3 — dodatok A1: čítanie dôkazu z pg_cron
 
-**NÁVRH NA SCHVÁLENIE ROMANOM — 29. 10. 2026.**
+**SCHVÁLENÉ ROMANOM — 29. 10. 2026.**
 
 Tento samostatný dodatok dopĺňa §4.2, §5.7 a overenie v §8 dokumentu
 [FINAL B1–B8 rev3](PAPER-MEASUREMENT-B1-B8-REV3.md).
@@ -110,9 +110,9 @@ pevným `search_path`, úzkym výstupom a EXECUTE iba pre vlastníka assess RPC.
 Nesmie sprístupniť všeobecné čítanie cron logov HTTP workerovi. Tento fallback
 nie je týmto dodatkom automaticky schválený ani implementovaný.
 
-## Navrhované akceptačné testy a fázy
+## Akceptačné testy a fázy
 
-Čísla AT47–AT51 sú návrh; pôvodné AT sa neprečíslujú.
+Dodatok pridáva AT47–AT51; pôvodné AT sa neprečíslujú.
 
 | ID | Scenár a očakávaný výsledok | Zaradenie a limit |
 | --- | --- | --- |
@@ -130,7 +130,7 @@ závislosti. Presný runner image je v logu CI; verzie rozšírení a rolové
 oprávnenia vypisuje integračný test. Node.js 20 upozornenia akcií sú oddelená
 údržba a nemenia výsledok týchto testov.
 
-Návrh ďalšieho kroku po schválení dodatku: pripraviť P3 endpointy a overiť
+Roman zároveň 29. 10. 2026 povolil pripraviť P3 endpointy a overiť
 ich v CI proti lokálnemu Supabase, bez Vercel preview. Takéto overenie bude
 opäť iba doplnkové; nemení §8 ani neuzatvára brány P2/P3/P4. P4 naďalej
 vyžaduje aspoň 24 h v schválenom izolovanom prostredí s preview.
@@ -141,6 +141,8 @@ vyžaduje aspoň 24 h v schválenom izolovanom prostredí s preview.
 | --- | --- | --- |
 | 29. 10. 2026 | Návrh A1: čítanie cron dôkazov, rozsah jobu, ACL/RLS, testy AT47–AT51 a riziko spravovanej platformy. | Čaká na Romanovo schválenie; FINAL rev3 zostáva nezmenená. |
 | 29. 10. 2026 | CI #125 odhalilo PUBLIC zápisové právo. Návrh doplnený o zdedené DELETE/EXECUTE, kontrolu administrátorských grantov a nutnosť posúdiť širší dopad ACL. | Kandidát iba v CI; nejde o povolenie meniť ACL spravovaného projektu. |
+
+| 29. 10. 2026 | Roman schválil A1 a pokračovanie P3 výlučne v CI. | Schválené znenie dodatku; spravované brány, preview a produkcia zostávajú otvorené. |
 
 Podklady: [CI #124](https://github.com/haukro/revoltis-bot-strategy/actions/runs/40883584779),
 [PostgreSQL 17 CREATE POLICY](https://www.postgresql.org/docs/17/sql-createpolicy.html),
