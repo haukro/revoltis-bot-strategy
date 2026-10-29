@@ -64,6 +64,8 @@ def create(env, prefix='VALID', *, after_gate=False, shadow=False, ended=False):
     now = s.rows('select floor(extract(epoch from clock_timestamp())*1000)::bigint as ms')[0]['ms']
     start = now//STEP_MS*STEP_MS - (GATE_MS if after_gate else 0) - 5*STEP_MS + int(uuid4().hex[:6],16)%100000
     t = test_config(start_ms=start, warmup=24)
+    if prefix == 'CLOSED':
+        t['settings']['stop_loss_percent'] = 5
     pair = prefix + uuid4().hex[:8].upper() + '/USDT'
     t['pair'] = pair; t['settings']['selected_pairs'] = [pair]; t['settings_sha256'] = hash_json(t['settings'])
     t.update(id=str(uuid4()), variant='B', strategy_version_id='synthetic-p3-ci', lease_ms=120000,
@@ -145,6 +147,21 @@ def test_at35_http_caller_cannot_choose_horizon(env):
     assert r.status_code == 422
     rows = env[0].rows('select count(*) n from paper_runs r join paper_run_claims c on c.id=r.claim_id where r.test_end_ms<>c.test_end_ms or r.as_of_ms<>c.test_end_ms')
     assert rows == [{'n': 0}]
+
+
+def test_actual_closed_trade_is_run_owned_and_replayable(env):
+    from app.paper_measurement import RunEvidence, replay_run
+    t = create(env, 'CLOSED')
+    tick(env)
+    row = run_row(env, t)
+    assert row['status'] == 'valid' and row['trade_count'] > 0 and row['open_count'] == 0
+    snapshot = env[0].rpc('paper_read_run', p_run_id=row['id'])
+    tape = snapshot['trades']
+    assert hash_json(tape) == row['tape_sha256']
+    assert all(x['run_id'] == row['id'] and x['closed_at_ms'] <= row['test_end_ms'] for x in tape)
+    item = RunEvidence(snapshot['run'], snapshot['candles'], tape, snapshot['open_positions'], 'verified')
+    result = replay_run(row['id'], read_snapshot=lambda _: (snapshot['test'], item))
+    assert result['reason'] == 'replay_match'
 
 
 def test_shadow_stop_precedes_new_claim(env):

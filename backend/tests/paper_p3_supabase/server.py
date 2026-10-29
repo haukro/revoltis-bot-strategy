@@ -21,6 +21,8 @@ class SyntheticMarket:
         prices = [100.] * window.expected_count
         if pair.startswith('OPEN') and len(prices) >= 29:
             prices[-4:] = [90., 91., 91., 91.]
+        if pair.startswith('CLOSED') and len(prices) >= 29:
+            prices[-4:] = [90., 91., 80., 100.]
         rows = [{'open_time_ms': window.first_open_ms + i*STEP_MS,
                  'close_time_raw_ms': window.first_open_ms + (i+1)*STEP_MS - 1,
                  'open': price*.999, 'high': price*1.002, 'low': price*.998,

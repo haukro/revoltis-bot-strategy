@@ -64,6 +64,8 @@ jobs:
           PYCODE
           npx --yes supabase@2.122.0 --workdir "$PAPER_P2_STACK_DIR" db push --local --yes
           npx --yes supabase@2.122.0 --workdir "$PAPER_P2_STACK_DIR" migration list --local
+      - name: Local Supabase security advisors
+        run: npx --yes supabase@2.122.0 --workdir "$PAPER_P2_STACK_DIR" db advisors --local --type security --level warn --fail-on error
       - name: Test P3 HTTP worker against real local Supabase
         working-directory: backend
         env:

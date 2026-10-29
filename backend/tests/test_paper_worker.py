@@ -119,6 +119,44 @@ def test_invalid_tick_does_not_read_market_or_create_claim():
     market.latest.assert_not_awaited()
 
 
+def test_timeout_records_error_and_never_resumes_persist():
+    test = {**test_config(), "id": "test", "pending_run_ids": [], "shadow": False, "lease_ms": 120000}
+    claim = {"id": "claim", "lease_token": "token", "test_end_ms": START+STEP_MS}
+    calls = []
+    async def call(name, **kw):
+        calls.append((name, kw))
+        if name == "paper_worker_page":
+            return {"outcome": "ready", "tests": [test]}
+        if name == "paper_claim_run":
+            return {"outcome": "claimed", "claim": claim}
+        if name == "paper_worker_outcome":
+            return {"outcome": "error"}
+        raise AssertionError(name)
+    async def never_complete(*args):
+        await asyncio.Event().wait()
+    rpc, market = AsyncMock(), AsyncMock()
+    rpc.call.side_effect = call
+    market.latest.return_value = START
+    worker = PaperWorker(rpc, market, code_commit=COMMIT, timeout_seconds=.02)
+    worker.build = never_complete
+    with pytest.raises(TimeoutError):
+        asyncio.run(worker.tick("tick"))
+    assert calls[-1][0] == "paper_worker_outcome"
+    assert calls[-1][1]["p_reason"] == "worker_timeout"
+    assert calls[-1][1]["p_lease_token"] == "token"
+    assert not any(name == "paper_persist_run" for name, _ in calls)
+
+
+def test_unverifiable_candidate_closes_without_later_market_work():
+    rpc, market = AsyncMock(), AsyncMock()
+    rpc.call.return_value = {"outcome": "test_closed"}
+    worker = PaperWorker(rpc, market, code_commit=COMMIT)
+    worker.assess = AsyncMock(return_value={"outcome": "assessed", "verdict": {"verdict": "INVALID"}})
+    assert asyncio.run(worker._test({"id": "test", "pending_run_ids": ["earlier", "later"]}, "tick"))["outcome"] == "test_closed"
+    worker.assess.assert_awaited_once_with("earlier")
+    market.latest.assert_not_awaited()
+
+
 @pytest.fixture
 def endpoint():
     worker = AsyncMock()

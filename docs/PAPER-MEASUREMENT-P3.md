@@ -66,6 +66,7 @@ samostatným CI nastavením a otvorenou otázkou spravovaného prostredia.
 | AT11 medzera sviečok | Unit + HTTP/DB, invalid incomplete_candles a chýbajúca páska |
 | AT24 diagnostika | HTTP diagnostika a automatický beh pri rovnakom B v oddelených tabuľkách |
 | AT35 horizont | HTTP zakázané extra pole, worker neposiela horizont do persist, zhoda DB claim/run |
+| AT5 uložená uzavretá páska | HTTP beh s uzavretým obchodom, run-owned páska a read-only replay_match |
 | AT28 zotavenie | Persist bez assess; ďalší HTTP tick posúdi uložený beh s reálnym cron pôvodom |
 | Shadow, chyby, RPC ACL | Stop pred claim, trvalý error outcome, zakázané RPC pre anon/authenticated |
 | Chýbajúce otvorené pozície | Invalid missing_open_positions, nikdy falošné open_count=0 |
@@ -76,6 +77,18 @@ Sviečky a kniha sú syntetické, engine je pôvodný. Toto nie je P4 24h beh.
 CI checkout pre lokálny stack je pripnutý na head SHA a porovnaný s git HEAD;
 toto SHA sa nastaví do `VERCEL_GIT_COMMIT_SHA` iba ako explicitná CI fixture.
 Nepreukazuje to väzbu budúceho Vercel deployu na commit.
+
+## Prvé overenie
+
+[CI #127](https://github.com/haukro/revoltis-bot-strategy/actions/runs/40910823443)
+na `ebb9c95046c8374ab89c5804d1414cb4f0cf161d` prešlo: backend 260,
+P2 transakcie/adapter 67, inštalácia 1, P2 Supabase 17, P3 HTTP 12.
+P3 HTTP sada trvala 58,90 s vrátane čakania na skutočný cron. Nová migrácia
+sa aplikovala cez lokálny CLI bez superuser eskalácie. Frontend je zelený.
+
+Následne doplnené dva unit prípady (timeout bez neskorého persist a INVALID
+kandidát bez ďalšieho výpočtu), HTTP páska s uzavretým obchodom a replayom,
+a lokálni bezpečnostní advisors. Aktuálny výsledok je v popise PR pre presný head.
 
 ## Otvorené pred uzavretím P3
 
