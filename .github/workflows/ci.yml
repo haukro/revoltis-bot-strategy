@@ -199,7 +199,7 @@ jobs:
           pytest_log = tmp / 'a2-5-pytest.log'
           if pytest_log.exists():
               model = [l for l in pytest_log.read_text(errors='replace').splitlines()
-                       if l.startswith(('Local image', 'Role model', 'Extensions:', 'Cron ACL:'))]
+                       if l.startswith(('Local image', 'Role model', 'Postgres memberships', 'Extensions:', 'Cron ACL:'))]
               if model:
                   print('::notice title=A2 platform model::' + clean('\n'.join(model), 3500))
       - name: Sanitized startup diagnostics

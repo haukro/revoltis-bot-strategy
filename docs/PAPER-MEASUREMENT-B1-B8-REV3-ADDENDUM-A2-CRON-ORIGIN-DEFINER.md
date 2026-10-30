@@ -91,8 +91,11 @@ overený pôvod.
   Funkciu nemôže nahradiť ani zmazať.
 - Prevzaté riziko: vlastník funkcie `postgres` má na spravovanej platforme
   `BYPASSRLS` a vidí všetky cron logy. `postgres` je administrátorská rola
-  projektu, ktorá tieto práva má aj bez A2. A2 mu pridáva iba čítanie troch
-  stĺpcov tickov. Bezpečnosť stojí na tele funkcie, preto je jej text súčasťou
+  projektu, ktorá tieto práva má aj bez A2. Na spravovanom projekte aj v lokálnom
+  obraze je členom `pg_read_all_data` (INHERIT), `service_role`, `pg_monitor`
+  a `supabase_privileged_role`. Číta teda všetky tabuľky už teraz. A2 mu pridáva
+  iba explicitné čítanie troch stĺpcov tickov, aby funkcia nezávisela od
+  implicitného `pg_read_all_data` (overuje AT57). Bezpečnosť stojí na tele funkcie, preto je jej text súčasťou
   schválenia a CI kontroluje vlastníka, ACL aj absenciu zápisov a dynamického SQL.
 
 ## A2.4 Model `postgres` s BYPASSRLS a bez neho
@@ -128,7 +131,7 @@ overený pôvod.
 | AT54 | Negatívna matica: (a) PID reuse: starší failed + novší succeeded = `verified`; starší succeeded + novší failed = `unverifiable`; rovnaký PID iba mimo intervalu = žiadny dôkaz. (b) Iný job rovnakého vlastníka (aj skutočný cron), (c) rovnaký názov pod iným vlastníkom, (d) job inej databázy (dočasná zmena databázy skutočného jobu v transakcii, ktorá sa vráti; unikátny index `(jobname, username)` druhý job nedovolí), (e) log s inou databázou alebo používateľom, (f) job čítacej roly, (g) beh začatý po ticku alebo skončený pred ním, (h) chýbajúci log → `pending` na hranici `created_at + grace`, `unverifiable` o 1 ms neskôr. (i) `running`/`starting` a `succeeded` bez `end_time` = `in_progress`. (j) Rovnaký `start_time`: vyhráva vyšší `runid`. (k) Novší `running` skryje starší `succeeded`. (l) Neznámy tick: funkcia `no_tick`, origin výnimka ako v P2. | A2 CI (syntetické neaktívne joby) + emulácia |
 | AT55 | `anon`, `authenticated`, `service_role`, `authenticator`, `paper_cron_owner`: bez EXECUTE, USAGE a členstva; volanie aj cez PostgREST odmietnuté. `paper_rpc_owner`: bez USAGE na `cron`, bez cron grantov a politík. SELECT, DELETE, `schedule` a `unschedule` → `permission denied for schema cron`. Nevie funkciu nahradiť ani zmazať. | A2 CI + spravované prostredie |
 | AT56 | `postgres` s BYPASSRLS → overenie funguje. Bez BYPASSRLS → `no_tick`; s viditeľným tickom → `no_evidence`; origin nikdy `verified`. Pôvodný stav sa obnoví. | A2 CI (iba lokálne, na spravovanom sa neprepína) |
-| AT57 | Degradácia: odobraté EXECUTE, zmazaná funkcia/schéma, `postgres` bez USAGE na `cron`, bez SELECT na ticky, chýbajúce cron tabuľky → `pending`, potom `unverifiable`. Opakovaná aplikácia A2 je odmietnutá. | A2 CI + emulácia |
+| AT57 | Degradácia: odobraté EXECUTE, zmazaná funkcia/schéma, `postgres` bez USAGE na `cron`, bez SELECT na ticky (v oboch prípadoch spolu s odobratím zdedeného `pg_read_all_data`), chýbajúce cron tabuľky → `pending`, potom `unverifiable`. Bez `pg_read_all_data`, iba s explicitnými grantmi, overenie funguje. Opakovaná aplikácia A2 je odmietnutá. | A2 CI + emulácia |
 | AT58 | Spravovaná platforma: A2 sa nainštaluje rolou `postgres` bez superusera. Po podporovanom upgrade alebo obnove pg_cron zostanú vlastník, ACL a výsledky AT52–AT55. Verzie a výsledky sa zaznamenajú pred aj po. | Otvorená brána spravovaného prostredia |
 
 Testy: `backend/tests/paper_a2_supabase/test_cron_origin_definer.py`.
@@ -199,4 +202,5 @@ harnessu, nie o CI so skutočným pg_cron. Nenahrádza AT53–AT57 v jobe
 | Dátum | Zmena | Stav |
 | --- | --- | --- |
 | 30. 10. 2026 | Návrh A2: fallback A1.4 po neúspešnej AT51 na spravovanom projekte. Privátna funkcia, nová migrácia, AT52–AT58, emulácia 141/141. | NÁVRH, čaká na Romanovo schválenie. Nič neaplikované do spravovanej DB, cron nezapnutý. |
+| 30. 10. 2026 | Prvé CI so skutočným pg_cron: 36/38. Dva prípady AT57 zlyhali, lebo `postgres` dedí SELECT/USAGE z `pg_read_all_data` (potvrdené aj na spravovanom projekte). Test degradácie odoberá aj toto členstvo. Pribudla kontrola nezávislosti od `pg_read_all_data`. | Oprava testu, migrácia A2 bez zmeny. |
 | 30. 10. 2026 | Oprava testov po review: jediný job `paper_tick`/`paper_cron_owner` (unikátny index), job inej databázy cez vrátenú transakciu, deaktivovaný a nečinný skutočný job počas syntetických testov, BYPASSRLS nastavený pred prvým testom, opakovaná aplikácia cez `DB_URL` ako `postgres`. Doplnený job `paper-a2-supabase`. | NÁVRH; overenie v draft PR. Migrácia A2 bez zmeny. |

@@ -101,6 +101,9 @@ def test_at52_platform_model_is_recorded(stack, managed_role_model):
     print('Cron ACL:', json.dumps(stack.rows(
         "select c.relname, pg_get_userbyid(c.relowner) as owner, c.relacl::text as acl "
         "from pg_class c where c.relnamespace='cron'::regnamespace and c.relkind='r' order by 1")))
+    memberships = stack.rows("select r.rolname, m.inherit_option from pg_auth_members m join pg_roles r on r.oid=m.roleid "
+                             "where m.member='postgres'::regrole order by 1")
+    print('Postgres memberships:', json.dumps(memberships))
     roles = {r['rolname']: r for r in model}
     assert roles['postgres']['rolsuper'] is False and roles['postgres']['rolbypassrls'] is True
     # Pomocna funkcia potrebuje iba existujuce prava postgres na cron.
@@ -323,8 +326,11 @@ def test_at56_bypassrls_model_both_ways(stack, synthetic):
     'revoke execute on function paper_cron_proof.tick_run_status(uuid) from paper_rpc_owner',
     'drop function paper_cron_proof.tick_run_status(uuid)',
     'drop schema paper_cron_proof cascade',
-    'revoke usage on schema cron from postgres cascade',
-    'revoke select (tick_id,backend_pid,created_at) on public.paper_measure_ticks from postgres',
+    # postgres dedi SELECT/USAGE aj z pg_read_all_data (spravovany projekt aj lokalny
+    # obraz). Degradacia preto odobera explicitny grant aj toto clenstvo.
+    'revoke usage on schema cron from postgres cascade; revoke pg_read_all_data from postgres',
+    'revoke select (tick_id,backend_pid,created_at) on public.paper_measure_ticks from postgres; '
+    'revoke pg_read_all_data from postgres',
     'alter table cron.job rename to job_a2_hidden',
 ])
 def test_at57_degraded_evidence_never_verifies(stack, synthetic, prep):
@@ -335,6 +341,17 @@ def test_at57_degraded_evidence_never_verifies(stack, synthetic, prep):
                       f"select paper_private.origin('{tick}',{c + GRACE + 1},{GRACE}); rollback;").split()
     assert out == ['pending', 'unverifiable'], (prep, out)
     assert origin(stack, tick, str(c + 1000)) == 'verified'
+
+
+def test_at57_helper_does_not_depend_on_pg_read_all_data(stack, synthetic):
+    # A2 sa opiera iba o explicitne granty (USAGE/SELECT na cron, stlpce tickov),
+    # nie o implicitne clenstvo postgres v pg_read_all_data.
+    tick = synthetic['pid_reuse_old_failed_new_succeeded'][0]
+    member = val(stack, "select pg_has_role('postgres','pg_read_all_data','USAGE')")
+    out = stack.admin(f"begin; revoke pg_read_all_data from postgres; "
+                      f"select pg_has_role('postgres','pg_read_all_data','USAGE'); set local role paper_rpc_owner; "
+                      f"select paper_cron_proof.tick_run_status('{tick}'); rollback;").split()
+    assert out == ['f', 'succeeded'], (member, out)
 
 
 def test_at57_reapplying_a2_as_postgres_is_refused(stack):
