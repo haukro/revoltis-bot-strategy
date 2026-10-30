@@ -1,6 +1,7 @@
 # B1–B8 rev3 — dodatok A4: odoslanie ticku z testovacej DB na izolovaný Preview
 
-**NÁVRH NA SCHVÁLENIE ROMANOM — 30. 10. 2026. NIE JE SCHVÁLENÝ.**
+**BLOKOVANÉ — 30. 10. 2026. NEAPLIKOVAŤ.** Táto verzia (rev1) posiela statické
+secrety cez frontu pg_net, ktorú môžu meniť aplikačné roly (§A4.5).
 
 Platí iba pre testovací projekt `nofomo-paper-validation` a Preview vetvu
 `claude/paper-p4-preview` ([postup Preview](PAPER-MEASUREMENT-P4-PREVIEW-SETUP.md)).
@@ -86,8 +87,22 @@ select vault.create_secret('<Protection Bypass for Automation>', 'paper_p4_verce
 Overenie: emulácia PG16 (náhrady za Vault a `net.http_post`) prešla pre
 AT67–AT69. CI so skutočným Vaultom a pg_net: pozri PR #75.
 
+## A4.5 Blokujúci nález (review 30. 10. 2026)
+
+Na testovacom projekte majú `anon`, `authenticated`, `service_role` aj
+`paper_cron_owner` na `net.http_request_queue` okrem SELECT aj **UPDATE
+a INSERT**. Kým pg_net požiadavku neodošle, dá sa zmeniť jej `url` a statické
+hlavičky (`CRON_SECRET`, celoprojektový bypass) odísť na cudzí server. Pevná URL
+v `send_tick` chráni iba v okamihu zápisu do fronty a Vault nechráni hodnotu
+po vložení do hlavičky. Bod 1 v §A4.3 riziko podhodnotil (opisoval iba čítanie).
+Celoprojektový bypass preto nebol vytvorený a A4 rev1 sa nenasadzuje.
+
+Smer opravy (rev2, samostatný návrh): do fronty nepôjde žiadna statická tajná
+hodnota. Iba token viazaný na jeden tick (HMAC) a Preview bez SSO bypassu.
+
 ## Záznam zmien
 
 | Dátum | Zmena | Stav |
 | --- | --- | --- |
-| 30. 10. 2026 | Návrh A4. | NÁVRH, čaká na CI a schválenie. |
+| 30. 10. 2026 | Návrh A4 (rev1). CI 52/52 (`414f9cb`). | — |
+| 30. 10. 2026 | Review: UPDATE/INSERT na frontu pg_net pre aplikačné roly (§A4.5). | **BLOKOVANÉ**, neaplikované; pripravuje sa rev2. |
