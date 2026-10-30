@@ -1041,6 +1041,148 @@ async def paper_blind_status():
     }
 
 
+@app.get("/api/paper/tests")
+async def paper_tests_overview(limit: int = 50):
+    """Read-only, blind-safe prehľad operačných behov / tickov.
+
+    Nevracia PnL, PF, expectancy, win rate, side, price, quantity ani
+    per-trade timestampy. Len systémové behy (workery, reconciliation,
+    outbox backlog) a prípadné budúce meracie ticky (P4/P5).
+    """
+    require_durable_production_store()
+    limit = max(1, min(int(limit or 50), 200))
+
+    worker_rows = await supabase_get(
+        "worker_heartbeats",
+        "select=worker_name,status,last_run_id,last_started_at,last_completed_at,"
+        "last_success_at,claimed_count,processed_count,updated_at"
+        "&order=updated_at.desc"
+        f"&limit={limit}",
+    )
+
+    recon_rows = await supabase_get(
+        "reconciliation_runs",
+        "select=id,status,started_at,completed_at,audit_integrity_passed"
+        "&order=completed_at.desc.nullslast"
+        f"&limit={min(limit, 20)}",
+    )
+
+    outbox_pending = await supabase_get(
+        "execution_outbox",
+        "select=id&status=eq.PENDING&limit=1",
+    )
+
+    snapshot: dict[str, Any] = {}
+    try:
+        snapshot = await _paper_ops_snapshot()
+    except Exception:
+        snapshot = {}
+    queue = snapshot.get("queue") or {}
+    backlog = int(queue.get("current_backlog") or 0)
+
+    runs: list[dict[str, Any]] = []
+
+    for row in worker_rows or []:
+        started = row.get("last_started_at")
+        completed = row.get("last_completed_at") or row.get("last_success_at")
+        lag_ms: int | None = None
+        if started and completed:
+            try:
+                t0 = datetime.fromisoformat(str(started).replace("Z", "+00:00"))
+                t1 = datetime.fromisoformat(str(completed).replace("Z", "+00:00"))
+                lag_ms = max(0, int((t1 - t0).total_seconds() * 1000))
+            except Exception:
+                lag_ms = None
+        runs.append(
+            {
+                "id": str(row.get("last_run_id") or row.get("worker_name") or "worker"),
+                "kind": "worker",
+                "origin": str(row.get("worker_name") or "worker"),
+                "outcome": str(row.get("status") or "UNKNOWN"),
+                "at": completed or started or row.get("updated_at"),
+                "lag_ms": lag_ms,
+                "meta": {
+                    "claimed_count": row.get("claimed_count"),
+                    "processed_count": row.get("processed_count"),
+                },
+            }
+        )
+
+    for row in recon_rows or []:
+        started = row.get("started_at")
+        completed = row.get("completed_at")
+        lag_ms = None
+        if started and completed:
+            try:
+                t0 = datetime.fromisoformat(str(started).replace("Z", "+00:00"))
+                t1 = datetime.fromisoformat(str(completed).replace("Z", "+00:00"))
+                lag_ms = max(0, int((t1 - t0).total_seconds() * 1000))
+            except Exception:
+                lag_ms = None
+        outcome = str(row.get("status") or "UNKNOWN")
+        if row.get("audit_integrity_passed") is False and outcome.upper() in {"PASSED", "OK"}:
+            outcome = "AUDIT_FAIL"
+        runs.append(
+            {
+                "id": str(row.get("id") or "recon"),
+                "kind": "reconciliation",
+                "origin": "reconciliation",
+                "outcome": outcome,
+                "at": completed or started,
+                "lag_ms": lag_ms,
+                "meta": {
+                    "audit_integrity_passed": row.get("audit_integrity_passed"),
+                },
+            }
+        )
+
+    runs.sort(key=lambda item: str(item.get("at") or ""), reverse=True)
+    runs = runs[:limit]
+
+    # Future P4/P5 measurement ticks (id, at, origin, outcome, lag_ms)
+    ticks: list[dict[str, Any]] = []
+
+    if await _spec006_blind_runtime_active():
+        return {
+            "status": "ok",
+            "blind_safe": True,
+            "live_trading": False,
+            "summary": {
+                "run_count": len(runs),
+                "tick_count": len(ticks),
+                "queue_backlog": backlog,
+                "worker_count": len(worker_rows or []),
+            },
+            "runs": [
+                {
+                    "id": r["id"],
+                    "kind": r["kind"],
+                    "origin": r["origin"],
+                    "outcome": r["outcome"],
+                    "at": r["at"],
+                    "lag_ms": r["lag_ms"],
+                }
+                for r in runs
+            ],
+            "ticks": ticks,
+        }
+
+    return {
+        "status": "ok",
+        "blind_safe": True,
+        "live_trading": False,
+        "summary": {
+            "run_count": len(runs),
+            "tick_count": len(ticks),
+            "queue_backlog": backlog,
+            "worker_count": len(worker_rows or []),
+            "outbox_probe": "reachable" if outbox_pending is not None else "unavailable",
+        },
+        "runs": runs,
+        "ticks": ticks,
+    }
+
+
 @app.post("/api/paper/kill-switch/activate")
 async def paper_kill_switch_activate(
     request: KillSwitchRequest,
