@@ -311,6 +311,36 @@ def _require_internal_secret(provided: str | None, env_name: str) -> None:
         raise HTTPException(401, "unauthorized")
 
 
+def _paper_cron_scheduler_token(
+    authorization: str | None,
+    x_paper_scheduler_token: str | None,
+) -> str:
+    """Authorize a Vercel cron request without duplicating worker logic."""
+    scheduler_secret = os.getenv("PAPER_SCHEDULER_TOKEN")
+    if (
+        scheduler_secret
+        and x_paper_scheduler_token
+        and secrets.compare_digest(x_paper_scheduler_token, scheduler_secret)
+    ):
+        return scheduler_secret
+
+    cron_secret = os.getenv("CRON_SECRET")
+    scheme, _, credential = (authorization or "").partition(" ")
+    if (
+        cron_secret
+        and scheme.lower() == "bearer"
+        and credential
+        and secrets.compare_digest(credential, cron_secret)
+    ):
+        if not scheduler_secret:
+            raise HTTPException(503, "paper_scheduler_token_not_configured")
+        return scheduler_secret
+
+    if not scheduler_secret and not cron_secret:
+        raise HTTPException(503, "paper_cron_auth_not_configured")
+    raise HTTPException(401, "unauthorized")
+
+
 async def _paper_ops_snapshot() -> dict[str, Any]:
     result = await supabase_rpc("paper_ops_health_snapshot", {"p_account_key": "paper-default"})
     if isinstance(result, dict):
@@ -1912,6 +1942,36 @@ async def internal_paper_reconcile(
         "alpha_logic_touched": False,
         "strategy_b_modified": False,
     }
+
+
+@app.get("/api/cron/paper/recover")
+async def cron_paper_recover(
+    authorization: str | None = Header(default=None, alias="Authorization"),
+    x_paper_scheduler_token: str | None = Header(default=None, alias="X-Paper-Scheduler-Token"),
+):
+    """Run the existing recovery worker from Vercel Cron."""
+    scheduler_token = _paper_cron_scheduler_token(authorization, x_paper_scheduler_token)
+    return await internal_paper_recover(scheduler_token)
+
+
+@app.get("/api/cron/paper/outbox-tick")
+async def cron_paper_outbox_tick(
+    authorization: str | None = Header(default=None, alias="Authorization"),
+    x_paper_scheduler_token: str | None = Header(default=None, alias="X-Paper-Scheduler-Token"),
+):
+    """Run the existing outbox worker from Vercel Cron."""
+    scheduler_token = _paper_cron_scheduler_token(authorization, x_paper_scheduler_token)
+    return await internal_paper_outbox_tick(scheduler_token)
+
+
+@app.get("/api/cron/paper/reconcile")
+async def cron_paper_reconcile(
+    authorization: str | None = Header(default=None, alias="Authorization"),
+    x_paper_scheduler_token: str | None = Header(default=None, alias="X-Paper-Scheduler-Token"),
+):
+    """Run the existing reconciliation worker from Vercel Cron."""
+    scheduler_token = _paper_cron_scheduler_token(authorization, x_paper_scheduler_token)
+    return await internal_paper_reconcile(scheduler_token)
 
 
 @app.get("/api/health")
