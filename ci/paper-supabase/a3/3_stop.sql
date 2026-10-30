@@ -1,5 +1,6 @@
--- A3 (NAVRH) faza 3: odstranenie jobu a navrat povodnych prav v jednej transakcii.
--- Po unschedule zmizne riadok cron.job, takze tick skusky uz nebude overitelny.
+-- A3 (NAVRH) faza 3 LEN NA UPRATANIE (nie pre P4): odstranenie jobu a navrat prav.
+-- Po unschedule zmizne riadok cron.job a ticky prestanu byt overitelne (A2 no_evidence).
+-- Pre zastavenie P4 pouzit 3_pause.sql.
 begin;
 grant paper_cron_owner to postgres with inherit false, set true;
 grant usage on schema cron to paper_cron_owner;

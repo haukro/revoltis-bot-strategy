@@ -37,8 +37,20 @@ Job si naplánuje sám `paper_cron_owner`, takže pg_cron zapíše
 | `revoke usage on schema cron from paper_cron_owner; revoke paper_cron_owner from postgres` | dočasné práva zaniknú v tej istej transakcii |
 | samooverenie | bez USAGE, bez SET/INHERIT členstva, presne jeden aktívny job so správnym príkazom; inak sa všetko vráti |
 
-Vypnutie jobu (`3_stop.sql`) používa rovnaký vzor: `unschedule`, odobratie
-práv, `NOLOGIN` a samooverenie. Overenie (`2_verify.sql`) iba číta.
+**Zastavenie P4 je deaktivácia (`3_pause.sql`), nie odstránenie.** Rovnakým
+vzorom sa v jednej transakcii dočasne pridá aj EXECUTE na `cron.alter_job`
+(nemá PUBLIC EXECUTE, `postgres` ho má s GRANT OPTION). Job sa nastaví na
+`active = false`, rola dostane späť `NOLOGIN` a všetky dočasné práva zaniknú.
+Job aj `cron.job_run_details` ostávajú, takže ticky P4 ostanú overiteľné
+podľa A2 aj pri neskoršej kontrole. `3_stop.sql` (`unschedule`) slúži iba na
+upratanie po uzavretí nezávislej kontroly P4 alebo v CI.
+
+Overenie má dve časti: `2_verify.sql` iba číta, `2b_verify_roles.sql` beží
+v transakcii ukončenej `ROLLBACK`. V nej sa dočasne pridá SET na
+`paper_rpc_owner` a `paper_cron_owner` a skontroluje sa:
+`paper_private.origin` pod `paper_rpc_owner` (kontext assess RPC), zákaz
+čítania cronu pre `paper_rpc_owner` a zákaz mazania logov a `unschedule` pre
+`paper_cron_owner`. Nič z toho neostane uložené.
 
 Súbory a SHA-256:
 
@@ -46,7 +58,12 @@ Súbory a SHA-256:
 | --- | --- |
 | `ci/paper-supabase/a3/1_schedule.sql` | `aaa1264ee34553ab0f4559bcb1578e0c9eb53d9c1f856496614b68deaac96994` |
 | `ci/paper-supabase/a3/2_verify.sql` | `62021a7b69a30f7ed2f691c1223789c4e78e3e77a432d6e0cabeb0d85d45830b` |
-| `ci/paper-supabase/a3/3_stop.sql` | `71922adc92421037e99656dcb7cde6984974480fe57383ab9a9a6d852ff7bee4` |
+| `ci/paper-supabase/a3/2b_verify_roles.sql` | `c4803202fd3ae5798f4963448f326ca1b0e173170785180410950037fc57838a` |
+| `ci/paper-supabase/a3/3_pause.sql` | `11c9573dbbbd862a4d83def0107f7e85e6da69d7f4db7e6ebf9db6ae16883adc` |
+| `ci/paper-supabase/a3/3_stop.sql` (iba upratanie) | `636f32f6db46f7e1877c437bdb96d178ea1aab184976396cbadf19fc37d0136d` |
+
+`3_stop.sql` sa oproti skúške z 30. 10. (`71922adc…`) zmenil iba v úvodnom
+komentári: je označený ako súbor iba na upratanie.
 
 ## A3.2 Bezpečnosť
 
@@ -60,7 +77,9 @@ Súbory a SHA-256:
   pre `localhost` heslo vyžaduje, job zlyhá (pozri A3.4). Nastavenie hesla
   nie je súčasťou A3.
 - Po `unschedule` zmizne riadok `cron.job`. Ticky jobu potom A2 hodnotí ako
-  `no_evidence`, teda fail-closed. Počas testu sa job preto neodstraňuje.
+  `no_evidence`, teda fail-closed. Potvrdené na spravovanom projekte: tick
+  skúšky po odstránení vracia `no_evidence`. Preto sa P4 zastavuje iba
+  deaktiváciou.
 
 ## A3.3 Testy
 
@@ -72,13 +91,24 @@ Súbory a SHA-256:
 | AT62 | Počas behu `paper_cron_owner`: DELETE na `cron.job_run_details` a `cron.unschedule` → `permission denied for schema cron`. | A2 CI |
 | AT63 | `3_stop.sql`: job odstránený, NOLOGIN, bez USAGE a členstva. | A2 CI + spravované |
 | AT64 | Autentifikácia cron pripojenia na spravovanom projekte. | **Iba spravované**; CI ju nedokazuje |
+| AT65 | `2b_verify_roles.sql`: `origin = verified` pod `paper_rpc_owner`; čítanie cronu (`paper_rpc_owner`), mazanie logov a `unschedule` (`paper_cron_owner`) → `permission denied for schema cron`. Po `ROLLBACK` žiadne SET/INHERIT členstvo. | A2 CI + spravované (doplní AT58a) |
+| AT66 | `3_pause.sql`: job ostane s `active = false`, logy ostanú, NOLOGIN, bez USAGE a bez EXECUTE na `alter_job`. Počas aspoň jednej minútovej hranice nepribudne beh a `origin` zostane `verified`. | A2 CI + spravované pri P4 |
 
-## A3.4 Riziká a otvorené body
+## A3.4 Skúška na spravovanom projekte (30. 10. 2026)
 
-1. **Autentifikácia (AT64).** `pg_hba` sa z `postgres` čítať nedá (`42501`).
-   Ak spravovaný projekt pre `localhost` vyžaduje heslo, prvý beh skončí
-   `failed` s chybou pripojenia. Riešenie (heslo, background workers, podpora
-   Supabase) by bolo samostatné rozhodnutie.
+`nofomo-paper-validation`, súbory z `7a07a74`, hashe overené pred spustením:
+
+| Krok | Výsledok |
+| --- | --- |
+| AT59 | `schedule_in_database` pre inú rolu → `XX000 must be superuser to create a job for another role` |
+| AT60 (`1_schedule.sql`) | `jobid = 1`, `paper_cron_owner`, `postgres`, aktívny; bez USAGE a dočasného členstva |
+| AT64 | prvý beh 20:22:00 UTC **succeeded**, 13,4 ms, `1 row`. Autentifikácia cron pripojenia funguje |
+| AT61 (čiastočne) | `tick_run_status` = `succeeded`. `origin` pod `paper_rpc_owner` sa tu nevolal (doplní AT65) |
+| `3_stop.sql` (`71922adc…`) | job odstránený, NOLOGIN, bez USAGE, 0 dočasných členstiev |
+
+## A3.5 Riziká a otvorené body
+
+1. AT65 a AT66 na spravovanom projekte ešte neprebehli.
 2. Odchýlka od rev3 §4.1: job nevytvára administrátor, ale rola cronu
    s dočasnými právami.
 3. Ak by `paper_cron_owner` niekto neskôr pridal USAGE na `cron`, získal by
@@ -88,4 +118,6 @@ Súbory a SHA-256:
 
 | Dátum | Zmena | Stav |
 | --- | --- | --- |
-| 30. 10. 2026 | Návrh A3 po odmietnutí `schedule_in_database` pre inú rolu na spravovanom projekte. | NÁVRH; overenie v CI, skúška na spravovanom projekte čaká na súhlas. |
+| 30. 10. 2026 | Návrh A3 po odmietnutí `schedule_in_database` pre inú rolu na spravovanom projekte. | NÁVRH; CI 41/41 (`7a07a74`). |
+| 30. 10. 2026 | Skúška na spravovanom projekte: AT59, AT60, AT64 prešli, AT61 čiastočne (§A3.4). | So súhlasom Romana; job odstránený. |
+| 30. 10. 2026 | Zastavenie P4 deaktiváciou (`3_pause.sql`) namiesto `unschedule`, overenie pod rolami (`2b_verify_roles.sql`), AT65–AT66. | NÁVRH; čaká na CI a na schválenie A3. |

@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import time
 
 import pytest
 
@@ -20,7 +21,7 @@ if not os.environ.get('PAPER_A2_SUPABASE'):
 import psycopg
 from test_local_stack import Stack, eventually
 
-PHASES = ('1_schedule.sql', '2_verify.sql', '3_stop.sql')
+PHASES = ('1_schedule.sql', '2_verify.sql', '2b_verify_roles.sql', '3_pause.sql', '3_stop.sql')
 
 
 def phase_dir():
@@ -40,11 +41,21 @@ def as_postgres(stack, text):
     with psycopg.connect(stack.dsn, autocommit=True) as conn:
         assert conn.execute('select current_user').fetchone()[0] == 'postgres'
         cur = conn.execute(text)
-        return cur.fetchall() if cur.description else None
+        rows = None
+        while True:  # viac prikazov: posledny vysledok s riadkami (napr. pred ROLLBACK)
+            if cur.description:
+                rows = cur.fetchall()
+            if not cur.nextset():
+                return rows
 
 
 def run_phase(stack, name):
     return as_postgres(stack, (phase_dir() / name).read_text())
+
+
+def load(rows):
+    value = rows[0][0]
+    return json.loads(value) if isinstance(value, str) else value
 
 
 def test_a3_cross_role_scheduling_is_refused_for_postgres(stack):
@@ -88,9 +99,32 @@ def test_a3_self_scheduled_job_runs_and_is_verified(stack):
                  '-U', 'supabase_admin', '-d', 'postgres'], input=f'set role paper_cron_owner; {statement};',
                 text=True, capture_output=True)
             assert result.returncode != 0 and 'permission denied for schema cron' in result.stderr, result.stderr
+        # 2b: rovnake kontroly ako postgres v transakcii s ROLLBACK (spusta sa aj na spravovanom projekte).
+        roles = load(run_phase(stack, '2b_verify_roles.sql'))
+        print('A3 roles:', json.dumps(roles))
+        assert roles['origin'] == 'verified', roles
+        for key in ('reader_cron_read', 'cron_owner_delete_logs', 'cron_owner_unschedule'):
+            assert roles[key] == 'denied: permission denied for schema cron', (key, roles)
+        assert stack.rows("select count(*) n from pg_auth_members where member='postgres'::regrole and roleid in "
+                          "('paper_rpc_owner'::regrole,'paper_cron_owner'::regrole) and (set_option or inherit_option)") == [{'n': 0}]
+        # Zastavenie pre P4: deaktivacia, job aj logy ostavaju.
+        run_phase(stack, '3_pause.sql')
+        paused = stack.rows(f"select active from cron.job where jobid={jobid}")
+        assert paused == [{'active': False}], paused
+        runs = stack.rows(f"select count(*) n from cron.job_run_details where jobid={jobid}")[0]['n']
+        assert runs > 0
+        assert stack.rows("select rolcanlogin, has_schema_privilege('paper_cron_owner','cron','USAGE') u, "
+                          "has_function_privilege('paper_cron_owner','cron.alter_job(bigint,text,text,text,text,boolean)','EXECUTE') a "
+                          "from pg_roles where rolname='paper_cron_owner'") == [{'rolcanlogin': False, 'u': False, 'a': False}]
+        # Prejde aspon jedna minutova hranica bez noveho behu.
+        time.sleep(75)
+        assert stack.rows(f"select count(*) n from cron.job_run_details where jobid={jobid}")[0]['n'] == runs
+        after = load(run_phase(stack, '2b_verify_roles.sql'))
+        assert after['origin'] == 'verified', after
     finally:
         if stack.rows("select count(*) n from cron.job where jobname='paper_tick' and username='paper_cron_owner'")[0]['n']:
-            run_phase(stack, PHASES[2])
+            # Iba upratanie CI zasobnika; P4 sa zastavuje cez 3_pause.sql.
+            run_phase(stack, '3_stop.sql')
     assert stack.rows("select count(*) n from cron.job where jobname='paper_tick'") == [{'n': 0}]
     assert stack.rows("select rolcanlogin, has_schema_privilege('paper_cron_owner','cron','USAGE') u "
                       "from pg_roles where rolname='paper_cron_owner'") == [{'rolcanlogin': False, 'u': False}]
