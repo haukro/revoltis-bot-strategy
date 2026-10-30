@@ -120,7 +120,7 @@ overený pôvod.
   sa pri ňom odmietne nainštalovať (`a2_reader_cron_usage`). A2 potrebuje
   vlastný CI job na čistom zásobníku.
 - AT47–AT50 sa pre A2 nahrádzajú AT53–AT55. AT51 je zaznamenaná ako neúspešná
-  pre A1 a pre A2 sa znovu otvára ako AT58.
+  pre A1 a pre A2 sa znovu otvára ako AT58a (inštalácia) a AT58b (upgrade).
 
 ## A2.6 Akceptačné testy
 
@@ -132,7 +132,8 @@ overený pôvod.
 | AT55 | `anon`, `authenticated`, `service_role`, `authenticator`, `paper_cron_owner`: bez EXECUTE, USAGE a členstva; volanie aj cez PostgREST odmietnuté. `paper_rpc_owner`: bez USAGE na `cron`, bez cron grantov a politík. SELECT, DELETE, `schedule` a `unschedule` → `permission denied for schema cron`. Nevie funkciu nahradiť ani zmazať. | A2 CI + spravované prostredie |
 | AT56 | `postgres` s BYPASSRLS → overenie funguje. Bez BYPASSRLS → `no_tick`; s viditeľným tickom → `no_evidence`; origin nikdy `verified`. Pôvodný stav sa obnoví. | A2 CI (iba lokálne, na spravovanom sa neprepína) |
 | AT57 | Degradácia: odobraté EXECUTE, zmazaná funkcia/schéma, `postgres` bez USAGE na `cron`, bez SELECT na ticky (v oboch prípadoch spolu s odobratím zdedeného `pg_read_all_data`), chýbajúce cron tabuľky → `pending`, potom `unverifiable`. Bez `pg_read_all_data`, iba s explicitnými grantmi, overenie funguje. Opakovaná aplikácia A2 je odmietnutá. | A2 CI + emulácia |
-| AT58 | Spravovaná platforma: A2 sa nainštaluje rolou `postgres` bez superusera. Po podporovanom upgrade alebo obnove pg_cron zostanú vlastník, ACL a výsledky AT52–AT55. Verzie a výsledky sa zaznamenajú pred aj po. | Otvorená brána spravovaného prostredia |
+| AT58a | Inštalácia na spravovanej platforme (`nofomo-paper-validation`): A2 sa nainštaluje rolou `postgres` bez superusera, samooverenie migrácie prejde a AT52–AT55 platia na spravovanej DB. Zaznamená sa verzia pg_cron/pg_net, SHA-256 uloženého SQL a výsledky. | Otvorená brána spravovaného prostredia; overuje sa po schválení A2 |
+| AT58b | Správanie po podporovanom upgrade alebo obnove pg_cron: vlastník, ACL a výsledky AT52–AT55 zostanú zachované. Výsledky pred/po a obe verzie sa zaznamenajú. | **Neoverené**, kým sa upgrade alebo obnova skutočne nevykoná. Úspešná AT58a ani CI ju nenahrádzajú. |
 
 Testy: `backend/tests/paper_a2_supabase/test_cron_origin_definer.py`.
 Spúšťajú sa iba pri `PAPER_A2_SUPABASE=1` v jobe `paper-a2-supabase`.
@@ -182,7 +183,7 @@ aj Supabase default privileges pre funkcie. Na P2 + P3 + A2 prešlo
 
 Emulácia overuje SQL a model oprávnení. Ide o výsledok dodaného emulačného
 harnessu, nie o CI so skutočným pg_cron. Nenahrádza AT53–AT57 v jobe
-`paper-a2-supabase` ani AT58.
+`paper-a2-supabase` ani AT58a/AT58b.
 
 ## A2.9 Otvorené riziká a body na schválenie
 
@@ -191,7 +192,7 @@ harnessu, nie o CI so skutočným pg_cron. Nenahrádza AT53–AT57 v jobe
 2. `postgres` s BYPASSRLS je predpoklad overenia. Ak ho platforma zmení,
    meranie bude fail-closed a P4 neprejde (nie falošný PASS).
 3. Upgrade pg_cron so zmenou stĺpcov alebo stavov sa prejaví ako
-   `no_evidence`/výnimka, teda fail-closed. Kontroluje AT58.
+   `no_evidence`/výnimka, teda fail-closed. Kontroluje AT58b; bez vykonaného upgrade ostáva neoverené.
 4. Verzie v histórii migrácií spravovaného projektu (`20261030…`) sa
    nezhodujú s repom. Rozhodnúť pred akýmkoľvek CLI `db push`.
 5. `postgres` si ponecháva automatické ADMIN členstvo (PG16+) v rolách `paper_*`
@@ -202,5 +203,6 @@ harnessu, nie o CI so skutočným pg_cron. Nenahrádza AT53–AT57 v jobe
 | Dátum | Zmena | Stav |
 | --- | --- | --- |
 | 30. 10. 2026 | Návrh A2: fallback A1.4 po neúspešnej AT51 na spravovanom projekte. Privátna funkcia, nová migrácia, AT52–AT58, emulácia 141/141. | NÁVRH, čaká na Romanovo schválenie. Nič neaplikované do spravovanej DB, cron nezapnutý. |
+| 30. 10. 2026 | CI run 41104771895 na `f3f6055`: všetkých 5 jobov úspešných, `paper-a2-supabase` 39/39. AT58 rozdelená na AT58a (inštalácia na spravovanej platforme) a AT58b (upgrade, neoverené bez vykonaného upgrade). | NÁVRH; čaká na schválenie znenia. |
 | 30. 10. 2026 | Prvé CI so skutočným pg_cron: 36/38. Dva prípady AT57 zlyhali, lebo `postgres` dedí SELECT/USAGE z `pg_read_all_data` (potvrdené aj na spravovanom projekte). Test degradácie odoberá aj toto členstvo. Pribudla kontrola nezávislosti od `pg_read_all_data`. | Oprava testu, migrácia A2 bez zmeny. |
 | 30. 10. 2026 | Oprava testov po review: jediný job `paper_tick`/`paper_cron_owner` (unikátny index), job inej databázy cez vrátenú transakciu, deaktivovaný a nečinný skutočný job počas syntetických testov, BYPASSRLS nastavený pred prvým testom, opakovaná aplikácia cez `DB_URL` ako `postgres`. Doplnený job `paper-a2-supabase`. | NÁVRH; overenie v draft PR. Migrácia A2 bez zmeny. |
