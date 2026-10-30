@@ -14,6 +14,11 @@
       "entrypoint": "app.main:app"
     }
   },
+  "crons": [
+    { "path": "/api/cron/paper/outbox-tick", "schedule": "*/5 * * * *" },
+    { "path": "/api/cron/paper/reconcile", "schedule": "*/15 * * * *" },
+    { "path": "/api/cron/paper/recover", "schedule": "0 * * * *" }
+  ],
   "rewrites": [
     { "source": "/api/(.*)", "destination": { "service": "api" } },
     { "source": "/(.*)", "destination": { "service": "web" } }
