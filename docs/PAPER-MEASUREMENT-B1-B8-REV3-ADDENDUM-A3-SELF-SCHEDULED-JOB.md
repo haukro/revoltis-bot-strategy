@@ -1,6 +1,7 @@
 # B1–B8 rev3 — dodatok A3: job `paper_tick` naplánovaný rolou `paper_cron_owner`
 
-**NÁVRH NA SCHVÁLENIE ROMANOM — 30. 10. 2026. NIE JE SCHVÁLENÝ.**
+**SCHVÁLENÉ ROMANOM — 30. 10. 2026** ako spôsob vytvorenia a zastavenia jobu pre P4
+(zastavenie deaktiváciou s čakaním na dokončenie behov, §A3.1).
 
 Dopĺňa [FINAL B1–B8 rev3](PAPER-MEASUREMENT-B1-B8-REV3.md) §4.1–4.2 a
 [A2](PAPER-MEASUREMENT-B1-B8-REV3-ADDENDUM-A2-CRON-ORIGIN-DEFINER.md).
@@ -42,8 +43,11 @@ vzorom sa v jednej transakcii dočasne pridá aj EXECUTE na `cron.alter_job`
 (nemá PUBLIC EXECUTE, `postgres` ho má s GRANT OPTION). Job sa nastaví na
 `active = false`, rola dostane späť `NOLOGIN` a všetky dočasné práva zaniknú.
 Job aj `cron.job_run_details` ostávajú, takže ticky P4 ostanú overiteľné
-podľa A2 aj pri neskoršej kontrole. `3_stop.sql` (`unschedule`) slúži iba na
-upratanie po uzavretí nezávislej kontroly P4 alebo v CI.
+podľa A2 aj pri neskoršej kontrole. Samotné `active = false` nezastaví beh,
+ktorý už začal. Preto po `3_pause.sql` nasleduje `3b_wait_idle.sql` (iba
+čítanie): čaká najviac 120 s, kým job nemá beh v stave `starting`/`running`,
+inak skončí chybou `a3_runs_still_active`. `3_stop.sql` (`unschedule`) slúži
+iba na upratanie po uzavretí nezávislej kontroly P4 alebo v CI.
 
 Overenie má dve časti: `2_verify.sql` iba číta, `2b_verify_roles.sql` beží
 v transakcii ukončenej `ROLLBACK`. V nej sa dočasne pridá SET na
@@ -60,6 +64,7 @@ Súbory a SHA-256:
 | `ci/paper-supabase/a3/2_verify.sql` | `62021a7b69a30f7ed2f691c1223789c4e78e3e77a432d6e0cabeb0d85d45830b` |
 | `ci/paper-supabase/a3/2b_verify_roles.sql` | `c4803202fd3ae5798f4963448f326ca1b0e173170785180410950037fc57838a` |
 | `ci/paper-supabase/a3/3_pause.sql` | `11c9573dbbbd862a4d83def0107f7e85e6da69d7f4db7e6ebf9db6ae16883adc` |
+| `ci/paper-supabase/a3/3b_wait_idle.sql` | `fbc3e9ca913ebef3afc9f11062ca415c7744be4248f45585f44872dc6ec64240` |
 | `ci/paper-supabase/a3/3_stop.sql` (iba upratanie) | `636f32f6db46f7e1877c437bdb96d178ea1aab184976396cbadf19fc37d0136d` |
 
 `3_stop.sql` sa oproti skúške z 30. 10. (`71922adc…`) zmenil iba v úvodnom
@@ -92,7 +97,7 @@ komentári: je označený ako súbor iba na upratanie.
 | AT63 | `3_stop.sql`: job odstránený, NOLOGIN, bez USAGE a členstva. | A2 CI + spravované |
 | AT64 | Autentifikácia cron pripojenia na spravovanom projekte. | **Iba spravované**; CI ju nedokazuje |
 | AT65 | `2b_verify_roles.sql`: `origin = verified` pod `paper_rpc_owner`; čítanie cronu (`paper_rpc_owner`), mazanie logov a `unschedule` (`paper_cron_owner`) → `permission denied for schema cron`. Po `ROLLBACK` žiadne SET/INHERIT členstvo. | A2 CI + spravované (doplní AT58a) |
-| AT66 | `3_pause.sql`: job ostane s `active = false`, logy ostanú, NOLOGIN, bez USAGE a bez EXECUTE na `alter_job`. Počas aspoň jednej minútovej hranice nepribudne beh a `origin` zostane `verified`. | A2 CI + spravované pri P4 |
+| AT66 | `3_pause.sql` + `3b_wait_idle.sql`: job ostane s `active = false`, logy ostanú, žiadny beh `starting`/`running`, NOLOGIN, bez USAGE a bez EXECUTE na `alter_job`. Počas aspoň jednej minútovej hranice nepribudne beh a `origin` zostane `verified`. | A2 CI + spravované pri P4 |
 
 ## A3.4 Skúška na spravovanom projekte (30. 10. 2026)
 
@@ -120,4 +125,5 @@ komentári: je označený ako súbor iba na upratanie.
 | --- | --- | --- |
 | 30. 10. 2026 | Návrh A3 po odmietnutí `schedule_in_database` pre inú rolu na spravovanom projekte. | NÁVRH; CI 41/41 (`7a07a74`). |
 | 30. 10. 2026 | Skúška na spravovanom projekte: AT59, AT60, AT64 prešli, AT61 čiastočne (§A3.4). | So súhlasom Romana; job odstránený. |
+| 30. 10. 2026 | Čakanie na dokončenie rozbehnutých behov po deaktivácii (`3b_wait_idle.sql`). Roman schválil A3. | SCHVÁLENÉ; AT65–AT66 na spravovanom projekte čakajú na krátku skúšku cez Preview. |
 | 30. 10. 2026 | Zastavenie P4 deaktiváciou (`3_pause.sql`) namiesto `unschedule`, overenie pod rolami (`2b_verify_roles.sql`), AT65–AT66. | NÁVRH; čaká na CI a na schválenie A3. |

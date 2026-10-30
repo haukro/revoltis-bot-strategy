@@ -266,6 +266,95 @@ def test_feature_defaults_off_and_rejects_hosted_url(monkeypatch):
     assert error.value.detail == "paper_environment_not_authorized"
 
 
+PREVIEW_SECRETS = {"CRON_SECRET": "c" * 40, "PAPER_DIAGNOSTIC_SECRET": "d" * 40,
+                   "PAPER_SUPABASE_SERVICE_ROLE_KEY": "test-project-service-key"}
+
+
+def preview_env(monkeypatch, **overrides):
+    from app.paper_routes import PREVIEW_BRANCH, PREVIEW_SUPABASE_URL
+    for name in ("GITHUB_ACTIONS", "SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    values = {"PAPER_MEASUREMENT_ENABLED": "1", "VERCEL_ENV": "preview", "VERCEL_GIT_COMMIT_REF": PREVIEW_BRANCH,
+              "PAPER_SUPABASE_URL": PREVIEW_SUPABASE_URL, **PREVIEW_SECRETS, **overrides}
+    for name, value in values.items():
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+
+
+def preview_error(monkeypatch, **overrides):
+    from fastapi import HTTPException
+    preview_env(monkeypatch, **overrides)
+    with pytest.raises(HTTPException) as error:
+        PaperConfig.environment()
+    return error.value.detail
+
+
+def test_preview_accepts_only_the_fixed_branch_and_test_project(monkeypatch):
+    from app.paper_routes import PREVIEW_SUPABASE_URL
+    preview_env(monkeypatch)
+    config = PaperConfig.environment()
+    assert config.url == PREVIEW_SUPABASE_URL and config.key == "test-project-service-key"
+
+
+@pytest.mark.parametrize("overrides", [
+    {"VERCEL_ENV": "production"},
+    {"VERCEL_ENV": "development"},
+    {"VERCEL_GIT_COMMIT_REF": "main"},
+    {"VERCEL_GIT_COMMIT_REF": "claude/paper-p4-preview-x"},
+    {"VERCEL_GIT_COMMIT_REF": None},
+    {"PAPER_SUPABASE_URL": "https://vdglyxhlmukxeqynguke.supabase.co"},
+    {"PAPER_SUPABASE_URL": "https://zioazncbennqmscfnivv.supabase.co/"},
+    {"PAPER_SUPABASE_URL": "http://zioazncbennqmscfnivv.supabase.co"},
+    {"PAPER_SUPABASE_URL": None, "SUPABASE_URL": "https://zioazncbennqmscfnivv.supabase.co"},
+])
+def test_preview_rejects_other_environment_branch_or_project(monkeypatch, overrides):
+    assert preview_error(monkeypatch, **overrides) == "paper_environment_not_authorized"
+
+
+@pytest.mark.parametrize("overrides", [
+    {"CRON_SECRET": None},
+    {"PAPER_DIAGNOSTIC_SECRET": None},
+    {"PAPER_SUPABASE_SERVICE_ROLE_KEY": None, "SUPABASE_SERVICE_ROLE_KEY": "production-key"},
+    {"CRON_SECRET": "short"},
+    {"PAPER_DIAGNOSTIC_SECRET": "c" * 40},
+    {"PAPER_SUPABASE_SERVICE_ROLE_KEY": "c" * 40},
+    {"SUPABASE_SERVICE_ROLE_KEY": "test-project-service-key"},
+    {"SUPABASE_URL": "https://zioazncbennqmscfnivv.supabase.co/"},
+])
+def test_preview_missing_or_reused_settings_never_fall_back(monkeypatch, overrides):
+    assert preview_error(monkeypatch, **overrides) == "paper_configuration_missing"
+
+
+def test_preview_bypass_does_not_replace_endpoint_secrets(monkeypatch):
+    preview_env(monkeypatch)
+    worker = AsyncMock()
+
+    @asynccontextmanager
+    async def factory(config):
+        yield worker
+
+    app = FastAPI()
+    app.include_router(make_paper_router(PaperConfig.environment, factory))
+    client = TestClient(app)
+    tick = {"tick_id": str(uuid4())}
+    bypass = {"x-vercel-protection-bypass": "b" * 40}
+    assert client.post("/api/paper/measure/tick", json=tick, headers=bypass).status_code == 401
+    assert client.post("/api/paper/measure/tick", json=tick,
+                       headers={**bypass, "Authorization": "Bearer " + "d" * 40}).status_code == 401
+    assert client.post("/api/paper/diagnostic/run", json={"test_id": str(uuid4())},
+                       headers={**bypass, "Authorization": "Bearer " + "c" * 40}).status_code == 401
+    worker.tick.assert_not_awaited()
+    worker.diagnostic.assert_not_awaited()
+
+
+def test_preview_errors_do_not_echo_secret_values(monkeypatch):
+    for overrides in ({"CRON_SECRET": "short"}, {"VERCEL_GIT_COMMIT_REF": "main"}):
+        detail = preview_error(monkeypatch, **overrides)
+        assert all(secret not in detail for secret in PREVIEW_SECRETS.values())
+
+
 def test_market_preserves_confirmation_and_latest_closed_boundary():
     rows = [[str(START+STEP_MS), "100", "101", "99", "100", "10", "1000", "1000", "0"],
             [str(START), "100", "101", "99", "100", "10", "1000", "1000", "1"]]

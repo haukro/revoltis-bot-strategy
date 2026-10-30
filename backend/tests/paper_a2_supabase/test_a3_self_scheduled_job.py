@@ -111,8 +111,14 @@ def test_a3_self_scheduled_job_runs_and_is_verified(stack):
         run_phase(stack, '3_pause.sql')
         paused = stack.rows(f"select active from cron.job where jobid={jobid}")
         assert paused == [{'active': False}], paused
+        # Deaktivacia nezastavi uz rozbehnuty beh: pockat na jeho dokoncenie.
+        idle = load(run_phase(stack, '3b_wait_idle.sql'))
+        print('A3 idle:', json.dumps(idle, default=str))
+        assert idle['active'] is False and idle['unfinished'] == 0, idle
         runs = stack.rows(f"select count(*) n from cron.job_run_details where jobid={jobid}")[0]['n']
-        assert runs > 0
+        assert runs > 0 and runs == idle['runs']
+        assert stack.rows(f"select count(*) n from cron.job_run_details where jobid={jobid} "
+                          "and status in ('starting','running')") == [{'n': 0}]
         assert stack.rows("select rolcanlogin, has_schema_privilege('paper_cron_owner','cron','USAGE') u, "
                           "has_function_privilege('paper_cron_owner','cron.alter_job(bigint,text,text,text,text,boolean)','EXECUTE') a "
                           "from pg_roles where rolname='paper_cron_owner'") == [{'rolcanlogin': False, 'u': False, 'a': False}]
