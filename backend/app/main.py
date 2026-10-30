@@ -1067,10 +1067,13 @@ async def paper_tests_overview(limit: int = 50):
         f"&limit={min(limit, 20)}",
     )
 
-    outbox_pending = await supabase_get(
-        "execution_outbox",
-        "select=id&status=eq.PENDING&limit=1",
-    )
+    try:
+        outbox_pending = await supabase_get(
+            "execution_outbox",
+            "select=id&processed_at=is.null&limit=1",
+        )
+    except Exception:
+        outbox_pending = None
 
     snapshot: dict[str, Any] = {}
     try:

@@ -3,7 +3,10 @@
   "services": {
     "web": {
       "root": "frontend/",
-      "framework": "vite"
+      "framework": "vite",
+      "rewrites": [
+        { "source": "/paper-status", "destination": "/index.html" }
+      ]
     },
     "api": {
       "root": "backend/",
