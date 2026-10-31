@@ -1,7 +1,8 @@
 """A4 rev2 on the disposable stack: real HTTP worker in Preview tick-token mode.
 
 AT72: concurrent delivery of one tick token persists one claim and one run.
-AT73: the token never extends the 120 s tick window enforced by the database.
+AT73: neighbourhood of the 120 s window (117 s / 121 s) over real HTTP; the token never
+      extends the window. The exact 119 999 / 120 000 ms boundary is AT73b (A2, frozen clock).
 Ticks are inserted by the local image administrator with a chosen created_at;
 origin itself is covered by A2/A3, here only age and idempotency are tested.
 """
@@ -107,7 +108,7 @@ def test_at72_concurrent_delivery_of_one_tick_token_persists_one_claim(env):
     assert s.rows(f"select id from paper_runs where test_id='{t['id']}'") == runs
 
 
-def test_at73_tick_window_boundaries_hold_with_a_valid_token(env):
+def test_at73_tick_window_neighbourhood_holds_with_a_valid_token(env):
     s = env[0]
     t = create(s)
     inside = new_tick(s, 117)        # 117 s old: inside the 0..119999 ms window

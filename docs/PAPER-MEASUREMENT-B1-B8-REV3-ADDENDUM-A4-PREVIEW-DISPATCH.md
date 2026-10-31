@@ -41,9 +41,10 @@ cez `db push`. Vyžaduje A2, Vault, pg_net a pgcrypto (`extensions.hmac`).
   `Authorization: PaperTick v1.<tick_id>.<hex HMAC-SHA256(CRON_SECRET, 'paper-tick:v1:' || tick_id)>`.
   `CRON_SECRET` DB neopustí. Telo je `{"tick_id": "<tick_id>"}`. Žiadny
   `x-vercel-protection-bypass`;
-- `paper_dispatch.delivery_report()`: SECURITY INVOKER, `search_path = ''`,
-  EXECUTE iba `postgres` (vlastník). Pre každý odoslaný tick vráti `delivery`
-  podľa §A4.1.2 a príznak `pg_net_conflict`.
+- `paper_dispatch.trial_ticks(test_ids, from, to)` a
+  `paper_dispatch.trial_verdict(test_ids, from, to)`: SECURITY INVOKER,
+  `search_path = ''`, EXECUTE iba `postgres` (vlastník). Vyhodnotenie krátkej
+  skúšky podľa §A4.1.2.
 
 ### A4.1.1 Token (zhodne v DB a v endpointe)
 
@@ -59,33 +60,58 @@ cez `db push`. Vyžaduje A2, Vault, pg_net a pgcrypto (`extensions.hmac`).
 Token nemá vlastnú expiráciu. Platnosť určuje vek ticku v DB (0 až 119 999 ms,
 P2 `paper_claim_run` a P3 `paper_worker_page`) a idempotencia (`unique (test_id, tick_id)`).
 
-### A4.1.2 Doručenie
+### A4.1.2 Vyhodnotenie krátkej skúšky (PASS/FAIL)
 
-pg_net zapisuje výsledok do `net._http_response`, ktorú môže meniť PUBLIC.
-Stav pg_net preto o doručení **nerozhoduje**. Rozhoduje iba DB dôkaz, že
-endpoint tick spracoval (riadok v `paper_run_claims` alebo `paper_tick_outcomes`):
+Doručenie nie je dokončenie. Claim dokazuje iba to, že worker začal; worker môže
+po claime spadnúť alebo spracovať len niektoré testy. Vyhodnotenie preto beží
+pre **každý pár (shadow test, tick)** v okne skúšky `[from, to)` a rozhodujú iba
+DB dôkazy. Stav pg_net (`net._http_response`, `net.http_request_queue`, oba
+zapisovateľné pre PUBLIC) je iba informatívny a nikdy nedáva PASS.
 
-| `delivery` | Podmienka |
-| --- | --- |
-| `delivered` | aspoň jeden claim alebo outcome pre tick |
-| `pending` | bez dôkazu, tick mladší ako 120 s |
-| `unverifiable` | bez dôkazu a žiadny bežiaci test (worker by nič nezapísal) |
-| `undelivered` | bez dôkazu, tick starší ako 120 s, beží aspoň jeden test |
+| Stav páru | Podmienka | PASS? |
+| --- | --- | --- |
+| `run_valid` | platný run uložený pre tento tick | áno |
+| `completed_no_run` | outcome `no_new_candle`, `lease_held`, `evaluation_pending`, `boundary_race` | áno |
+| `run_invalid` | run uložený so statusom `invalid` | nie |
+| `test_ended` | outcome `test_closed` / `shadow_ended` | nie |
+| `lease_expired`, `worker_error`, `inconsistent` | príslušný outcome | nie |
+| `claimed_unfinished` | claim bez runu a bez outcome, lease vypršal (pád po claime) | nie |
+| `in_progress` | claim bez runu, lease ešte platí | nie (nekonečné) |
+| `pending` | bez dôkazu, tick mladší ako 120 s | nie (nekonečné) |
+| `undelivered` | bez dôkazu, tick starší ako 120 s | nie |
+| `not_dispatched` | tick bez záznamu v `paper_dispatch.sent` | nie |
 
-`pg_net_conflict = true`, ak pg_net hlási 2xx a DB dôkaz chýba (sfalšovaná
-alebo klamlivá odpoveď). Krátka skúška preto vyžaduje aspoň jeden bežiaci
-shadow test. Kontrolu robí `a4/2_verify_dispatch.sql` (iba čítanie, `postgres`).
+`trial_verdict` vráti `PASS` iba ak nemá žiadny dôvod. Dôvody:
 
-Endpoint `POST /api/paper/measure/tick` (`backend/app/paper_routes.py`):
+- `no_tests`, `unknown_test`, `not_shadow`, `invalid_window`;
+- `test_not_running_whole_window`: test vznikol po `from`, skončil pred `to`
+  alebo `shadow_until_ms < to`. Rozhoduje `created_at`/`completed_at` testu,
+  **nie** jeho aktuálny `status`, takže výsledok platí aj po zastavení testu;
+- `no_ticks` (prázdne okno), `missing_ticks` (medzera > 90 s od `from`,
+  medzi tickmi alebo do `to`);
+- názov každého neúspešného stavu páru (tabuľka vyššie);
+- `no_valid_run`: niektorý test nemá v okne ani jeden platný run (okno má
+  pokryť aspoň jednu 5-minútovú hranicu, odporúčané ≥ 10 min);
+- `pg_net_conflict`: pg_net hlási 2xx pri neúspešnom páre;
+- `requests_in_flight`: požiadavka z okna je ešte vo fronte pg_net;
+- `not_final`: teraz < `final_at` = max(`to` + 120 s, tick + 120 s, koniec
+  každého lease).
 
-- **Preview** (`VERCEL_ENV=preview`, vetva `claude/paper-p4-preview`, URL
-  testovacieho projektu): prijme iba token, ktorý sa zhoduje s tokenom
-  vypočítaným pre `tick_id` z tela (`compare_digest`). `Bearer CRON_SECRET`,
-  token pre iný tick, iný secret alebo zmenený podpis → 401, worker sa nevolá.
-- **CI** (`GITHUB_ACTIONS`, lokálny Supabase): iba `Bearer CRON_SECRET`, tick token → 401.
-- **Diagnostika** (`/diagnostic/run`): bez zmeny, iba `Bearer PAPER_DIAGNOSTIC_SECRET`.
-- Platnosť ticku ďalej stráži DB (P2 `paper_claim_run`): tick musí existovať,
-  mať `source = 'pg_cron'`, byť mladší ako 120 s; opakovanie → `tick_already_used`.
+Konečnosť: tick starší ako 120 s už nemôže dostať claim ani outcome bez claimu
+(P2 `paper_claim_run`, P3 `paper_worker_outcome`). Po vypršaní lease už nevznikne
+run. K claimnutému ticku môže worker neskôr dopísať iba `error`, čo stav
+`claimed_unfinished` mení na `worker_error`, teda FAIL zostáva FAIL.
+
+**Zastavenie cronu (`3_pause` + `3b_wait_idle`) nie je dôkaz dokončenia.**
+Odoslané HTTP požiadavky a workery môžu bežať ďalej. Postup po skúške:
+
+1. `3_pause.sql`, `3b_wait_idle.sql` (žiadny nový tick, cron nečinný);
+2. počkať do `final_at` (`trial_verdict` ho vráti; aspoň `to` + 120 s
+   a do konca všetkých lease, najviac ~5 min);
+3. spustiť `a4/2_verify_dispatch.sql` s ID shadow testu a oknom skúšky.
+   Skript vypíše neúspešné páry a pri FAIL **skončí chybou** (aj pri prázdnom
+   okne, nevyplnených hodnotách alebo inej role ako `postgres`). Iba PASS je
+   úspešná skúška.
 
 Príkaz jobu (bez tajných hodnôt):
 `select paper_dispatch.send_tick(public.paper_tick_start())`. Job vytvorí
@@ -95,9 +121,9 @@ Zastavenie a overenie bez zmeny z A3 (`3_pause.sql`, `3b_wait_idle.sql`,
 
 | Súbor | SHA-256 |
 | --- | --- |
-| `ci/paper-supabase/a4/a4_dispatch.sql` (rev2) | `bf0a0b004e9780738bccddb26c8c1addb90c438f32240339364ef1eb9ebb27b0` |
+| `ci/paper-supabase/a4/a4_dispatch.sql` (rev2) | `56196b4e94ddd35ca133c1abb915385f9cd999b69eaea8563fec8117899614ec` |
 | `ci/paper-supabase/a4/1_schedule_dispatch.sql` | `09bbcbcecc39a6183e7ebe7ee21a3a5abcfa68a00ffdb0129a371d872d5bbd02` |
-| `ci/paper-supabase/a4/2_verify_dispatch.sql` | `9e01871df83ab7484f9c3de132414ee11214a6ef0786c925053838aafd54e730` |
+| `ci/paper-supabase/a4/2_verify_dispatch.sql` | `46bab1dfedc9bdeee2675d3efbbe8f225c2dd12a9959e428afe290c9cfa5f79c` |
 
 ## A4.2 Tajné hodnoty
 
@@ -121,9 +147,11 @@ Protection Bypass for Automation sa nevytvára.
      pre ten tick a do 120 s od jeho vzniku. Použitie má rovnaký účinok ako
      legitímne doručenie (idempotentné, `tick_already_used`). Skutočná škoda
      je strata jedného doručenia (medzera v meraní), nie únik secretu.
-     `delivery_report()` takú stratu ukáže ako `undelivered`;
+     `trial_verdict()` takú stratu ukáže ako `undelivered` a skúška je FAIL;
    - sfalšovaná odpoveď v `net._http_response` (napr. 200 `processed`) nezmení
-     výsledok, iba nastaví `pg_net_conflict` (AT74);
+     výsledok, iba pridá `pg_net_conflict` (AT76);
+   - zmazanie riadku z fronty pg_net môže skryť `requests_in_flight`, ale nie
+     `not_final`: konečnosť sa počíta z ticku a lease, nie z fronty;
    - vložená vlastná požiadavka → bez `CRON_SECRET` nevie vyrobiť platný token.
    PostgREST schému `net` nevystavuje, prakticky ide o `postgres`/`supabase_admin`.
 2. **Vlastná doména sprístupní deployment vetvy bez SSO.** Overené 31. 10.
@@ -148,14 +176,17 @@ Protection Bypass for Automation sa nevytvára.
 | AT69 | Odmietnutia bez zápisu do fronty: session `postgres`, tick z iného PID, tick starší ako 10 s (11 s), tick z budúcnosti, neznámy tick, opakované odoslanie, vypnutý cieľ, chýbajúci alebo krátky secret. Hranica: tick starý 9 s sa odošle. Opakovaná aplikácia A4 odmietnutá. | A2 CI |
 | AT71 | Endpoint v Preview: prijme iba token pre tick z tela; 401 pre token iného ticku, iný secret, diagnostický secret, `Bearer CRON_SECRET`, prázdny a zmenený podpis. Diagnostika iba s vlastným secretom. V CI tick token → 401. | backend CI |
 | AT72 | Súbežné doručenie toho istého tokenu dvakrát cez reálny HTTP worker v režime Preview tokenu: obe 200, presne 1 claim pre (test, tick), 1 run. Opakovanie zachyteného tokenu v okne: bez nových zápisov. | P3 CI |
-| AT73 | Hranice okna s platným tokenom: tick 117 s spracovaný; 121 s, z budúcnosti a neexistujúci → `invalid_tick` bez zápisu; ten istý token po prekročení 120 s → `invalid_tick` bez zápisu. Bearer a cudzie tokeny → 401 bez zápisu. | P3 CI |
-| AT74 | Uložený a odoslaný tick bez DB dôkazu je `undelivered` aj pri sfalšovanej odpovedi 200 od `authenticated`/`anon` (`pg_net_conflict`); doručený tick ostane `delivered` aj pri sfalšovanej 401; mladý tick `pending`; bez bežiaceho testu `unverifiable`. | A2 CI |
-| AT70 | Skutočné doručenie na Preview cez vlastnú doménu: odpoveď 200 `processed`, žiadna 401/403, `2_verify_dispatch.sql` bez `undelivered` a bez `pg_net_conflict`. | Iba krátka skúška na testovacom projekte, po schválení nasadenia |
+| AT73 | **Okolie** hranice okna cez reálne HTTP (nie presná hranica): tick 117 s spracovaný; 121 s, z budúcnosti a neexistujúci → `invalid_tick` bez zápisu; ten istý token po prekročení 120 s → `invalid_tick`. Bearer a cudzie tokeny → 401 bez zápisu. | P3 CI |
+| AT73b | **Presná** hranica so zmrazeným `paper_private.now_ms()` (ROLLBACK, bez HTTP latencie): `paper_worker_page` 0 a 119 999 ms `ready`, 120 000 ms a −1 ms `invalid_tick`; `paper_worker_outcome` 119 999 zapíše, 120 000 `invalid_tick`; `paper_claim_run` 119 999 prejde kontrolou veku, 120 000 `invalid_tick`. | A2 CI |
+| AT75 | Úplné okno (8 tickov, 1 platný run, ostatné `no_new_candle`) → PASS; rovnaký výsledok aj keď je test už zastavený (`completed_at` po okne). | A2 CI |
+| AT76 | FAIL s presným dôvodom: pád po claime (`claimed_unfinished`), platný lease (`in_progress`, `not_final`), chyba workera, iba neplatný run (`run_invalid`, `no_valid_run`), sfalšovaná 200 pri nedoručenom ticku (`undelivered`, `pg_net_conflict`), chýbajúci tick, neodoslaný tick, požiadavka vo fronte, test zastavený v okne, test vytvorený po začiatku okna, čiastočné spracovanie dvoch testov (`undelivered`, 15/16), nulový počet tickov (`no_ticks`), prázdny zoznam / neznámy test / obrátené okno, čerstvé okno (`not_final`). Overovací skript zlyhá pri nevyplnených hodnotách aj pri prázdnom okne. | A2 CI |
+| AT70 | Skutočné doručenie na Preview cez vlastnú doménu: odpoveď 200 `processed`, žiadna 401/403, `2_verify_dispatch.sql` skončí PASS (po `final_at`). | Iba krátka skúška na testovacom projekte, po schválení nasadenia |
 
 Idempotenciu a vek ticku na strane DB pokrývajú aj P2 (`tick_already_used`,
 AT43d, AT44) a P3 (AT8). Lokálna emulácia PG16 s pgcrypto (náhrady za Vault,
 pg_net a P2 tabuľky) potvrdila pevný vektor cez `send_tick`, hranice 9/11 s,
-budúci tick, ACL a `delivery_report()`; nenahrádza CI so skutočným Supabase.
+budúci tick, ACL, `trial_verdict()` v 14 scenároch a zlyhanie overovacieho
+skriptu; nenahrádza CI so skutočným Supabase.
 
 ## A4.5 Blokujúci nález (review 30. 10. 2026)
 
@@ -188,5 +219,6 @@ hodnota. Iba token viazaný na jeden tick (HMAC) a Preview bez SSO bypassu.
 | 31. 10. 2026 | Rozpracovaná rev2 v kóde: `a4_dispatch.sql` posiela iba `PaperTick v1.<tick_id>.<HMAC-SHA256>`, bez bypassu, cieľ `https://p4-preview.haukro.com/api/paper/measure/tick` (subdoména čaká na Romanovo rozhodnutie). `paper_routes.py`: v Preview tick iba s tokenom viazaným na telo, Bearer iba CI. Text §A4.1–A4.4 ešte opisuje rev1. | ROZPRACOVANÉ, CI zatiaľ neoverené. |
 | 31. 10. 2026 | CI na `e616b94`: 1 zlyhanie v A4 teste (`body` vo fronte pg_net je `bytea`) a backend job. Oprava v `8b43a2f` (test číta `convert_from(body)::jsonb`, backend test s explicitnou odpoveďou diagnostiky, anotácie backend jobu); `a4_dispatch.sql` bez zmeny. CI `8b43a2f`: 5/5 jobov zelených, A2 52/52, backend 318 (7 skipped). | Overené CI. |
 | 31. 10. 2026 | Text §A4.1–A4.4 prepísaný na rev2, pridané §A4.6 a AT71. | NÁVRH, čaká na schválenie. |
-| 31. 10. 2026 | Príčina zlyhania `paper-a2-supabase` na `e616b94`: test čítal `->>` z `bytea` (`net.http_request_queue.body`). Hypotéza chýbajúceho pgcrypto vyvrátená: `a4_dispatch.sql` vyžaduje `extensions.hmac`, fixture ho aplikoval a AT67 v tom istom behu prešiel (51/52, jediné zlyhanie AT68). Doplnené §A4.1.1 (presná špecifikácia HMAC, pevný vektor), §A4.1.2 a `delivery_report()`, `2_verify_dispatch.sql`, AT72–AT74. | NÁVRH, čaká na schválenie. |
+| 31. 10. 2026 | Príčina zlyhania `paper-a2-supabase` na `e616b94`: test čítal `->>` z `bytea` (`net.http_request_queue.body`). Hypotéza chýbajúceho pgcrypto vyvrátená: `a4_dispatch.sql` vyžaduje `extensions.hmac`, fixture ho aplikoval a AT67 v tom istom behu prešiel (51/52, jediné zlyhanie AT68). Doplnené §A4.1.1 (presná špecifikácia HMAC, pevný vektor), report doručenia, `2_verify_dispatch.sql`, AT72–AT74. | NÁVRH, čaká na schválenie. |
 | 31. 10. 2026 | CI na `35a47c5` (kód zhodný s výsledným HEAD, ďalší commit mení iba tento záznam): 5/5 jobov zelených; A2 56/56 (vrátane pevného vektora, hranice 9 s, budúceho ticku, AT74), P3 17/17 (vrátane AT72, AT73), backend 319 (8 skipped). P3 job má odteraz anotácie. Overenie cez Preview (AT70) čaká na samostatné schválenie nasadenia. | Overené CI, NÁVRH čaká na schválenie. |
+| 31. 10. 2026 | Review `f395fa6`: report doručenia považoval claim za doručenie, závisel od aktuálne bežiaceho testu a overovací skript nemal PASS/FAIL. Nahradený `trial_ticks`/`trial_verdict` (§A4.1.2): stav pre každý pár (test, tick), okno viazané na `created_at`/`completed_at` testu, explicitný PASS/FAIL, konečnosť z ticku a lease; skript pri FAIL skončí chybou. AT74 nahradený AT75/AT76, pridaný AT73b (presná hranica), AT73 označený ako test okolia hranice. Postup po skúške: zastavenie cronu nie je dôkaz dokončenia. | NÁVRH, čaká na schválenie. |
