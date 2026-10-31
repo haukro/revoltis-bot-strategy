@@ -200,15 +200,18 @@ class Trial:
     def __init__(self, base):
         self.base, self.sql, self.k, self.requests = base, [], 0, {}
 
-    def test(self, *, completed_at=None, created_at="timestamptz '2000-01-01 00:00:00+00'"):
+    def test(self, *, completed_at=None, created_at="timestamptz '2000-01-01 00:00:00+00'",
+             start_ms='b.start_ms', shadow_until="clock_timestamp() + interval '1 hour'"):
+        """Kopia bazoveho testu cez INSERT. Pozor: INSERT so stavom 'stopped' obchadza trigger
+        paper_test_transition (kontroluje iba UPDATE/DELETE); skutocny prechod overuje AT75b."""
         tid = str(uuid4()); self.k += 1
         status = "'running'" if completed_at is None else "'stopped'"
         completed = 'null' if completed_at is None else completed_at
         self.sql.append(
             "insert into public.paper_tests select (jsonb_populate_record(null::public.paper_tests, to_jsonb(b) || "
-            f"jsonb_build_object('id','{tid}','start_ms',b.start_ms+{self.k},'created_at',{created_at},"
+            f"jsonb_build_object('id','{tid}','start_ms',{start_ms}+{self.k},'created_at',{created_at},"
             f"'status',{status},'completed_at',{completed},"
-            "'shadow_until_ms',floor(extract(epoch from clock_timestamp() + interval '1 hour')*1000)::bigint))).* "
+            f"'shadow_until_ms',floor(extract(epoch from {shadow_until})*1000)::bigint))).* "
             f"from public.paper_tests b where b.id='{self.base['id']}';")
         return tid
 
@@ -264,19 +267,46 @@ class Trial:
 
     def verdict(self, tests, window=WINDOW):
         ids = '{' + ','.join(tests) + '}'
-        out = psql("begin; " + "\n".join(self.sql) + " set local role postgres; "
+        # Odlozene kontroly (complete_run) sa vynutia pred vyhodnotenim, nie az pri COMMIT,
+        # ktory pri ROLLBACK nikdy nenastane.
+        out = psql("begin; " + "\n".join(self.sql) + " set constraints all immediate; set local role postgres; "
                    f"select row_to_json(v) from paper_dispatch.trial_verdict('{ids}'::uuid[], {window[0]}, {window[1]}) v; "
                    "rollback;")
         return json.loads(out.splitlines()[-1])
 
 
 def test_at75_complete_window_passes_also_after_the_test_stopped(base_test):
+    # Druha varianta vklada stav 'stopped' priamo (INSERT): overuje iba citanie zastaveneho
+    # stavu, NIE prechod cez paper_test_transition. Skutocny prechod je v AT75b.
     for completed_at in (None, W0 + " + interval '20 minutes'"):
         t = Trial(base_test)
         test = t.test(completed_at=completed_at)
         t.complete(test, t.minute_ticks())
         v = t.verdict([test])
         assert (v['verdict'], v['reasons'], v['ticks'], v['pairs_ok'], v['pairs_total']) == ('PASS', [], 8, 8, 8), v
+
+
+def test_at75b_historical_verdict_after_real_paper_stop_shadow(base_test):
+    """Skutocny prechod running -> stopped cez RPC paper_stop_shadow (trigger paper_test_transition)."""
+    t = Trial(base_test)
+    # Konzistentne casy: start pred oknom, shadow_until po okne a v minulosti (stop je povoleny).
+    test = t.test(start_ms="(floor(extract(epoch from timestamptz '2000-06-01 00:00:00+00')*1000))::bigint",
+                  shadow_until=W0 + " + interval '30 minutes'")
+    t.complete(test, t.minute_ticks())
+    t.raw("create temp table a4_stop on commit drop as "
+          f"select public.paper_stop_shadow('{test}')->>'outcome' as outcome;")
+    t.raw("create temp table a4_state on commit drop as "
+          f"select status, completed_at > clock_timestamp() - interval '1 minute' as fresh from public.paper_tests where id='{test}';")
+    t.raw("grant select on a4_stop, a4_state to postgres;")
+    ids = '{' + test + '}'
+    out = psql("begin; " + "\n".join(t.sql) + " set constraints all immediate; set local role postgres; "
+               "select json_build_object('stop', (select outcome from a4_stop), 'state', (select row_to_json(x) from a4_state x), "
+               f"'verdict', (select row_to_json(v) from paper_dispatch.trial_verdict('{ids}'::uuid[], {WINDOW[0]}, {WINDOW[1]}) v)); "
+               "rollback;")
+    r = json.loads(out.splitlines()[-1])
+    assert r['stop'] == 'stopped' and r['state'] == {'status': 'stopped', 'fresh': True}, r
+    v = r['verdict']
+    assert (v['verdict'], v['reasons'], v['pairs_ok'], v['pairs_total']) == ('PASS', [], 8, 8), r
 
 
 @pytest.mark.parametrize('case,expected', [
