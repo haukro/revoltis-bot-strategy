@@ -168,11 +168,14 @@ def test_a4_reapply_is_refused(stack):
 
 def report_case(stack, prelude):
     """Stav postavi v transakcii s ROLLBACK a vrati delivery_report() ako postgres."""
-    out = val(stack, "begin; " + prelude + " set local role postgres; "
-                     "select coalesce(jsonb_agg(to_jsonb(x) - 'sent_at' - 'request_id' - 'tick_age_ms'), '[]') "
-                     f"from {REPORT} x; rollback;")
     import json
-    return {row['tick_id']: row for row in json.loads(out.splitlines()[-1])}
+    result = subprocess.run(['docker', 'exec', '-i', 'supabase_db_paper-p2-ci', 'psql', '-X', '-qAt', '-v',
+                             'ON_ERROR_STOP=1', '-U', 'supabase_admin', '-d', 'postgres'],
+                            input="begin; " + prelude + " set local role postgres; "
+                                  "select coalesce(jsonb_agg(to_jsonb(x) - 'sent_at' - 'request_id' - 'tick_age_ms'), '[]') "
+                                  f"from {REPORT} x; rollback;", text=True, capture_output=True, timeout=45)
+    assert result.returncode == 0, result.stderr[-800:]
+    return {row['tick_id']: row for row in json.loads(result.stdout.strip().splitlines()[-1])}
 
 
 def sent_tick(tick, age_s, request_id):
@@ -206,7 +209,9 @@ def test_a4_delivery_report_uses_only_database_evidence(stack):
         assert report[young]['delivery'] == 'pending' and report[young]['pg_net_conflict'] is True
         assert report[refuted]['delivery'] == 'delivered' and report[refuted]['pg_net_status'] == 401
         # Bez bezaceho testu sa nedorucenie neda odlisit od prazdneho spracovania.
-        stopped = report_case(stack, state + "update public.paper_tests set status = 'stopped' where status = 'running'; ")
+        # Zastavenie skutocnou cestou (paper_stop_shadow, trigger paper_test_transition), v ROLLBACK.
+        assert val(stack, "select count(*) from public.paper_tests where status = 'running'") == '1'
+        stopped = report_case(stack, state + f"select public.paper_stop_shadow('{test['id']}'); ")
         assert stopped[forged]['delivery'] == 'unverifiable' and stopped[forged]['pg_net_conflict'] is True
         assert stopped[delivered]['delivery'] == 'delivered'
     finally:
