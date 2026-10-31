@@ -70,7 +70,38 @@ jobs:
         working-directory: backend
         env:
           PAPER_P3_SUPABASE: "1"
-        run: python -m pytest -q -s --tb=short tests/paper_p3_supabase
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest -q -s -rA --tb=short --junitxml="$RUNNER_TEMP/p3-junit.xml" tests/paper_p3_supabase 2>&1 | tee "$RUNNER_TEMP/p3-pytest.log"
+      - name: P3 result annotations (sanitized)
+        if: always()
+        shell: python
+        run: |
+          # Logs are not always downloadable; annotations are. Credential-like lines are dropped.
+          import os, re
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          secret = re.compile(r'key|secret|password|authorization|jwt|publishable|sb_|eyJ|postgres(ql)?://', re.I)
+          def clean(text, limit):
+              lines = [l for l in text.splitlines() if l.strip() and not secret.search(l)]
+              return '%0A'.join(l.replace('%', '%25').replace('\r', '') for l in lines)[-limit:]
+          tmp = Path(os.environ['RUNNER_TEMP'])
+          junit = tmp / 'p3-junit.xml'
+          if junit.exists():
+              root = ET.parse(junit).getroot()
+              suite = root if root.tag == 'testsuite' else root.find('testsuite')
+              print(f"::notice title=P3 pytest::tests={suite.get('tests')} failures={suite.get('failures')} "
+                    f"errors={suite.get('errors')} skipped={suite.get('skipped')}")
+              bad = [c for c in suite.iter('testcase') if c.find('failure') is not None or c.find('error') is not None]
+              for case in bad[:9]:
+                  node = case.find('failure') if case.find('failure') is not None else case.find('error')
+                  text = (node.get('message') or '') + '\n' + (node.text or '')
+                  print(f"::error title={case.get('name', '')[:120]}::{clean(text, 3500)}")
+          log = tmp / 'p3-pytest.log'
+          if log.exists():
+              passed = [l for l in log.read_text(errors='replace').splitlines() if l.startswith(('PASSED', 'FAILED', 'ERROR', 'SKIPPED'))]
+              print(f"::warning title=p3-pytest.log::{clean(chr(10).join(passed), 3500)}")
       - name: Sanitized startup diagnostics
         if: failure()
         shell: python
@@ -88,6 +119,135 @@ jobs:
         run: |
           docker rm -f paper-p2-ci-http 2>/dev/null || true
           npx --yes supabase@2.122.0 --workdir "$PAPER_P2_STACK_DIR" stop --no-backup
+
+  paper-a2-supabase:
+    # A2 (NAVRH): fallback A1.4. Cerstvy zasobnik BEZ CI kandidata A1
+    # (tests/paper_p2_supabase sa tu nespusta). Nepripaja spravovany projekt.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    env:
+      PAPER_P2_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r backend/requirements.txt -r backend/requirements-paper-p2.txt pytest
+      - name: Prepare unlinked local Supabase
+        shell: bash
+        run: |
+          set -euo pipefail
+          ci_stack_dir=$(mktemp -d "$RUNNER_TEMP/paper-a2-supabase.XXXXXX")
+          echo "PAPER_P2_STACK_DIR=$ci_stack_dir" >> "$GITHUB_ENV"
+          echo "PAPER_P2_SUPABASE_STATUS=$ci_stack_dir/status.json" >> "$GITHUB_ENV"
+          npx --yes supabase@2.122.0 --version
+          npx --yes supabase@2.122.0 --workdir "$ci_stack_dir" init
+          python ci/paper-supabase/prepare.py "$ci_stack_dir"
+      - name: Start actual Supabase services and apply exact P2 migration
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx --yes supabase@2.122.0 --workdir "$PAPER_P2_STACK_DIR" start \
+            --exclude studio,postgres-meta,realtime,storage-api,imgproxy,mailpit,edge-runtime,logflare,vector,supavisor \
+            > "$PAPER_P2_STACK_DIR/start.log" 2>&1
+          npx --yes supabase@2.122.0 --workdir "$PAPER_P2_STACK_DIR" status -o json > "$PAPER_P2_SUPABASE_STATUS"
+          npx --yes supabase@2.122.0 --workdir "$PAPER_P2_STACK_DIR" migration list --local 2>&1 | tee "$RUNNER_TEMP/a2-1-start.log"
+      - name: Install pg_cron and pg_net like the managed project (extension owner supabase_admin)
+        shell: bash
+        run: |
+          set -o pipefail
+          docker exec -i supabase_db_paper-p2-ci psql -X -qAt -v ON_ERROR_STOP=1 -U supabase_admin -d postgres 2>&1 <<'SQL' | tee "$RUNNER_TEMP/a2-2-extensions.log"
+          create extension if not exists pg_cron with schema pg_catalog;
+          create extension if not exists pg_net with schema extensions;
+          select extname || ' ' || extversion || ' owner=' || pg_get_userbyid(extowner) from pg_extension
+            where extname in ('pg_cron','pg_net') order by 1;
+          SQL
+      - name: Apply exact P3 and A2 migrations as postgres
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$PAPER_P2_COMMIT"
+          python - <<'PYCODE'
+          from pathlib import Path
+          import hashlib, os, shutil
+          for name in ('20261029161155_paper_measurement_p3_worker.sql',
+                       '20261030200000_paper_measurement_a2_cron_origin.sql'):
+              source = Path('supabase/migrations') / name
+              target = Path(os.environ['PAPER_P2_STACK_DIR']) / 'supabase/migrations' / name
+              shutil.copyfile(source, target)
+              assert source.read_bytes() == target.read_bytes()
+              print(name, hashlib.sha256(source.read_bytes()).hexdigest())
+          PYCODE
+          npx --yes supabase@2.122.0 --workdir "$PAPER_P2_STACK_DIR" db push --local --yes 2>&1 | tee "$RUNNER_TEMP/a2-3-push.log"
+          npx --yes supabase@2.122.0 --workdir "$PAPER_P2_STACK_DIR" migration list --local 2>&1 | tee -a "$RUNNER_TEMP/a2-3-push.log"
+      - name: Local Supabase security advisors
+        shell: bash
+        run: |
+          set -o pipefail
+          npx --yes supabase@2.122.0 --workdir "$PAPER_P2_STACK_DIR" db advisors --local --type security --level warn --fail-on error 2>&1 | tee "$RUNNER_TEMP/a2-4-advisors.log"
+      - name: Test A2 cron origin definer (AT52-AT57)
+        working-directory: backend
+        env:
+          PAPER_A2_SUPABASE: "1"
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest -q -s -rA --tb=short --junitxml="$RUNNER_TEMP/a2-junit.xml" tests/paper_a2_supabase 2>&1 | tee "$RUNNER_TEMP/a2-5-pytest.log"
+      - name: A2 result annotations (sanitized)
+        if: always()
+        shell: python
+        run: |
+          # Logs are not always downloadable; annotations are. No secrets: lines
+          # matching credential patterns are dropped before anything is printed.
+          import os, re
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          secret = re.compile(r'key|token|secret|password|authorization|jwt|publishable|sb_|eyJ|postgres(ql)?://', re.I)
+          def clean(text, limit):
+              lines = [l for l in text.splitlines() if l.strip() and not secret.search(l)]
+              return '%0A'.join(l.replace('%', '%25').replace('\r', '') for l in lines)[-limit:]
+          tmp = Path(os.environ['RUNNER_TEMP'])
+          junit = tmp / 'a2-junit.xml'
+          if junit.exists():
+              root = ET.parse(junit).getroot()
+              suite = root if root.tag == 'testsuite' else root.find('testsuite')
+              print(f"::notice title=A2 pytest::tests={suite.get('tests')} failures={suite.get('failures')} "
+                    f"errors={suite.get('errors')} skipped={suite.get('skipped')}")
+              bad = [c for c in suite.iter('testcase') if c.find('failure') is not None or c.find('error') is not None]
+              for case in bad[:9]:
+                  node = case.find('failure') if case.find('failure') is not None else case.find('error')
+                  text = (node.get('message') or '') + '\n' + (node.text or '')
+                  print(f"::error title={case.get('name')[:120]}::{clean(text, 3500)}")
+          for log in sorted(tmp.glob('a2-[0-9]-*.log')):
+              print(f"::warning title={log.name}::{clean(log.read_text(errors='replace'), 3500)}")
+          pytest_log = tmp / 'a2-5-pytest.log'
+          if pytest_log.exists():
+              model = [l for l in pytest_log.read_text(errors='replace').splitlines()
+                       if l.startswith(('Local image', 'Role model', 'Postgres memberships', 'Extensions:', 'Cron ACL:'))]
+              if model:
+                  print('::notice title=A2 platform model::' + clean('\n'.join(model), 3500))
+      - name: Sanitized startup diagnostics
+        if: failure()
+        shell: python
+        run: |
+          import os, re
+          from pathlib import Path
+          path = Path(os.environ.get('PAPER_P2_STACK_DIR', '/nonexistent')) / 'start.log'
+          if path.exists():
+              for line in path.read_text(errors='replace').splitlines()[-100:]:
+                  if re.search(r'key|token|secret|password|authorization|jwt|publishable|sb_|eyJ|postgres(ql)?://', line, re.I):
+                      continue
+                  print(line)
+      - name: Remove disposable local services
+        if: always() && env.PAPER_P2_STACK_DIR != ''
+        run: npx --yes supabase@2.122.0 --workdir "$PAPER_P2_STACK_DIR" stop --no-backup
 
   paper-p2:
     runs-on: ubuntu-24.04
@@ -136,7 +296,38 @@ jobs:
           cache: pip
           cache-dependency-path: backend/requirements.txt
       - run: pip install -r requirements.txt pytest
-      - run: python -m pytest -q
+      - name: Backend pytest
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest -q -rfE --tb=short --junitxml="$RUNNER_TEMP/backend-junit.xml" 2>&1 | tee "$RUNNER_TEMP/backend-pytest.log"
+      - name: Backend result annotations (sanitized)
+        if: always()
+        shell: python
+        run: |
+          # Logs are not always downloadable; annotations are. Credential-like lines are dropped.
+          import os, re
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          secret = re.compile(r'key|secret|password|authorization|jwt|publishable|sb_|eyJ|postgres(ql)?://', re.I)
+          def clean(text, limit):
+              lines = [l for l in text.splitlines() if l.strip() and not secret.search(l)]
+              return '%0A'.join(l.replace('%', '%25').replace('\r', '') for l in lines)[-limit:]
+          tmp = Path(os.environ['RUNNER_TEMP'])
+          junit = tmp / 'backend-junit.xml'
+          if junit.exists():
+              root = ET.parse(junit).getroot()
+              suite = root if root.tag == 'testsuite' else root.find('testsuite')
+              print(f"::notice title=backend pytest::tests={suite.get('tests')} failures={suite.get('failures')} "
+                    f"errors={suite.get('errors')} skipped={suite.get('skipped')}")
+              bad = [c for c in suite.iter('testcase') if c.find('failure') is not None or c.find('error') is not None]
+              for case in bad[:9]:
+                  node = case.find('failure') if case.find('failure') is not None else case.find('error')
+                  text = (node.get('message') or '') + '\n' + (node.text or '')
+                  print(f"::error title={case.get('classname', '')[-60:]}.{case.get('name', '')[:80]}::{clean(text, 3500)}")
+          log = tmp / 'backend-pytest.log'
+          if log.exists():
+              print(f"::warning title=backend-pytest.log::{clean(log.read_text(errors='replace'), 3500)}")
 
   frontend:
     runs-on: ubuntu-24.04
