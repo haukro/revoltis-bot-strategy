@@ -198,7 +198,7 @@ class Trial:
     """Generuje SQL pre jednu skusku; vsetko sa vykona v jednej transakcii s ROLLBACK."""
 
     def __init__(self, base):
-        self.base, self.sql, self.k = base, [], 0
+        self.base, self.sql, self.k, self.requests = base, [], 0, {}
 
     def test(self, *, completed_at=None, created_at="timestamptz '2000-01-01 00:00:00+00'"):
         tid = str(uuid4()); self.k += 1
@@ -217,7 +217,8 @@ class Trial:
         self.sql.append("insert into public.paper_measure_ticks(tick_id,source,cron_job_name,backend_pid,created_at) "
                         f"values ('{tk}','pg_cron','paper_tick',1,{at});")
         if sent:
-            self.sql.append(f"insert into paper_dispatch.sent(tick_id,request_id) values ('{tk}',{request_id or 900000 + len(self.sql)});")
+            self.requests[tk] = request_id or 900000 + len(self.sql)
+            self.sql.append(f"insert into paper_dispatch.sent(tick_id,request_id) values ('{tk}',{self.requests[tk]});")
         return tk
 
     def minute_ticks(self, count=8, start=W0, skip=()):
@@ -228,7 +229,9 @@ class Trial:
         self.sql.append(
             "insert into public.paper_run_claims(id,test_id,tick_id,last_candle_open_ms,boundary_ms,test_end_ms,"
             "attempt,claimed_at,lease_expires_at) "
-            f"select '{cid}','{test}',k.tick_id,x.b-300000,x.b,x.m,1,k.created_at,{lease} "
+            # attempt ako paper_claim_run: dalsi claim na tej istej 5m hranici ma attempt + 1
+            f"select '{cid}','{test}',k.tick_id,x.b-300000,x.b,x.m,(select coalesce(max(q.attempt),0)+1 "
+            f"from public.paper_run_claims q where q.test_id='{test}' and q.boundary_ms=x.b),k.created_at,{lease} "
             "from public.paper_measure_ticks k, lateral (select paper_private.ms(k.created_at) m, "
             f"(floor(paper_private.ms(k.created_at)/300000.0)*300000)::bigint b) x where k.tick_id='{tick}';")
         return cid
@@ -312,12 +315,10 @@ def test_at76_incomplete_or_unproven_trial_fails(base_test, case, expected):
             t.outcome(test, tick, 'no_new_candle')
     elif case == 'forged_200_for_undelivered':
         t.raw("set local role anon; insert into net._http_response(id,status_code,content_type,content,timed_out) "
-              "select s.request_id,200,'application/json','{\"outcome\":\"processed\"}',false "
-              f"from paper_dispatch.sent s where s.tick_id='{ticks[5]}'; reset role;")
+              f"values ({t.requests[ticks[5]]},200,'application/json','{{\"outcome\":\"processed\"}}',false); reset role;")
     elif case == 'request_in_flight':
         t.raw("insert into net.http_request_queue(id,method,url,headers,body,timeout_milliseconds) "
-              f"select s.request_id,'POST','https://p4-preview.haukro.com/api/paper/measure/tick','{{}}',null,1000 "
-              f"from paper_dispatch.sent s where s.tick_id='{ticks[1]}';")
+              f"values ({t.requests[ticks[1]]},'POST','https://p4-preview.haukro.com/api/paper/measure/tick','{{}}',null,1000);")
     v = t.verdict([test])
     assert v['verdict'] == 'FAIL' and v['reasons'] == expected, (case, v)
 
