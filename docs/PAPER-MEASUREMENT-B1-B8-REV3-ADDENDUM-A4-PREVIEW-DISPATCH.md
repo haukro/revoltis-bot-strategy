@@ -40,7 +40,41 @@ cez `db push`. Vyžaduje A2, Vault, pg_net a pgcrypto (`extensions.hmac`).
 - **jediná hlavička s autentifikáciou:**
   `Authorization: PaperTick v1.<tick_id>.<hex HMAC-SHA256(CRON_SECRET, 'paper-tick:v1:' || tick_id)>`.
   `CRON_SECRET` DB neopustí. Telo je `{"tick_id": "<tick_id>"}`. Žiadny
-  `x-vercel-protection-bypass`.
+  `x-vercel-protection-bypass`;
+- `paper_dispatch.delivery_report()`: SECURITY INVOKER, `search_path = ''`,
+  EXECUTE iba `postgres` (vlastník). Pre každý odoslaný tick vráti `delivery`
+  podľa §A4.1.2 a príznak `pg_net_conflict`.
+
+### A4.1.1 Token (zhodne v DB a v endpointe)
+
+| Časť | Hodnota |
+| --- | --- |
+| Kľúč | `CRON_SECRET` ako UTF-8 (DB: Vault `paper_p4_cron_secret`, endpoint: premenná Preview vetvy) |
+| Správa | UTF-8 reťazec `paper-tick:v1:` + `tick_id` v kanonickom tvare UUID (malé písmená, so spojovníkmi) |
+| Algoritmus | HMAC-SHA256, výstup hex malými písmenami (64 znakov) |
+| DB | `encode(extensions.hmac(convert_to(správa,'UTF8'), convert_to(kľúč,'UTF8'), 'sha256'), 'hex')` |
+| Endpoint | `hmac.new(kľúč, správa, sha256).hexdigest()` v `tick_token()`, porovnanie `secrets.compare_digest` s tokenom pre `tick_id` z tela |
+| Pevný vektor | kľúč `'k' * 40`, tick `00000000-0000-0000-0000-000000000001` → `8ec3a7b53733daee250202a8cac55df6792ac9c468954e2e39ed7bcd6343f324` |
+
+Token nemá vlastnú expiráciu. Platnosť určuje vek ticku v DB (0 až 119 999 ms,
+P2 `paper_claim_run` a P3 `paper_worker_page`) a idempotencia (`unique (test_id, tick_id)`).
+
+### A4.1.2 Doručenie
+
+pg_net zapisuje výsledok do `net._http_response`, ktorú môže meniť PUBLIC.
+Stav pg_net preto o doručení **nerozhoduje**. Rozhoduje iba DB dôkaz, že
+endpoint tick spracoval (riadok v `paper_run_claims` alebo `paper_tick_outcomes`):
+
+| `delivery` | Podmienka |
+| --- | --- |
+| `delivered` | aspoň jeden claim alebo outcome pre tick |
+| `pending` | bez dôkazu, tick mladší ako 120 s |
+| `unverifiable` | bez dôkazu a žiadny bežiaci test (worker by nič nezapísal) |
+| `undelivered` | bez dôkazu, tick starší ako 120 s, beží aspoň jeden test |
+
+`pg_net_conflict = true`, ak pg_net hlási 2xx a DB dôkaz chýba (sfalšovaná
+alebo klamlivá odpoveď). Krátka skúška preto vyžaduje aspoň jeden bežiaci
+shadow test. Kontrolu robí `a4/2_verify_dispatch.sql` (iba čítanie, `postgres`).
 
 Endpoint `POST /api/paper/measure/tick` (`backend/app/paper_routes.py`):
 
@@ -61,8 +95,9 @@ Zastavenie a overenie bez zmeny z A3 (`3_pause.sql`, `3b_wait_idle.sql`,
 
 | Súbor | SHA-256 |
 | --- | --- |
-| `ci/paper-supabase/a4/a4_dispatch.sql` (rev2) | `5050cd3a6e21e0a35a5ce3844e036c7d948a58e77f68e3d2dd74d28cb87e3673` |
+| `ci/paper-supabase/a4/a4_dispatch.sql` (rev2) | `bf0a0b004e9780738bccddb26c8c1addb90c438f32240339364ef1eb9ebb27b0` |
 | `ci/paper-supabase/a4/1_schedule_dispatch.sql` | `09bbcbcecc39a6183e7ebe7ee21a3a5abcfa68a00ffdb0129a371d872d5bbd02` |
+| `ci/paper-supabase/a4/2_verify_dispatch.sql` | `9e01871df83ab7484f9c3de132414ee11214a6ef0786c925053838aafd54e730` |
 
 ## A4.2 Tajné hodnoty
 
@@ -85,7 +120,10 @@ Protection Bypass for Automation sa nevytvára.
    - presmerovaná `url` → útočník získa token jedného ticku. Ten platí iba
      pre ten tick a do 120 s od jeho vzniku. Použitie má rovnaký účinok ako
      legitímne doručenie (idempotentné, `tick_already_used`). Skutočná škoda
-     je strata jedného doručenia (medzera v meraní), nie únik secretu;
+     je strata jedného doručenia (medzera v meraní), nie únik secretu.
+     `delivery_report()` takú stratu ukáže ako `undelivered`;
+   - sfalšovaná odpoveď v `net._http_response` (napr. 200 `processed`) nezmení
+     výsledok, iba nastaví `pg_net_conflict` (AT74);
    - vložená vlastná požiadavka → bez `CRON_SECRET` nevie vyrobiť platný token.
    PostgREST schému `net` nevystavuje, prakticky ide o `postgres`/`supabase_admin`.
 2. **Vlastná doména sprístupní deployment vetvy bez SSO.** Overené 31. 10.
@@ -106,13 +144,18 @@ Protection Bypass for Automation sa nevytvára.
 | ID | Scenár a očakávaný výsledok | Zaradenie |
 | --- | --- | --- |
 | AT67 | Definícia a ACL `send_tick`, pevná URL (iná → `target_url_check`), aplikačné roly a `paper_rpc_owner` bez prístupu, `paper_cron_owner` nečíta `target`, `sent` ani Vault. | A2 CI |
-| AT68 | Pozitívny prípad v transakcii s ROLLBACK: POST iba na pevnú URL, bez bypass hlavičky, `CRON_SECRET` sa v hlavičkách nevyskytuje, `Authorization` sa rovná tokenu z Pythonu (`tick_token`, teda pgcrypto `hmac` = Python `hmac`). Po ROLLBACK fronta bez zmeny. | A2 CI |
-| AT69 | Odmietnutia bez zápisu do fronty: session `postgres`, tick z iného PID, tick starší ako 10 s, neznámy tick, opakované odoslanie, vypnutý cieľ, chýbajúci alebo krátky secret. Opakovaná aplikácia A4 odmietnutá. | A2 CI |
+| AT68 | Pozitívny prípad v transakcii s ROLLBACK: POST iba na pevnú URL, bez bypass hlavičky, `CRON_SECRET` sa v hlavičkách nevyskytuje, `Authorization` sa rovná tokenu z Pythonu. Pevný vektor (§A4.1.1) cez skutočnú `send_tick` aj v Python unit teste. Po ROLLBACK fronta bez zmeny. | A2 CI, backend CI |
+| AT69 | Odmietnutia bez zápisu do fronty: session `postgres`, tick z iného PID, tick starší ako 10 s (11 s), tick z budúcnosti, neznámy tick, opakované odoslanie, vypnutý cieľ, chýbajúci alebo krátky secret. Hranica: tick starý 9 s sa odošle. Opakovaná aplikácia A4 odmietnutá. | A2 CI |
 | AT71 | Endpoint v Preview: prijme iba token pre tick z tela; 401 pre token iného ticku, iný secret, diagnostický secret, `Bearer CRON_SECRET`, prázdny a zmenený podpis. Diagnostika iba s vlastným secretom. V CI tick token → 401. | backend CI |
-| AT70 | Skutočné doručenie na Preview cez vlastnú doménu: odpoveď 200 `processed`, žiadna 401/403. | Iba krátka skúška na testovacom projekte |
+| AT72 | Súbežné doručenie toho istého tokenu dvakrát cez reálny HTTP worker v režime Preview tokenu: obe 200, presne 1 claim pre (test, tick), 1 run. Opakovanie zachyteného tokenu v okne: bez nových zápisov. | P3 CI |
+| AT73 | Hranice okna s platným tokenom: tick 117 s spracovaný; 121 s, z budúcnosti a neexistujúci → `invalid_tick` bez zápisu; ten istý token po prekročení 120 s → `invalid_tick` bez zápisu. Bearer a cudzie tokeny → 401 bez zápisu. | P3 CI |
+| AT74 | Uložený a odoslaný tick bez DB dôkazu je `undelivered` aj pri sfalšovanej odpovedi 200 od `authenticated`/`anon` (`pg_net_conflict`); doručený tick ostane `delivered` aj pri sfalšovanej 401; mladý tick `pending`; bez bežiaceho testu `unverifiable`. | A2 CI |
+| AT70 | Skutočné doručenie na Preview cez vlastnú doménu: odpoveď 200 `processed`, žiadna 401/403, `2_verify_dispatch.sql` bez `undelivered` a bez `pg_net_conflict`. | Iba krátka skúška na testovacom projekte, po schválení nasadenia |
 
-Idempotenciu a vek ticku na strane DB pokrývajú P2 (`tick_already_used`,
-AT43d, AT44) a P3 (AT8).
+Idempotenciu a vek ticku na strane DB pokrývajú aj P2 (`tick_already_used`,
+AT43d, AT44) a P3 (AT8). Lokálna emulácia PG16 s pgcrypto (náhrady za Vault,
+pg_net a P2 tabuľky) potvrdila pevný vektor cez `send_tick`, hranice 9/11 s,
+budúci tick, ACL a `delivery_report()`; nenahrádza CI so skutočným Supabase.
 
 ## A4.5 Blokujúci nález (review 30. 10. 2026)
 
@@ -145,3 +188,4 @@ hodnota. Iba token viazaný na jeden tick (HMAC) a Preview bez SSO bypassu.
 | 31. 10. 2026 | Rozpracovaná rev2 v kóde: `a4_dispatch.sql` posiela iba `PaperTick v1.<tick_id>.<HMAC-SHA256>`, bez bypassu, cieľ `https://p4-preview.haukro.com/api/paper/measure/tick` (subdoména čaká na Romanovo rozhodnutie). `paper_routes.py`: v Preview tick iba s tokenom viazaným na telo, Bearer iba CI. Text §A4.1–A4.4 ešte opisuje rev1. | ROZPRACOVANÉ, CI zatiaľ neoverené. |
 | 31. 10. 2026 | CI na `e616b94`: 1 zlyhanie v A4 teste (`body` vo fronte pg_net je `bytea`) a backend job. Oprava v `8b43a2f` (test číta `convert_from(body)::jsonb`, backend test s explicitnou odpoveďou diagnostiky, anotácie backend jobu); `a4_dispatch.sql` bez zmeny. CI `8b43a2f`: 5/5 jobov zelených, A2 52/52, backend 318 (7 skipped). | Overené CI. |
 | 31. 10. 2026 | Text §A4.1–A4.4 prepísaný na rev2, pridané §A4.6 a AT71. | NÁVRH, čaká na schválenie. |
+| 31. 10. 2026 | Príčina zlyhania `paper-a2-supabase` na `e616b94`: test čítal `->>` z `bytea` (`net.http_request_queue.body`). Hypotéza chýbajúceho pgcrypto vyvrátená: `a4_dispatch.sql` vyžaduje `extensions.hmac`, fixture ho aplikoval a AT67 v tom istom behu prešiel (51/52, jediné zlyhanie AT68). Doplnené §A4.1.1 (presná špecifikácia HMAC, pevný vektor), §A4.1.2 a `delivery_report()`, `2_verify_dispatch.sql`, AT72–AT74. | NÁVRH, čaká na schválenie. |

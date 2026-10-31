@@ -73,11 +73,40 @@ begin
   return v_request;
 end $$;
 
+-- Doručenie sa posudzuje IBA podľa DB dôkazov (claim alebo outcome pre tick).
+-- net._http_response je zapisovateľná pre PUBLIC, preto je stav pg_net iba
+-- informatívny: 2xx bez DB dôkazu je konflikt (sfalšovaná alebo klamlivá odpoveď).
+-- Bez bežiaceho testu worker nič nezapíše, preto je výsledok 'unverifiable'.
+create function paper_dispatch.delivery_report()
+returns table(tick_id uuid, request_id bigint, sent_at timestamptz, tick_age_ms bigint,
+              db_evidence bigint, pg_net_status integer, delivery text, pg_net_conflict boolean)
+language sql stable security invoker
+set search_path = ''
+as $$
+  select s.tick_id, s.request_id, s.sent_at,
+         floor(extract(epoch from clock_timestamp() - t.created_at) * 1000)::bigint,
+         e.n, r.status_code,
+         case when e.n > 0 then 'delivered'
+              when clock_timestamp() - t.created_at < interval '120 seconds' then 'pending'
+              when not exists(select from public.paper_tests p where p.status = 'running') then 'unverifiable'
+              else 'undelivered' end,
+         e.n = 0 and coalesce(r.status_code between 200 and 299, false)
+  from paper_dispatch.sent s
+  join public.paper_measure_ticks t on t.tick_id = s.tick_id
+  cross join lateral (select (select count(*) from public.paper_run_claims c where c.tick_id = s.tick_id)
+                           + (select count(*) from public.paper_tick_outcomes o where o.tick_id = s.tick_id) as n) e
+  left join lateral (select x.status_code from net._http_response x where x.id = s.request_id
+                     order by x.created desc limit 1) r on true
+  order by s.sent_at, s.tick_id
+$$;
+revoke all on function paper_dispatch.delivery_report() from public;
+
 revoke all on function paper_dispatch.send_tick(uuid) from public;
 do $$ declare r text; begin
   foreach r in array array['anon','authenticated','service_role','authenticator','paper_rpc_owner'] loop
     if exists(select from pg_roles where rolname = r) then
       execute format('revoke all on function paper_dispatch.send_tick(uuid) from %I', r);
+      execute format('revoke all on function paper_dispatch.delivery_report() from %I', r);
       execute format('revoke all on schema paper_dispatch from %I', r);
     end if;
   end loop;
@@ -97,6 +126,10 @@ do $$ declare f oid := 'paper_dispatch.send_tick(uuid)'::regprocedure; r text; b
        (has_function_privilege(r, f, 'EXECUTE') or has_schema_privilege(r, 'paper_dispatch', 'USAGE')) then
       raise exception 'a4_application_role_access %', r; end if;
   end loop;
+  if exists(select from aclexplode((select proacl from pg_proc where oid = 'paper_dispatch.delivery_report()'::regprocedure)) a
+            where a.grantee <> 'postgres'::regrole)
+     or (select prosecdef from pg_proc where oid = 'paper_dispatch.delivery_report()'::regprocedure) then
+    raise exception 'a4_report_acl'; end if;
   if has_table_privilege('paper_cron_owner', 'paper_dispatch.target', 'SELECT')
      or has_table_privilege('paper_cron_owner', 'paper_dispatch.sent', 'SELECT')
      or has_table_privilege('paper_cron_owner', 'vault.decrypted_secrets', 'SELECT') then

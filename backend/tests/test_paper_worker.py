@@ -368,8 +368,8 @@ def test_tick_token_matches_documented_vector():
     from app.paper_routes import tick_token
     # Rovnaky vektor overuje CI proti pgcrypto hmac() v testovacej DB.
     token = tick_token("k" * 40, "00000000-0000-0000-0000-000000000001")
-    assert token.startswith("PaperTick v1.00000000-0000-0000-0000-000000000001.")
-    assert len(token.rsplit(".", 1)[1]) == 64
+    assert token == ("PaperTick v1.00000000-0000-0000-0000-000000000001."
+                     "8ec3a7b53733daee250202a8cac55df6792ac9c468954e2e39ed7bcd6343f324")
 
 
 def test_preview_tick_accepts_only_token_bound_to_body_tick(monkeypatch):
