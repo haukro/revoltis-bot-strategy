@@ -349,6 +349,68 @@ def test_preview_bypass_does_not_replace_endpoint_secrets(monkeypatch):
     worker.diagnostic.assert_not_awaited()
 
 
+def preview_client(monkeypatch):
+    preview_env(monkeypatch)
+    worker = AsyncMock()
+    worker.tick.return_value = {"outcome": "processed"}
+
+    @asynccontextmanager
+    async def factory(config):
+        yield worker
+
+    app = FastAPI()
+    app.include_router(make_paper_router(PaperConfig.environment, factory))
+    return TestClient(app), worker
+
+
+def test_tick_token_matches_documented_vector():
+    from app.paper_routes import tick_token
+    # Rovnaky vektor overuje CI proti pgcrypto hmac() v testovacej DB.
+    token = tick_token("k" * 40, "00000000-0000-0000-0000-000000000001")
+    assert token.startswith("PaperTick v1.00000000-0000-0000-0000-000000000001.")
+    assert len(token.rsplit(".", 1)[1]) == 64
+
+
+def test_preview_tick_accepts_only_token_bound_to_body_tick(monkeypatch):
+    from app.paper_routes import tick_token
+    client, worker = preview_client(monkeypatch)
+    tick, other = str(uuid4()), str(uuid4())
+    ok = client.post("/api/paper/measure/tick", json={"tick_id": tick},
+                     headers={"Authorization": tick_token("c" * 40, tick)})
+    assert ok.status_code == 200 and ok.json() == {"outcome": "processed"}
+    worker.tick.assert_awaited_once()
+    for header in (tick_token("c" * 40, other),          # token pre iny tick
+                   tick_token("x" * 40, tick),            # nespravny secret
+                   tick_token("d" * 40, tick),            # diagnosticky secret
+                   "Bearer " + "c" * 40,                  # staticky secret v Preview neplati
+                   "PaperTick v1." + tick + ".",          # prazdny podpis
+                   tick_token("c" * 40, tick).upper()):   # zmeneny podpis
+        response = client.post("/api/paper/measure/tick", json={"tick_id": tick}, headers={"Authorization": header})
+        assert response.status_code == 401, header[:20]
+    assert worker.tick.await_count == 1
+
+
+def test_preview_diagnostic_still_needs_its_own_secret(monkeypatch):
+    from app.paper_routes import tick_token
+    client, worker = preview_client(monkeypatch)
+    test_id = str(uuid4())
+    assert client.post("/api/paper/diagnostic/run", json={"test_id": test_id},
+                       headers={"Authorization": tick_token("c" * 40, test_id)}).status_code == 401
+    assert client.post("/api/paper/diagnostic/run", json={"test_id": test_id},
+                       headers={"Authorization": "Bearer " + "d" * 40}).status_code == 200
+    worker.diagnostic.assert_awaited_once()
+
+
+def test_ci_mode_does_not_accept_tick_tokens(endpoint):
+    from app.paper_routes import tick_token
+    client, worker = endpoint
+    tick = str(uuid4())
+    response = client.post("/api/paper/measure/tick", json={"tick_id": tick},
+                           headers={"Authorization": tick_token("cron-secret", tick)})
+    assert response.status_code == 401
+    worker.tick.assert_not_awaited()
+
+
 def test_preview_errors_do_not_echo_secret_values(monkeypatch):
     for overrides in ({"CRON_SECRET": "short"}, {"VERCEL_GIT_COMMIT_REF": "main"}):
         detail = preview_error(monkeypatch, **overrides)

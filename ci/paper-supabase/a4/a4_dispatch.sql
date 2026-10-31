@@ -1,13 +1,16 @@
--- A4 (NAVRH, neschvaleny). Odoslanie ticku z testovacej DB na izolovany Preview.
+-- A4 rev2 (NAVRH, neschvaleny). Odoslanie ticku z testovacej DB na izolovany Preview.
+-- rev2: do fronty pg_net nejde ziadna staticka tajna hodnota ani Vercel bypass.
+-- Hlavicka nesie iba token viazany na jeden tick: HMAC-SHA256(CRON_SECRET, 'paper-tick:v1:'||tick_id).
 -- Iba pre nofomo-paper-validation. Zamerne NIE je v supabase/migrations, aby sa
 -- nikdy nedostal do produkcie cez db push. Spusta postgres (bez superusera).
--- Tajne hodnoty nie su v tomto subore ani v prikaze cron jobu: su vo Vault.
+-- CRON_SECRET je iba vo Vault; z DB odchadza len jednorazovy token.
 begin;
 do $$ begin
   if current_user <> 'postgres' then raise exception 'a4_requires_postgres'; end if;
   if to_regnamespace('paper_cron_proof') is null then raise exception 'a4_requires_a2'; end if;
   if to_regclass('vault.decrypted_secrets') is null then raise exception 'a4_requires_vault'; end if;
   if to_regprocedure('net.http_post(text,jsonb,jsonb,jsonb,integer)') is null then raise exception 'a4_requires_pg_net'; end if;
+  if to_regprocedure('extensions.hmac(bytea,bytea,text)') is null then raise exception 'a4_requires_pgcrypto'; end if;
   if to_regnamespace('paper_dispatch') is not null then raise exception 'a4_already_applied'; end if;
 end $$;
 
@@ -16,13 +19,15 @@ revoke all on schema paper_dispatch from public;
 grant usage on schema paper_dispatch to paper_cron_owner;
 
 -- Jediny povoleny ciel je pevny v obmedzeni; zmena vyzaduje novu revidovanu verziu.
+-- Vlastna domena Preview vetvy: SSO ochrana projektu (all_except_custom_domains) sa na nu
+-- nevztahuje, takze netreba celoprojektovy bypass. Autentifikaciu robi iba token.
 create table paper_dispatch.target (
   singleton boolean primary key default true check (singleton),
-  url text not null check (url = 'https://revoltis-bot-strategy-haukro-git-claude-paper-p4-preview-haukro.vercel.app/api/paper/measure/tick'),
+  url text not null check (url = 'https://p4-preview.haukro.com/api/paper/measure/tick'),
   enabled boolean not null default false,
   updated_at timestamptz not null default clock_timestamp());
 insert into paper_dispatch.target(url) values
-  ('https://revoltis-bot-strategy-haukro-git-claude-paper-p4-preview-haukro.vercel.app/api/paper/measure/tick');
+  ('https://p4-preview.haukro.com/api/paper/measure/tick');
 
 -- Kazdy tick sa odosle najviac raz.
 create table paper_dispatch.sent (
@@ -38,7 +43,7 @@ returns bigint
 language plpgsql volatile security definer
 set search_path = ''
 as $$
-declare v_pid integer; v_created timestamptz; v_url text; v_secret text; v_bypass text; v_request bigint;
+declare v_pid integer; v_created timestamptz; v_url text; v_secret text; v_token text; v_request bigint;
 begin
   if session_user <> 'paper_cron_owner' then raise exception 'dispatch_origin_unverified'; end if;
   select t.backend_pid, t.created_at into v_pid, v_created
@@ -52,16 +57,17 @@ begin
   select g.url into v_url from paper_dispatch.target g where g.enabled;
   if v_url is null then raise exception 'dispatch_disabled'; end if;
   select s.decrypted_secret into v_secret from vault.decrypted_secrets s where s.name = 'paper_p4_cron_secret';
-  select s.decrypted_secret into v_bypass from vault.decrypted_secrets s where s.name = 'paper_p4_vercel_bypass';
-  if coalesce(length(v_secret), 0) < 32 or coalesce(length(v_bypass), 0) < 32 then
-    raise exception 'dispatch_secret_missing'; end if;
+  if coalesce(length(v_secret), 0) < 32 then raise exception 'dispatch_secret_missing'; end if;
+  -- Token plati iba pre tento tick; endpoint prijme len existujuci tick nie starsi ako 120 s
+  -- a jeho opakovane spracovanie je idempotentne. Secret samotny DB neopusti.
+  v_token := 'PaperTick v1.' || p_tick_id::text || '.' || encode(extensions.hmac(
+    convert_to('paper-tick:v1:' || p_tick_id::text, 'UTF8'), convert_to(v_secret, 'UTF8'), 'sha256'), 'hex');
+  v_secret := null;
   -- Zapis do fronty pg_net je transakcny: pri chybe nizsie sa nic neodosle.
   v_request := net.http_post(
     url := v_url,
     body := jsonb_build_object('tick_id', p_tick_id),
-    headers := jsonb_build_object('Content-Type', 'application/json',
-                                  'Authorization', 'Bearer ' || v_secret,
-                                  'x-vercel-protection-bypass', v_bypass),
+    headers := jsonb_build_object('Content-Type', 'application/json', 'Authorization', v_token),
     timeout_milliseconds := 60000);
   insert into paper_dispatch.sent(tick_id, request_id) values (p_tick_id, v_request);
   return v_request;

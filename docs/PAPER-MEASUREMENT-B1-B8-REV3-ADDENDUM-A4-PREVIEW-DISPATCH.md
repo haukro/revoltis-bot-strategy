@@ -106,3 +106,4 @@ hodnota. Iba token viazaný na jeden tick (HMAC) a Preview bez SSO bypassu.
 | --- | --- | --- |
 | 30. 10. 2026 | Návrh A4 (rev1). CI 52/52 (`414f9cb`). | — |
 | 30. 10. 2026 | Review: UPDATE/INSERT na frontu pg_net pre aplikačné roly (§A4.5). | **BLOKOVANÉ**, neaplikované; pripravuje sa rev2. |
+| 31. 10. 2026 | Rozpracovaná rev2 v kóde: `a4_dispatch.sql` posiela iba `PaperTick v1.<tick_id>.<HMAC-SHA256>`, bez bypassu, cieľ `https://p4-preview.haukro.com/api/paper/measure/tick` (subdoména čaká na Romanovo rozhodnutie). `paper_routes.py`: v Preview tick iba s tokenom viazaným na telo, Bearer iba CI. Text §A4.1–A4.4 ešte opisuje rev1. | ROZPRACOVANÉ, CI zatiaľ neoverené. |

@@ -17,10 +17,9 @@ if not os.environ.get('PAPER_A2_SUPABASE'):
 import psycopg
 from test_local_stack import Stack
 
-TARGET = 'https://revoltis-bot-strategy-haukro-git-claude-paper-p4-preview-haukro.vercel.app/api/paper/measure/tick'
+TARGET = 'https://p4-preview.haukro.com/api/paper/measure/tick'
 FN = 'paper_dispatch.send_tick(uuid)'
-SECRETS = ("select vault.create_secret(new_secret := repeat('c', 40), new_name := 'paper_p4_cron_secret'); "
-           "select vault.create_secret(new_secret := repeat('b', 40), new_name := 'paper_p4_vercel_bypass');")
+SECRETS = "select vault.create_secret(new_secret := repeat('c', 40), new_name := 'paper_p4_cron_secret');"
 ENABLE = 'update paper_dispatch.target set enabled = true;'
 AS_CRON = 'set local session authorization paper_cron_owner;'
 
@@ -74,16 +73,21 @@ def test_a4_definition_acl_and_fixed_target(stack):
         assert val(stack, f"select has_table_privilege('paper_cron_owner','{table}','SELECT')") == 'f', table
 
 
-def test_a4_positive_queues_only_fixed_target_with_both_secrets(stack):
+def test_a4_positive_queues_only_fixed_target_with_tick_token(stack):
+    from app.paper_routes import tick_token
     before = queue_rows(stack)
     out = val(stack, f"begin; {ENABLE} {SECRETS} {AS_CRON} "
                      "create temp table a4_req as select paper_dispatch.send_tick(public.paper_tick_start()) as id; "
                      "reset session authorization; "
                      "select q.url = '" + TARGET + "' and q.method = 'POST' "
-                     "and q.headers->>'Authorization' = 'Bearer ' || repeat('c', 40) "
-                     "and q.headers->>'x-vercel-protection-bypass' = repeat('b', 40) "
+                     "and not (q.headers ? 'x-vercel-protection-bypass') "
+                     "and strpos(q.headers::text, repeat('c', 40)) = 0, "
+                     "q.headers->>'Authorization', q.body->>'tick_id' "
                      "from net.http_request_queue q join a4_req r on r.id = q.id; rollback;")
-    assert out.splitlines()[-1] == 't', out
+    checks, header, tick = out.splitlines()[-1].split('|')
+    assert checks == 't', out
+    # Rovnaky token ako vypocita endpoint (Python hmac == pgcrypto hmac); secret nie je v hlavickach.
+    assert header == tick_token('c' * 40, tick), header[:24]
     assert queue_rows(stack) == before  # ROLLBACK: nic sa neodoslalo
 
 
@@ -106,7 +110,6 @@ def test_a4_positive_queues_only_fixed_target_with_both_secrets(stack):
     ('disabled_target', f"{SECRETS} {AS_CRON} select paper_dispatch.send_tick(public.paper_tick_start());", 'dispatch_disabled'),
     ('missing_secrets', f"{ENABLE} {AS_CRON} select paper_dispatch.send_tick(public.paper_tick_start());", 'dispatch_secret_missing'),
     ('short_secret', f"{ENABLE} select vault.create_secret(new_secret := 'short', new_name := 'paper_p4_cron_secret'); "
-     "select vault.create_secret(new_secret := repeat('b', 40), new_name := 'paper_p4_vercel_bypass'); "
      f"{AS_CRON} select paper_dispatch.send_tick(public.paper_tick_start());", 'dispatch_secret_missing'),
 ])
 def test_a4_refusals_never_queue_a_request(stack, name, statement, error):
