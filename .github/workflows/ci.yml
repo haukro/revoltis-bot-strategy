@@ -70,7 +70,38 @@ jobs:
         working-directory: backend
         env:
           PAPER_P3_SUPABASE: "1"
-        run: python -m pytest -q -s --tb=short tests/paper_p3_supabase
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest -q -s -rA --tb=short --junitxml="$RUNNER_TEMP/p3-junit.xml" tests/paper_p3_supabase 2>&1 | tee "$RUNNER_TEMP/p3-pytest.log"
+      - name: P3 result annotations (sanitized)
+        if: always()
+        shell: python
+        run: |
+          # Logs are not always downloadable; annotations are. Credential-like lines are dropped.
+          import os, re
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          secret = re.compile(r'key|secret|password|authorization|jwt|publishable|sb_|eyJ|postgres(ql)?://', re.I)
+          def clean(text, limit):
+              lines = [l for l in text.splitlines() if l.strip() and not secret.search(l)]
+              return '%0A'.join(l.replace('%', '%25').replace('\r', '') for l in lines)[-limit:]
+          tmp = Path(os.environ['RUNNER_TEMP'])
+          junit = tmp / 'p3-junit.xml'
+          if junit.exists():
+              root = ET.parse(junit).getroot()
+              suite = root if root.tag == 'testsuite' else root.find('testsuite')
+              print(f"::notice title=P3 pytest::tests={suite.get('tests')} failures={suite.get('failures')} "
+                    f"errors={suite.get('errors')} skipped={suite.get('skipped')}")
+              bad = [c for c in suite.iter('testcase') if c.find('failure') is not None or c.find('error') is not None]
+              for case in bad[:9]:
+                  node = case.find('failure') if case.find('failure') is not None else case.find('error')
+                  text = (node.get('message') or '') + '\n' + (node.text or '')
+                  print(f"::error title={case.get('name', '')[:120]}::{clean(text, 3500)}")
+          log = tmp / 'p3-pytest.log'
+          if log.exists():
+              passed = [l for l in log.read_text(errors='replace').splitlines() if l.startswith(('PASSED', 'FAILED', 'ERROR', 'SKIPPED'))]
+              print(f"::warning title=p3-pytest.log::{clean(chr(10).join(passed), 3500)}")
       - name: Sanitized startup diagnostics
         if: failure()
         shell: python
