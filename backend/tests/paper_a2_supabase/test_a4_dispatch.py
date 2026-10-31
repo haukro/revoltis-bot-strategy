@@ -76,13 +76,14 @@ def test_a4_definition_acl_and_fixed_target(stack):
 def test_a4_positive_queues_only_fixed_target_with_tick_token(stack):
     from app.paper_routes import tick_token
     before = queue_rows(stack)
+    # net.http_request_queue.body je bytea (pg_net 0.20), preto convert_from(...)::jsonb.
     out = val(stack, f"begin; {ENABLE} {SECRETS} {AS_CRON} "
                      "create temp table a4_req as select paper_dispatch.send_tick(public.paper_tick_start()) as id; "
                      "reset session authorization; "
                      "select q.url = '" + TARGET + "' and q.method = 'POST' "
                      "and not (q.headers ? 'x-vercel-protection-bypass') "
                      "and strpos(q.headers::text, repeat('c', 40)) = 0, "
-                     "q.headers->>'Authorization', q.body->>'tick_id' "
+                     "q.headers->>'Authorization', convert_from(q.body, 'UTF8')::jsonb->>'tick_id' "
                      "from net.http_request_queue q join a4_req r on r.id = q.id; rollback;")
     checks, header, tick = out.splitlines()[-1].split('|')
     assert checks == 't', out

@@ -265,7 +265,38 @@ jobs:
           cache: pip
           cache-dependency-path: backend/requirements.txt
       - run: pip install -r requirements.txt pytest
-      - run: python -m pytest -q
+      - name: Backend pytest
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest -q -rfE --tb=short --junitxml="$RUNNER_TEMP/backend-junit.xml" 2>&1 | tee "$RUNNER_TEMP/backend-pytest.log"
+      - name: Backend result annotations (sanitized)
+        if: always()
+        shell: python
+        run: |
+          # Logs are not always downloadable; annotations are. Credential-like lines are dropped.
+          import os, re
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          secret = re.compile(r'key|secret|password|authorization|jwt|publishable|sb_|eyJ|postgres(ql)?://', re.I)
+          def clean(text, limit):
+              lines = [l for l in text.splitlines() if l.strip() and not secret.search(l)]
+              return '%0A'.join(l.replace('%', '%25').replace('\r', '') for l in lines)[-limit:]
+          tmp = Path(os.environ['RUNNER_TEMP'])
+          junit = tmp / 'backend-junit.xml'
+          if junit.exists():
+              root = ET.parse(junit).getroot()
+              suite = root if root.tag == 'testsuite' else root.find('testsuite')
+              print(f"::notice title=backend pytest::tests={suite.get('tests')} failures={suite.get('failures')} "
+                    f"errors={suite.get('errors')} skipped={suite.get('skipped')}")
+              bad = [c for c in suite.iter('testcase') if c.find('failure') is not None or c.find('error') is not None]
+              for case in bad[:9]:
+                  node = case.find('failure') if case.find('failure') is not None else case.find('error')
+                  text = (node.get('message') or '') + '\n' + (node.text or '')
+                  print(f"::error title={case.get('classname', '')[-60:]}.{case.get('name', '')[:80]}::{clean(text, 3500)}")
+          log = tmp / 'backend-pytest.log'
+          if log.exists():
+              print(f"::warning title=backend-pytest.log::{clean(log.read_text(errors='replace'), 3500)}")
 
   frontend:
     runs-on: ubuntu-24.04

@@ -353,6 +353,7 @@ def preview_client(monkeypatch):
     preview_env(monkeypatch)
     worker = AsyncMock()
     worker.tick.return_value = {"outcome": "processed"}
+    worker.diagnostic.return_value = {"outcome": "diagnostic_created"}
 
     @asynccontextmanager
     async def factory(config):
