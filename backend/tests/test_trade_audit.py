@@ -241,6 +241,37 @@ def test_preflight_missing_report_returns_unavailable_without_simulation():
     simulation.assert_not_called()
 
 
+def test_preflight_uses_single_result_projection_then_fetches_only_candidates():
+    from app.main import validation_replay_availability
+    records, _ = replay_fixture()
+    queries = []
+
+    async def read(table, query):
+        queries.append((table, query))
+        if query == "select=id,variant_results:result->variant_results&order=finished_at.desc&limit=100":
+            return [
+                {"id": record["id"], "variant_results": record["result"]["variant_results"]}
+                for record in records
+            ]
+        for record in records:
+            if query == f"id=eq.{record['id']}&select=id,result&limit=1":
+                return [{"id": record["id"], "result": record["result"]}]
+        return []
+
+    with patch('app.main.supabase_get', new=AsyncMock(side_effect=read)):
+        result = asyncio.run(validation_replay_availability())
+
+    assert result["status"] == "ready"
+    assert result["source_job_ids"] == sorted(record["id"] for record in records)
+    assert queries[0] == (
+        "optimizer_runs",
+        "select=id,variant_results:result->variant_results&order=finished_at.desc&limit=100",
+    )
+    assert all("locked_pairs:" not in query and "source:" not in query and "version_id:" not in query
+               for _, query in queries)
+    assert len(queries) == 3
+
+
 def test_api_replay_is_cached_and_cannot_change_strategy_or_start_optimizer():
     from app.main import ValidationReplayRequest, replay_original_validation, validation_replay_attempts
     records, runs = replay_fixture()
