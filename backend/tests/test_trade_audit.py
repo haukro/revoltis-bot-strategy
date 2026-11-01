@@ -250,8 +250,11 @@ def test_preflight_uses_single_result_projection_then_fetches_only_candidates():
         queries.append((table, query))
         if query == "select=id,variant_results:result->variant_results&order=finished_at.desc&limit=100":
             return [
-                {"id": record["id"], "variant_results": record["result"]["variant_results"]}
-                for record in records
+                {"id": "non-match", "variant_results": []},
+                *[
+                    {"id": record["id"], "variant_results": record["result"]["variant_results"]}
+                    for record in records
+                ],
             ]
         for record in records:
             if query == f"id=eq.{record['id']}&select=id,result&limit=1":
