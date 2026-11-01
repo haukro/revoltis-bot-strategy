@@ -257,7 +257,7 @@ Overené čítaním z `nofomo-paper-validation` po `final_at` cez
 | Ticky | 10 × HTTP 200 z aplikácie (`processed`); 3 × `run_valid` (`run_created`), 7 × `completed_no_run` (`no_new_candle`); žiadny `pg_net_conflict`, žiadna požiadavka vo fronte |
 | Kontrola pred cronom | obe kontrolné požiadavky (bez tokenu, neplatný Bearer) `401 {"detail":"unauthorized"}` od aplikácie (hlásenie implementátora) |
 | Stav po skúške | cron `paper_tick` neaktívny, `paper_dispatch.target.enabled = false`, posledný tick 00:02:00 UTC, fronta pg_net prázdna, job a dôkazy zachované |
-| Výnimka Vercelu | odstránenie a návrat `Protected deployment` treba doložiť; v tejto session sa doména nedala overiť (nie je na allowliste) |
+| Výnimka Vercelu | odstránená; alias domény bez `protectionBypass`. Návrat ochrany overený HTTP: 1. 11. 00:03:13 UTC dve kontrolné požiadavky z testovacej DB (pg_net `request_id` 16, 17) → obe `401` so stránkou Vercelu `Protected deployment` (`vercel_auth_enabled: true`), bez timeoutu a chyby. Posledné doručenie skúšky bolo o 00:02:00 UTC, teda pred obnovením ochrany. |
 
 Rozsah: krátka technická skúška doručenia a spracovania. Nepotvrdzuje správanie
 počas 24 h, pri výpadkoch ani výkonnosť stratégie (TEST-SPEC-002 bez zmeny).
@@ -280,3 +280,4 @@ výskyt 23. 9.). Rieši sa samostatne.
 | 31. 10. 2026 | Review `f395fa6`: report doručenia považoval claim za doručenie, závisel od aktuálne bežiaceho testu a overovací skript nemal PASS/FAIL. Nahradený `trial_ticks`/`trial_verdict` (§A4.1.2): stav pre každý pár (test, tick), okno viazané na `created_at`/`completed_at` testu, explicitný PASS/FAIL, konečnosť z ticku a lease; skript pri FAIL skončí chybou. AT74 nahradený AT75/AT76, pridaný AT73b (presná hranica), AT73 označený ako test okolia hranice. Postup po skúške: zastavenie cronu nie je dôkaz dokončenia. | NÁVRH, čaká na schválenie. |
 | 1. 11. 2026 | §A4.1.3 a §A4.3 opravené podľa overeného správania: vlastná doména Preview vetvy je chránená Standard Protection, skúška vyžaduje Deployment Protection Exception iba pre túto doménu (zapnúť po kontrole, odstrániť po skúške). Komentár v `a4_dispatch.sql` ponechaný kvôli schválenému hashu. | Opravené v dokumentácii. |
 | 1. 11. 2026 | Krátka skúška na `788427b`: PASS 10/10 (§A4.7). 24-hodinový P4 samostatné rozhodnutie. | **PASS**, krátka skúška uzavretá. |
+| 1. 11. 2026 | Návrat ochrany `p4-preview.haukro.com` po odstránení výnimky overený (pg_net 16, 17: `401 Protected deployment`). | Overené. |
