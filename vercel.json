@@ -1,5 +1,4 @@
 {
-  "git": { "deploymentEnabled": { "chatgpt/validation-replay-read-path": false } },
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "services": {
     "web": {
