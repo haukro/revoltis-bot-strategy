@@ -2661,8 +2661,29 @@ async def start_optimizer(request: OptimizerRequest):
 @app.get("/api/optimizer/validation-replay")
 async def validation_replay_availability():
     """Read-only preflight for the user's two historical rows, never starts a job."""
-    records = await supabase_get("optimizer_runs", "order=finished_at.desc&limit=100")
-    originals = [r for r in records if any(matches_target(row) for row in r.get("result", {}).get("variant_results", []))]
+    lightweight = await supabase_get(
+        "optimizer_runs",
+        "select=id,"
+        "variant_results:result->variant_results,"
+        "locked_pairs:result->locked_pairs,"
+        "source:result->>source,"
+        "version_id:result->>version_id"
+        "&order=finished_at.desc&limit=100",
+    )
+    candidate_ids = [
+        r["id"]
+        for r in lightweight
+        if any(matches_target(row) for row in (r.get("variant_results") or []))
+    ]
+    originals = []
+    for job_id in candidate_ids:
+        rows = await supabase_get(
+            "optimizer_runs",
+            f"id=eq.{job_id}&select=id,result&limit=1",
+        )
+        record = next((row for row in rows if row.get("id") == job_id), None)
+        if record is not None:
+            originals.append(record)
     try:
         prepared = prepare_replay(originals)
     except (ValueError, KeyError, TypeError) as error:
