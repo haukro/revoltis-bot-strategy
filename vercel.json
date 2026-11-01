@@ -1,14 +1,12 @@
 {
+  "git": { "deploymentEnabled": { "chatgpt/validation-replay-read-path": false } },
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "services": {
     "web": {
       "root": "frontend/",
       "framework": "vite",
       "rewrites": [
-        {
-          "source": "/paper-status",
-          "destination": "/index.html"
-        }
+        { "source": "/paper-status", "destination": "/index.html" }
       ]
     },
     "api": {
@@ -18,36 +16,12 @@
     }
   },
   "crons": [
-    {
-      "path": "/api/cron/paper/outbox-tick",
-      "schedule": "*/5 * * * *"
-    },
-    {
-      "path": "/api/cron/paper/reconcile",
-      "schedule": "*/15 * * * *"
-    },
-    {
-      "path": "/api/cron/paper/recover",
-      "schedule": "0 * * * *"
-    }
+    { "path": "/api/cron/paper/outbox-tick", "schedule": "*/5 * * * *" },
+    { "path": "/api/cron/paper/reconcile", "schedule": "*/15 * * * *" },
+    { "path": "/api/cron/paper/recover", "schedule": "0 * * * *" }
   ],
   "rewrites": [
-    {
-      "source": "/api/(.*)",
-      "destination": {
-        "service": "api"
-      }
-    },
-    {
-      "source": "/(.*)",
-      "destination": {
-        "service": "web"
-      }
-    }
-  ],
-  "git": {
-    "deploymentEnabled": {
-      "chatgpt/validation-replay-read-path": false
-    }
-  }
+    { "source": "/api/(.*)", "destination": { "service": "api" } },
+    { "source": "/(.*)", "destination": { "service": "web" } }
+  ]
 }
