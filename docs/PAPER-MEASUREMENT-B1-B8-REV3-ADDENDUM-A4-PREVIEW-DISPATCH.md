@@ -1,8 +1,10 @@
 # B1–B8 rev3 — dodatok A4: odoslanie ticku z testovacej DB na izolovaný Preview
 
-**rev2 — NÁVRH, čaká na Romanovo schválenie (31. 10. 2026).** rev1 je
-BLOKOVANÁ a nesmie sa aplikovať (§A4.5). rev2 neposiela cez frontu pg_net
-žiadnu statickú tajnú hodnotu ani Vercel bypass.
+**rev2 — schválená Romanom na commite `788427b` iba pre krátku skúšku na
+`nofomo-paper-validation`. Krátka skúška 1. 11. 2026: PASS 10/10 (§A4.7).**
+24-hodinový P4 je samostatné rozhodnutie a týmto schválením nie je pokrytý.
+rev1 je BLOKOVANÁ a nesmie sa aplikovať (§A4.5). rev2 neposiela cez frontu
+pg_net žiadnu statickú tajnú hodnotu ani Vercel bypass.
 
 Platí iba pre testovací projekt `nofomo-paper-validation` a Preview vetvu
 `claude/paper-p4-preview` ([postup Preview](PAPER-MEASUREMENT-P4-PREVIEW-SETUP.md)).
@@ -28,8 +30,7 @@ cez `db push`. Vyžaduje A2, Vault, pg_net a pgcrypto (`extensions.hmac`).
 - schéma `paper_dispatch` (vlastník `postgres`, USAGE iba `paper_cron_owner`);
 - `paper_dispatch.target`: jediný riadok, URL pevne daná obmedzením
   `https://p4-preview.haukro.com/api/paper/measure/tick`, predvolene
-  `enabled = false`. Subdoména čaká na rozhodnutie (§A4.6); iný názov
-  znamená novú verziu súboru a nový hash;
+  `enabled = false`. Iný názov znamená novú verziu súboru a nový hash;
 - `paper_dispatch.sent`: každý tick sa odošle najviac raz;
 - `paper_dispatch.send_tick(tick_id)`: SECURITY DEFINER, vlastník `postgres`,
   `search_path = ''`, EXECUTE iba `paper_cron_owner`. Odošle iba, ak
@@ -113,6 +114,32 @@ Odoslané HTTP požiadavky a workery môžu bežať ďalej. Postup po skúške:
    okne, nevyplnených hodnotách alebo inej role ako `postgres`). Iba PASS je
    úspešná skúška.
 
+### A4.1.3 Ochrana Vercelu na vlastnej Preview doméne (overené 1. 11. 2026)
+
+Projekt má Vercel Authentication v režime Standard Protection
+(`ssoProtection.deploymentType = all_except_custom_domains`). Tento režim
+nechráni iba **produkčné** domény. `p4-preview.haukro.com` je priradená Preview
+vetve `claude/paper-p4-preview`, je to teda preview doména a **ochrana sa na ňu
+vzťahuje**. Pôvodný predpoklad, že vlastná doména Preview vetvy je bez SSO, bol
+chybný. Overené skutočným správaním: požiadavka bez tokenu aj s neplatným Bearer
+dostala od Vercelu `401 Protected deployment` a k aplikácii sa nedostala.
+
+Postup pre skúšku bez celoprojektového bypassu:
+
+1. Vercel → Deployment Protection → **Deployment Protection Exceptions**:
+   výnimka **iba** pre `p4-preview.haukro.com`. Ostatné preview a generované
+   `*.vercel.app` URL ostávajú chránené.
+2. Pred zapnutím cronu musia obe kontrolné požiadavky z testovacej DB (bez
+   tokenu, neplatný Bearer) dostať `401` s telom `{"detail":"unauthorized"}`
+   **od aplikácie**. Ak nie, výnimku hneď odstrániť a skúšku nespúšťať.
+3. Po skúške výnimku odstrániť a overiť, že doména znova vracia
+   `Protected deployment`.
+
+Komentár v `a4_dispatch.sql` (pri `paper_dispatch.target`) stále tvrdí, že sa
+ochrana na doménu nevzťahuje. Je to iba komentár bez vplyvu na správanie.
+Ponechaný je, aby sa nezmenil schválený hash `56196b4e…`, a opraví sa
+v najbližšej revízii súboru.
+
 Príkaz jobu (bez tajných hodnôt):
 `select paper_dispatch.send_tick(public.paper_tick_start())`. Job vytvorí
 `a4/1_schedule_dispatch.sql` (zhodný s A3 `1_schedule.sql` až na príkaz).
@@ -154,17 +181,22 @@ Protection Bypass for Automation sa nevytvára.
      `not_final`: konečnosť sa počíta z ticku a lease, nie z fronty;
    - vložená vlastná požiadavka → bez `CRON_SECRET` nevie vyrobiť platný token.
    PostgREST schému `net` nevystavuje, prakticky ide o `postgres`/`supabase_admin`.
-2. **Vlastná doména sprístupní deployment vetvy bez SSO.** Overené 31. 10.
-   (iba názvy a scope, bez hodnôt): všetky produkčné premenné majú scope
-   `production`, premenné pre všetky Preview neexistujú. Vetva má iba
-   `PAPER_MEASUREMENT_ENABLED`, `PAPER_SUPABASE_URL`, `CRON_SECRET`,
-   `PAPER_DIAGNOSTIC_SECRET` (+ `PAPER_SUPABASE_SERVICE_ROLE_KEY`, doplní Roman).
-   Verejne viditeľný je teda kód frontendu vetvy, nie produkčné dáta.
-   Podmienka: do Preview scope nepridávať žiadne produkčné premenné.
+2. **Vlastná doména je verejná iba počas výnimky Vercelu** (§A4.1.3).
+   Bez výnimky ju chráni Vercel Authentication ako každú preview doménu.
+   Kým výnimka platí, je verejný celý deployment vetvy (frontend aj API), nielen
+   endpoint ticku. Endpoint ticku chráni HMAC token, diagnostiku vlastný secret.
+   Scope premenných overený 31. 10. a 1. 11. (iba názvy a scope, bez hodnôt):
+   všetky produkčné premenné majú scope `production`, premenné pre všetky
+   Preview neexistujú. Vetva má iba `PAPER_MEASUREMENT_ENABLED`,
+   `PAPER_SUPABASE_URL`, `CRON_SECRET`, `PAPER_DIAGNOSTIC_SECRET` a
+   `PAPER_SUPABASE_SERVICE_ROLE_KEY` testovacieho projektu.
+   Podmienka: kým výnimka platí, do Preview scope vetvy nepridávať nič produkčné;
+   výnimku držať iba počas skúšky.
 3. Únik `CRON_SECRET` (napr. z Vercelu) by umožnil vyrobiť tokeny, dopad je
    rovnaký ako v bode 1 (iba existujúce ticky do 120 s, idempotentne).
-4. Po P4: rotovať `CRON_SECRET` (Vercel aj Vault), `paper_dispatch.target`
-   vypnúť, vlastnú doménu odpojiť.
+4. Po skúške aj po P4: `paper_dispatch.target` vypnúť, výnimku Vercelu odstrániť
+   a overiť `Protected deployment`, rotovať `CRON_SECRET` (Vercel aj Vault),
+   vlastnú doménu odpojiť, ak sa nepoužije pre P4.
 5. Pre produkciu tento model nie je schválený.
 
 ## A4.4 Testy
@@ -203,12 +235,36 @@ hodnota. Iba token viazaný na jeden tick (HMAC) a Preview bez SSO bypassu.
 
 ## A4.6 Rozhodnutia pre Romana
 
-1. Schváliť rev2 (§A4.1–A4.4) na aplikáciu **iba** na `nofomo-paper-validation`.
-2. Názov subdomény. Návrh `p4-preview.haukro.com` (DNS u Českého hostingu,
-   CNAME na Vercel). Iný názov → upravím `a4_dispatch.sql`, testy a hash.
-3. Ručné kroky (hodnoty nikdy do chatu): `PAPER_SUPABASE_SERVICE_ROLE_KEY`
-   v Preview vetvy, DNS záznam a priradenie domény k vetve, `vault.create_secret`
-   podľa §A4.2.
+1. ~~Schváliť rev2 na aplikáciu iba na `nofomo-paper-validation`.~~ Schválené
+   pre krátku skúšku na `788427b`.
+2. ~~Názov subdomény.~~ `p4-preview.haukro.com`, CNAME u Českého hostingu,
+   priradená vetve `claude/paper-p4-preview`, overená vo Verceli.
+3. ~~Ručné kroky.~~ Service role key v Preview vetvy, DNS, Vault secret: hotové.
+4. **Otvorené:** 24-hodinový P4 (samostatné rozhodnutie, nová výnimka Vercelu
+   iba na dobu P4, rovnaký postup ukončenia a PASS/FAIL).
+
+## A4.7 Výsledok krátkej skúšky (1. 11. 2026)
+
+Overené čítaním z `nofomo-paper-validation` po `final_at` cez
+`paper_dispatch.trial_verdict` / `trial_ticks`.
+
+| Položka | Hodnota |
+| --- | --- |
+| Revízia | `788427b` (Preview deploy vetvy `claude/paper-p4-preview`, A4 nainštalovaná; telá `send_tick`, `trial_ticks`, `trial_verdict`, práva a pevná URL zhodné so súborom `56196b4e…`) |
+| Shadow test | `63e00145-f750-4bd2-bd37-f474b1152a3c`, vznikol 31. 10. 23:52:21 UTC, zastavený 1. 11. 00:04:51 UTC (po okne) |
+| Okno | 31. 10. 23:52:40 – 1. 11. 00:02:40 UTC (00:52:40 – 01:02:40 SK) |
+| Verdikt | **PASS**, dôvody `[]`, 1 test, 10 tickov, 10/10 párov dokončených, `final_at` 00:04:40 UTC |
+| Ticky | 10 × HTTP 200 z aplikácie (`processed`); 3 × `run_valid` (`run_created`), 7 × `completed_no_run` (`no_new_candle`); žiadny `pg_net_conflict`, žiadna požiadavka vo fronte |
+| Kontrola pred cronom | obe kontrolné požiadavky (bez tokenu, neplatný Bearer) `401 {"detail":"unauthorized"}` od aplikácie (hlásenie implementátora) |
+| Stav po skúške | cron `paper_tick` neaktívny, `paper_dispatch.target.enabled = false`, posledný tick 00:02:00 UTC, fronta pg_net prázdna, job a dôkazy zachované |
+| Výnimka Vercelu | odstránenie a návrat `Protected deployment` treba doložiť; v tejto session sa doména nedala overiť (nie je na allowliste) |
+
+Rozsah: krátka technická skúška doručenia a spracovania. Nepotvrdzuje správanie
+počas 24 h, pri výpadkoch ani výkonnosť stratégie (TEST-SPEC-002 bez zmeny).
+
+Mimo rozsahu A4: produkčné `/api/dashboard` a `/api/optimizer-latest` vracajú
+500 pre `statement timeout` nad `simulation_runs` a `optimizer_runs` (prvý
+výskyt 23. 9.). Rieši sa samostatne.
 
 ## Záznam zmien
 
@@ -222,3 +278,5 @@ hodnota. Iba token viazaný na jeden tick (HMAC) a Preview bez SSO bypassu.
 | 31. 10. 2026 | Príčina zlyhania `paper-a2-supabase` na `e616b94`: test čítal `->>` z `bytea` (`net.http_request_queue.body`). Hypotéza chýbajúceho pgcrypto vyvrátená: `a4_dispatch.sql` vyžaduje `extensions.hmac`, fixture ho aplikoval a AT67 v tom istom behu prešiel (51/52, jediné zlyhanie AT68). Doplnené §A4.1.1 (presná špecifikácia HMAC, pevný vektor), report doručenia, `2_verify_dispatch.sql`, AT72–AT74. | NÁVRH, čaká na schválenie. |
 | 31. 10. 2026 | CI na `35a47c5` (kód zhodný s výsledným HEAD, ďalší commit mení iba tento záznam): 5/5 jobov zelených; A2 56/56 (vrátane pevného vektora, hranice 9 s, budúceho ticku, AT74), P3 17/17 (vrátane AT72, AT73), backend 319 (8 skipped). P3 job má odteraz anotácie. Overenie cez Preview (AT70) čaká na samostatné schválenie nasadenia. | Overené CI, NÁVRH čaká na schválenie. |
 | 31. 10. 2026 | Review `f395fa6`: report doručenia považoval claim za doručenie, závisel od aktuálne bežiaceho testu a overovací skript nemal PASS/FAIL. Nahradený `trial_ticks`/`trial_verdict` (§A4.1.2): stav pre každý pár (test, tick), okno viazané na `created_at`/`completed_at` testu, explicitný PASS/FAIL, konečnosť z ticku a lease; skript pri FAIL skončí chybou. AT74 nahradený AT75/AT76, pridaný AT73b (presná hranica), AT73 označený ako test okolia hranice. Postup po skúške: zastavenie cronu nie je dôkaz dokončenia. | NÁVRH, čaká na schválenie. |
+| 1. 11. 2026 | §A4.1.3 a §A4.3 opravené podľa overeného správania: vlastná doména Preview vetvy je chránená Standard Protection, skúška vyžaduje Deployment Protection Exception iba pre túto doménu (zapnúť po kontrole, odstrániť po skúške). Komentár v `a4_dispatch.sql` ponechaný kvôli schválenému hashu. | Opravené v dokumentácii. |
+| 1. 11. 2026 | Krátka skúška na `788427b`: PASS 10/10 (§A4.7). 24-hodinový P4 samostatné rozhodnutie. | **PASS**, krátka skúška uzavretá. |
