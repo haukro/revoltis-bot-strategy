@@ -1,7 +1,7 @@
 # Prevádzková zmena 1. 11. 2026: indexy pre čítanie `simulation_runs` a `optimizer_runs`
 
 Projekt: produkčná Supabase `vdglyxhlmukxeqynguke` (revoltis-bot-strategy).
-Schválil: Roman. Vykonal: Roman v SQL editore. Overenie: iba čítanie.
+Schválil: Roman. Vykonal: ChatGPT cez produkčný Supabase SQL editor. Overenie: iba čítanie.
 
 ## Problém
 
@@ -28,7 +28,10 @@ analyze public.optimizer_runs;
 ```
 
 Repo: `supabase/migrations/20261101003700_prod_read_path_indexes.sql` je
-idempotentný záznam (`IF NOT EXISTS`, bez `CONCURRENTLY`). Produkčná tabuľka
+idempotentný záznam (`IF NOT EXISTS`, bez `CONCURRENTLY`). Na už opravenej
+produkcii existujúce indexy preskočí. Na inom naplnenom projekte však obyčajný
+`CREATE INDEX` počas tvorby blokuje zápisy do tabuľky; nie je ekvivalentom
+ručného `CREATE INDEX CONCURRENTLY`. Produkčná tabuľka
 `supabase_migrations.schema_migrations` túto zmenu neobsahuje, pretože išla cez
 SQL editor.
 
@@ -42,7 +45,7 @@ SQL editor.
 | Plán `optimizer_runs` | `Index Scan using optimizer_runs_kind_version_finished_idx`, `Index Cond` na `kind` aj `version_id` (predtým Seq Scan + Filter + Sort) |
 | Produkcia po zmene | `/api/dashboard` 4× `200` (00:37:21 až 00:38:18 UTC), `/api/optimizer-latest` 4× `200` (00:37:24 až 00:38:17 UTC) |
 | Timeouty po zmene | jeden o 00:38:23 UTC, patrí `/api/optimizer/validation-replay` (mimo tejto zmeny) |
-| Čas DB, meranie Romana | `/api/dashboard` (`simulation_runs`) približne **51 ms**, `/api/optimizer-latest` (`optimizer_runs`) **3,2 ms**; v oboch prípadoch tri nové DB požiadavky |
+| Čas DB, meranie ChatGPT | `/api/dashboard` (`simulation_runs`) približne **51 ms**, `/api/optimizer-latest` (`optimizer_runs`) **3,2 ms**; v oboch prípadoch tri nové DB požiadavky |
 | Čas DB, `pg_stat_statements` (kontrola) | `optimizer_runs` dotaz PostgREST: 4 behy po zmene, spolu 10,2 ms, priemer 2,5 ms (predtým žiadny úspešný beh). `simulation_runs`: štatistika je kumulovaná od 14. 10., rozdiel 35 → 39 behov dáva 4 nové behy spolu ~193 ms, priemer ~48 ms, minimum 30,2 ms (predtým priemer 5,2 s) |
 | Trvanie zmeny | `create index concurrently` na `optimizer_runs` 14,8 s; `analyze optimizer_runs` 7,3 s |
 
@@ -52,17 +55,19 @@ Návrat: `drop index concurrently simulation_runs_finished_at_idx;` a
 ## Otvorené (mimo tejto zmeny)
 
 1. `/api/optimizer/validation-replay` číta `optimizer_runs?order=finished_at.desc&limit=100`
-   bez výberu stĺpcov, teda všetkých 104 riadkov so 121 MB komprimovaných dát
-   v `result`. Index to nevyrieši. Volá sa pri načítaní stránky a padá na
-   `statement_timeout`. Neošetrená výnimka (`raise_for_status` bez `try`) navyše
-   vytvára záznam „Exception in ASGI application“, ktorý Vercel môže priradiť
-   k inej súbežnej požiadavke (pravdepodobne aj záznam pri
-   `/api/cron/paper/outbox-tick` o 00:40:05 UTC; jeho RPC volania vrátili `200`).
-   Vyžaduje zmenu kódu, samostatné rozhodnutie. Pred návrhom opravy najprv určiť,
-   ktoré **riadky** endpoint naozaj potrebuje (podľa `request->>'kind'`, ID
-   zdrojových jobov alebo časového rozsahu) a ktoré **polia** z `result` číta
-   (`matches_target` a `prepare_replay` v `backend/app/trade_audit.py`), a až
-   potom zúžiť dotaz na tieto riadky a polia.
+   bez výberu stĺpcov, takže vracia najviac 100 z približne 104 riadkov a pri
+   každom vybranom riadku aj celé veľké JSON stĺpce. Tabuľka má približne
+   121 MB komprimovaných `result` dát celkovo; bez merania to nemožno označiť
+   za veľkosť konkrétnej HTTP odpovede. Index samotný tento prenos nevyrieši.
+   Endpoint sa volá pri načítaní stránky a bol priradený k zostávajúcemu
+   `statement_timeout`. Neošetrené `raise_for_status` môže vytvoriť
+   „Exception in ASGI application“, ale priradenie iného súbežného Vercel logu
+   (vrátane `/api/cron/paper/outbox-tick`) k tejto príčine nie je potvrdené.
+   Vyžaduje zmenu kódu a samostatné rozhodnutie. Analýza kódu ukazuje, že
+   preflight hľadá dve historické cieľové varianty a následne používa z
+   `result` najmä `variant_results`, `locked_pairs`, `source`,
+   `replay_snapshots` a `version_id`. Ďalší krok je zúžiť kandidátne riadky
+   a prenášané JSON polia bez zmeny replay logiky.
 2. Projekt v Supabase je na pláne FREE s označením „Exceeding usage limits“
    (snímka dashboardu). Malá inštancia (`shared_buffers` 224 MB) a obmedzený
    disk pravdepodobne prispievajú k pomalému čítaniu veľkých tabuliek. Hypotéza,
