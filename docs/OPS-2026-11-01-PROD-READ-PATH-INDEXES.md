@@ -42,6 +42,9 @@ SQL editor.
 | Plán `optimizer_runs` | `Index Scan using optimizer_runs_kind_version_finished_idx`, `Index Cond` na `kind` aj `version_id` (predtým Seq Scan + Filter + Sort) |
 | Produkcia po zmene | `/api/dashboard` 4× `200` (00:37:21 až 00:38:18 UTC), `/api/optimizer-latest` 4× `200` (00:37:24 až 00:38:17 UTC) |
 | Timeouty po zmene | jeden o 00:38:23 UTC, patrí `/api/optimizer/validation-replay` (mimo tejto zmeny) |
+| Čas DB, meranie Romana | `/api/dashboard` (`simulation_runs`) približne **51 ms**, `/api/optimizer-latest` (`optimizer_runs`) **3,2 ms**; v oboch prípadoch tri nové DB požiadavky |
+| Čas DB, `pg_stat_statements` (kontrola) | `optimizer_runs` dotaz PostgREST: 4 behy po zmene, spolu 10,2 ms, priemer 2,5 ms (predtým žiadny úspešný beh). `simulation_runs`: štatistika je kumulovaná od 14. 10., rozdiel 35 → 39 behov dáva 4 nové behy spolu ~193 ms, priemer ~48 ms, minimum 30,2 ms (predtým priemer 5,2 s) |
+| Trvanie zmeny | `create index concurrently` na `optimizer_runs` 14,8 s; `analyze optimizer_runs` 7,3 s |
 
 Návrat: `drop index concurrently simulation_runs_finished_at_idx;` a
 `drop index concurrently optimizer_runs_kind_version_finished_idx;`.
@@ -55,7 +58,11 @@ Návrat: `drop index concurrently simulation_runs_finished_at_idx;` a
    vytvára záznam „Exception in ASGI application“, ktorý Vercel môže priradiť
    k inej súbežnej požiadavke (pravdepodobne aj záznam pri
    `/api/cron/paper/outbox-tick` o 00:40:05 UTC; jeho RPC volania vrátili `200`).
-   Vyžaduje zmenu kódu, samostatné rozhodnutie.
+   Vyžaduje zmenu kódu, samostatné rozhodnutie. Pred návrhom opravy najprv určiť,
+   ktoré **riadky** endpoint naozaj potrebuje (podľa `request->>'kind'`, ID
+   zdrojových jobov alebo časového rozsahu) a ktoré **polia** z `result` číta
+   (`matches_target` a `prepare_replay` v `backend/app/trade_audit.py`), a až
+   potom zúžiť dotaz na tieto riadky a polia.
 2. Projekt v Supabase je na pláne FREE s označením „Exceeding usage limits“
    (snímka dashboardu). Malá inštancia (`shared_buffers` 224 MB) a obmedzený
    disk pravdepodobne prispievajú k pomalému čítaniu veľkých tabuliek. Hypotéza,
