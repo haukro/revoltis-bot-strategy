@@ -2663,11 +2663,9 @@ async def validation_replay_availability():
     """Read-only preflight for the user's two historical rows, never starts a job."""
     lightweight = await supabase_get(
         "optimizer_runs",
-        "select=id,"
-        "variant_results:result->variant_results,"
-        "locked_pairs:result->locked_pairs,"
-        "source:result->>source,"
-        "version_id:result->>version_id"
+        # Only the field read by matches_target(). Every additional projection
+        # from result detoasts the large JSON value again.
+        "select=id,variant_results:result->variant_results"
         "&order=finished_at.desc&limit=100",
     )
     candidate_ids = [
