@@ -241,6 +241,19 @@ def test_preflight_missing_report_returns_unavailable_without_simulation():
     simulation.assert_not_called()
 
 
+def test_preflight_read_failure_returns_unavailable_instead_of_raising():
+    import httpx
+    from app.main import validation_replay_availability
+    request = httpx.Request('GET', 'https://example.invalid/rest/v1/optimizer_runs')
+    error = httpx.HTTPStatusError('timeout', request=request, response=httpx.Response(500, request=request))
+    with patch('app.main.supabase_get', AsyncMock(side_effect=error)), patch('app.trade_audit.simulate') as simulation:
+        result = asyncio.run(validation_replay_availability())
+    assert result['status'] == 'replay_unavailable'
+    assert result['reason'] == 'source_read_failed'
+    assert result['qualified'] is False
+    simulation.assert_not_called()
+
+
 def test_preflight_uses_single_result_projection_then_fetches_only_candidates():
     from app.main import validation_replay_availability
     records, _ = replay_fixture()

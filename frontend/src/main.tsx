@@ -104,7 +104,6 @@ function App() {
   const [historicalHours, setHistoricalHours] = useState<1 | 6 | 24 | 168 | 336 | 720>(24);
   const [chartRange, setChartRange] = useState<'hour' | 'day' | 'week'>('day');
   const [optimizer, setOptimizer] = useState<any>(null);
-  const [replayAvailability, setReplayAvailability] = useState<any>(null);
   const [optimizerDays, setOptimizerDays] = useState<1 | 7 | 14 | 30 | 90>(7);
   const [optimizerTrials, setOptimizerTrials] = useState(3);
   const [optimizerRunning, setOptimizerRunning] = useState(false);
@@ -122,15 +121,6 @@ function App() {
     const data = await overview.json(); setDashboard(data); setConfig(data.strategy); setActiveUniverse(data.active_universe || null); setMarketPair(current => data.strategy.selected_pairs.includes(current) ? current : data.strategy.selected_pairs[0] || ''); setLastRun(data.last_simulation); if (data.last_simulation) { setSimulation({ metrics: data.last_simulation.summary, equity_curve: data.last_simulation.progress?.equity_curve || [], per_pair_metrics: data.last_simulation.progress?.per_pair_metrics || {}, per_pair_equity_curves: data.last_simulation.progress?.per_pair_equity_curves || {}, data_coverage: data.last_simulation.progress?.data_coverage || {} }); if (data.last_simulation.progress?.paper_forward) setRunStatus('stopped'); } if (data.last_scale_simulation) { setScaleLastRun(data.last_scale_simulation); setScaleSimulation({ metrics: data.last_scale_simulation.summary, equity_curve: data.last_scale_simulation.progress?.equity_curve || [], per_pair_metrics: data.last_scale_simulation.progress?.per_pair_metrics || {}, per_pair_equity_curves: data.last_scale_simulation.progress?.per_pair_equity_curves || {}, data_coverage: data.last_scale_simulation.progress?.data_coverage || {} }); } setVersions(savedVersions.ok ? await savedVersions.json() : []); const tests = savedBacktests.ok ? await savedBacktests.json() : []; setBacktests(tests); if (tests.length > 1) { setLeft(tests[1].id); setRight(tests[0].id); } if (latestOptimizer.ok) { const saved = await latestOptimizer.json(); if (saved) setOptimizer(saved); }
   };
   useEffect(() => { load().catch(() => setMessage('Aplikáciu sa nepodarilo načítať. Skontroluj, či beží API.')); }, []);
-  useEffect(() => {
-    let active = true;
-    fetch('/api/optimizer/validation-replay').then(async response => {
-      if (!response.ok) throw new Error('replay_preflight_failed');
-      const result = await response.json();
-      if (active) setReplayAvailability(result);
-    }).catch(() => { if (active) setReplayAvailability({ status: 'replay_unavailable', reason: 'api_unavailable' }); });
-    return () => { active = false; };
-  }, []);
   const scanOkx = async () => {
     setScannerLoading(true); setScannerError('');
     try {
