@@ -2661,13 +2661,19 @@ async def start_optimizer(request: OptimizerRequest):
 @app.get("/api/optimizer/validation-replay")
 async def validation_replay_availability():
     """Read-only preflight for the user's two historical rows, never starts a job."""
-    lightweight = await supabase_get(
-        "optimizer_runs",
-        # Only the field read by matches_target(). Every additional projection
-        # from result detoasts the large JSON value again.
-        "select=id,variant_results:result->variant_results"
-        "&order=finished_at.desc&limit=100",
-    )
+    try:
+        lightweight = await supabase_get(
+            "optimizer_runs",
+            # Only the field read by matches_target(). Every additional projection
+            # from result detoasts the large JSON value again.
+            "select=id,variant_results:result->variant_results"
+            "&order=finished_at.desc&limit=100",
+        )
+    except httpx.HTTPError:
+        # The scan can exceed the database statement timeout. Report it instead
+        # of raising an unhandled ASGI exception.
+        return {"status": "replay_unavailable", "reason": "source_read_failed", "source_job_ids": [],
+                "qualified": False, "verdict": "NEPREŠIEL"}
     candidate_ids = [
         r["id"]
         for r in lightweight
